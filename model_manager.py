@@ -231,6 +231,10 @@ class GpuBackend:
             while True:
                 await asyncio.sleep(30)
 
+                # Backend was permanently failed before vLLM ever started
+                if self._failed:
+                    return
+
                 # Detect unexpected vLLM crash
                 if self.process is not None and self.process.returncode is not None:
                     self.log.warning(
@@ -263,9 +267,52 @@ class GpuBackend:
 
     # ── Process lifecycle ──────────────────────────────────────────────────────
 
+    def _check_gpu_free(self) -> None:
+        """Raise RuntimeError if unexpected processes are occupying this GPU's VRAM.
+
+        vLLM's EngineCore and worker sub-processes can escape process-group kills
+        and linger with large CUDA allocations.  Catching this before launching
+        produces a clean error instead of an inscrutable OOM 60s into startup.
+        """
+        try:
+            # List every compute process on this specific GPU
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader",
+                    f"--id={self.gpu_id}",
+                ],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return   # nvidia-smi unavailable — skip check
+            lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+            if not lines:
+                return   # no compute processes on this GPU — good
+            # Something is there.  Collect PIDs/usage and warn loudly.
+            procs = []
+            for line in lines:
+                parts = [p.strip() for p in line.split(",")]
+                pid_s  = parts[0] if parts else "?"
+                mem_s  = parts[1] if len(parts) > 1 else "? MiB"
+                procs.append(f"PID {pid_s} ({mem_s})")
+            msg = (
+                f"GPU {self.gpu_id} is occupied by unexpected process(es) before spawn: "
+                + ", ".join(procs)
+                + ". Kill them manually or wait for them to exit, then retry."
+            )
+            self.log.error(msg)
+            # Do NOT mark _failed=True here — the caller will handle it.
+            # Use a transient error so the slot is freed and a future request can retry.
+            raise RuntimeError(msg)
+        except FileNotFoundError:
+            pass  # nvidia-smi not installed — skip check
+
     async def _spawn_locked(self) -> None:
         """Spawn vLLM subprocess and wait for /health.  Caller must hold self._lock."""
         self._ready = False
+        self._check_gpu_free()
         log_fd = open(self.log_path, "ab")
         try:
             self.log.info(
