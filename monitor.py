@@ -32,15 +32,53 @@ from datetime import datetime
 # ── Configuration (mirrors model_manager.py) ───────────────────────────────────
 INTERVAL = int(os.environ.get("INTERVAL", "30"))
 
-# (slot_id, gpu_id, api_port)
-SLOTS = [
-    (0, 0, 9002),
-    (1, 1, 9010),
-]
+# Slots are discovered at startup via the same env vars as model_manager.py.
+# Set GPU_SLOTS / GPU_IDS / GPU_PORT_BASE / GPU_PORT_GAP to match your deployment.
+# (populated after _discover_slots() is defined below)
 
-MODEL_MANAGER_PORT = 8002
+MODEL_MANAGER_PORT = int(os.environ.get("LISTEN_PORT", "8002"))
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "logs", "model_manager.log")
+
+
+def _discover_slots() -> list[tuple[int, int, int]]:
+    """Mirror the GPU slot discovery logic from model_manager.py.
+
+    Reads the same env vars so monitor and model_manager always agree:
+      GPU_SLOTS="0:9000,1:9010,2:9020"   explicit gpu:port pairs
+      GPU_IDS="0,2"                        restrict auto-detection
+      GPU_PORT_BASE=9000                   base port (default 9000)
+      GPU_PORT_GAP=10                      port gap per slot (default 10)
+    """
+    base = int(os.environ.get("GPU_PORT_BASE", "9000"))
+    gap  = int(os.environ.get("GPU_PORT_GAP",  "10"))
+
+    if slot_str := os.environ.get("GPU_SLOTS", "").strip():
+        slots = []
+        for i, token in enumerate(slot_str.split(",")):
+            token = token.strip()
+            if ":" in token:
+                g, p = token.split(":", 1)
+                slots.append((i, int(g), int(p)))
+            else:
+                slots.append((i, int(token), base + i * gap))
+        return slots
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        gpu_ids = [int(x) for x in out.splitlines() if x.strip().isdigit()]
+    except Exception:
+        gpu_ids = [0]
+
+    if ids_str := os.environ.get("GPU_IDS", "").strip():
+        wanted = {int(x) for x in ids_str.split(",") if x.strip().isdigit()}
+        gpu_ids = [g for g in gpu_ids if g in wanted]
+
+    return [(i, gid, base + i * gap) for i, gid in enumerate(gpu_ids)]
+
 
 # ── ANSI ───────────────────────────────────────────────────────────────────────
 _NO_COLOR = not sys.stdout.isatty()
@@ -355,6 +393,9 @@ def report() -> str:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
+    global SLOTS
+    SLOTS = _discover_slots()
+
     parser = argparse.ArgumentParser(description="LLM Gateway monitor")
     parser.add_argument("--once", action="store_true",
                         help="Print one report and exit")

@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import time
 import uuid
 
@@ -42,30 +43,84 @@ from aiohttp import web
 IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "300"))
 WAKE_TIMEOUT = int(os.environ.get("WAKE_TIMEOUT", "300"))
 HEALTH_POLL  = float(os.environ.get("HEALTH_POLL", "2.0"))
+LISTEN_PORT  = int(os.environ.get("LISTEN_PORT", "8002"))
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR    = os.path.join(SCRIPT_DIR, "logs")
 
-# Physical GPU slots: (slot_id, gpu_id, vllm_port)
-# model_manager sets VLLM_CUDA_DEVICE=gpu_id and VLLM_PORT=port when spawning.
+# ── GPU slot discovery ─────────────────────────────────────────────────────────
+# Slots are the physical GPU resources available to this process.
+# Each slot maps (slot_id, gpu_id, api_port).  model_manager sets
+# VLLM_CUDA_DEVICE=gpu_id and VLLM_PORT=api_port when spawning a backend.
 #
-# NOTE: vLLM's v1 EngineCore process binds API_PORT+1 for its internal ZMQ IPC
-# socket.  Slots must therefore be spaced ≥2 apart so one slot's EngineCore does
-# not collide with the next slot's API server port.
-# slot 0 API=9002 → EngineCore IPC=9003  (internal, never exposed)
-# slot 1 API=9010 → EngineCore IPC=9011  (well clear of slot 0)
-GPU_SLOTS: list[tuple[int, int, int]] = [
-    (0, 0, 9002),   # slot 0: GPU 0, port 9002
-    (1, 1, 9010),   # slot 1: GPU 1, port 9010  (9003 is slot-0 EngineCore IPC)
-]
+# Port spacing MUST be > 2 per slot.  vLLM's EngineCore subprocess binds
+# api_port + N (typically +2) for its internal ZMQ IPC socket.  If the next
+# slot's api_port falls within that range, spawns will fail with
+# "Address already in use".  The default gap of 10 is conservative and safe.
+#
+# Configuration (env vars, evaluated in order):
+#
+#   GPU_SLOTS="0:9000,1:9010,2:9020"
+#       Explicit gpu_id:port pairs, comma-separated.  Use this to skip GPUs
+#       that are reserved for other workloads (e.g. GPU 0 running a desktop).
+#
+#   GPU_IDS="0,2,4"
+#       Restrict auto-detection to these GPU indices.
+#
+#   GPU_PORT_BASE=9000   (default: 9000)
+#   GPU_PORT_GAP=10      (default: 10)
+#       Auto-mode: first slot gets GPU_PORT_BASE, next gets +GPU_PORT_GAP, etc.
+
+_PORT_BASE = int(os.environ.get("GPU_PORT_BASE", "9000"))
+_PORT_GAP  = int(os.environ.get("GPU_PORT_GAP",  "10"))
+
+
+def _discover_gpu_slots() -> list[tuple[int, int, int]]:
+    """Return [(slot_id, gpu_id, api_port), ...] from env or nvidia-smi."""
+
+    # 1. Fully explicit override
+    if slot_str := os.environ.get("GPU_SLOTS", "").strip():
+        slots = []
+        for i, token in enumerate(slot_str.split(",")):
+            token = token.strip()
+            if ":" in token:
+                gpu_s, port_s = token.split(":", 1)
+                slots.append((i, int(gpu_s), int(port_s)))
+            else:
+                # Just a GPU id — auto-assign port
+                slots.append((i, int(token), _PORT_BASE + i * _PORT_GAP))
+        return slots
+
+    # 2. Auto-detect via nvidia-smi
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        all_gpu_ids = [int(x) for x in out.splitlines() if x.strip().isdigit()]
+    except Exception:
+        all_gpu_ids = [0]   # safe fallback: single GPU
+
+    # 3. Optional filter
+    if ids_str := os.environ.get("GPU_IDS", "").strip():
+        wanted = {int(x) for x in ids_str.split(",") if x.strip().isdigit()}
+        all_gpu_ids = [g for g in all_gpu_ids if g in wanted]
+
+    return [
+        (i, gpu_id, _PORT_BASE + i * _PORT_GAP)
+        for i, gpu_id in enumerate(all_gpu_ids)
+    ]
+
+
+GPU_SLOTS: list[tuple[int, int, int]] = _discover_gpu_slots()
 
 # Model configs: model_name → (startup_script, served_model_name)
+# Add one entry per model you want to serve.  The startup script receives
+# VLLM_CUDA_DEVICE and VLLM_PORT from model_manager at spawn time.
 MODEL_CONFIGS: dict[str, tuple[str, str]] = {
     "qwen3.6-35b-a3b": ("run_qwen36_35b.sh", "qwen3.6-35b-a3b"),
     "qwen3.6-27b":     ("run_qwen36_27b.sh",  "qwen3.6-27b"),
 }
-
-LISTEN_PORT = 8002
 
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",

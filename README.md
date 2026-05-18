@@ -14,8 +14,8 @@ LiteLLM proxy  (:8901)   — OpenAI-compatible API, routing, fallbacks
 model_manager  (:8002)   — Dynamic GPU slot allocator
   │               │
   ▼               ▼
-vLLM slot 0    vLLM slot 1
-GPU 0 :9002    GPU 1 :9010
+vLLM slot 0    vLLM slot 1    …  vLLM slot N
+GPU 0 :9000    GPU 1 :9010      GPU N :9000+N×10
 (on-demand)    (on-demand, scale-out)
 ```
 
@@ -41,11 +41,12 @@ On a 2-GPU workstation where GPU 0 is also used for desktop/other tasks, you wan
 vLLM's EngineCore subprocess binds `api_port + N` (typically +2) for its internal ZMQ IPC socket. Slots must be spaced far enough apart that one slot's EngineCore cannot collide with another slot's API port.
 
 ```
-Slot 0  API :9002  →  EngineCore IPC :9004  (internal, not exposed)
+Slot 0  API :9000  →  EngineCore IPC :9002  (internal, not exposed)
 Slot 1  API :9010  →  EngineCore IPC :9012  (well clear of slot 0)
+Slot 2  API :9020  →  EngineCore IPC :9022  …
 ```
 
-If you assign consecutive ports (e.g. 9002 and 9003), slot 1 will always fail with *Address already in use*.
+If you assign consecutive ports (e.g. 9000 and 9001), slot 1 will always fail with *Address already in use*. The default gap of 10 is conservative and safe.
 
 ### Scale-out threshold
 
@@ -72,14 +73,42 @@ pip install aiohttp litellm
 
 ### 2. Configure GPU slots
 
-Edit the top of `model_manager.py`:
+**GPU slots are discovered automatically** — no code editing needed for common cases.
+
+By default, model_manager calls `nvidia-smi` at startup to enumerate all available GPUs and assigns:
+- Slot 0 → GPU 0 → port 9000
+- Slot 1 → GPU 1 → port 9010
+- Slot 2 → GPU 2 → port 9020
+- …and so on (port gap of 10 between slots)
+
+Override with environment variables if needed:
+
+| Variable | Example | Description |
+|---|---|---|
+| `GPU_SLOTS` | `0:9000,1:9010` | Explicit `gpu_id:api_port` pairs (overrides all other slot config) |
+| `GPU_IDS` | `2,3` | Restrict auto-detection to these GPU indices (skip GPU 0/1 used by desktop) |
+| `GPU_PORT_BASE` | `9000` | First slot's API port (default: 9000) |
+| `GPU_PORT_GAP` | `10` | Port gap between slots (default: 10; must be > 2 — see port layout above) |
+
+Examples:
+
+```bash
+# 4-GPU server, use all GPUs
+python3 model_manager.py
+
+# 8-GPU server, reserve GPUs 0-3 for other workloads, use GPUs 4-7
+GPU_IDS=4,5,6,7 python3 model_manager.py
+
+# Workstation: GPU 0 reserved for desktop, GPU 1 for models
+GPU_IDS=1 python3 model_manager.py
+
+# Fully explicit: GPU 0 on port 9000, GPU 2 on port 9020 (skip GPU 1)
+GPU_SLOTS=0:9000,2:9020 python3 model_manager.py
+```
+
+Edit `MODEL_CONFIGS` in `model_manager.py` to register your models:
 
 ```python
-GPU_SLOTS: list[tuple[int, int, int]] = [
-    (0, 0, 9002),   # (slot_id, gpu_id, api_port)
-    (1, 1, 9010),   # slot 1: GPU 1, port 9010 — not 9003! (see port layout above)
-]
-
 MODEL_CONFIGS: dict[str, tuple[str, str]] = {
     "qwen3.6-35b-a3b": ("run_qwen36_35b.sh", "qwen3.6-35b-a3b"),
     "qwen3.6-27b":     ("run_qwen36_27b.sh",  "qwen3.6-27b"),
@@ -132,11 +161,23 @@ litellm --config config.yaml --port 8901
 
 ## Environment variables
 
+### GPU slot configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `GPU_SLOTS` | *(auto)* | Explicit `gpu_id:api_port` pairs, e.g. `0:9000,1:9010` |
+| `GPU_IDS` | *(all)* | Comma-separated GPU indices to use, e.g. `1,2,3` |
+| `GPU_PORT_BASE` | `9000` | First slot's API port |
+| `GPU_PORT_GAP` | `10` | Port gap between slots (must be > 2) |
+
+### Behaviour tuning
+
 | Variable | Default | Description |
 |---|---|---|
 | `IDLE_TIMEOUT` | `300` | Seconds of inactivity before a slot is unloaded |
 | `WAKE_TIMEOUT` | `300` | Max seconds to wait for vLLM to become healthy |
 | `HEALTH_POLL`  | `2.0` | Seconds between `/health` polls during startup |
+| `LISTEN_PORT`  | `8002` | Port model_manager listens on |
 
 ## Monitoring
 
