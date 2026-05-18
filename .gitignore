@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+logs/
+*.log
+*.db
+*.db-journal
+prisma/
+.env
+gateway.env
+.claude/

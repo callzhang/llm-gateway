@@ -1,0 +1,21 @@
+[Unit]
+Description=LLM Gateway — Gemma4 E4B-it AWQ-INT4 vLLM (:9001, GPU 0, model_manager proxies :8001)
+After=network.target
+
+[Service]
+Type=simple
+User=derek
+Group=derek
+WorkingDirectory=/home/derek/Projects/llm-gateway
+EnvironmentFile=-/home/derek/Projects/llm-gateway/gateway.env
+ExecStart=/home/derek/Projects/llm-gateway/run_gemma4.sh
+Restart=on-failure
+RestartSec=60
+# vLLM model loading can take several minutes
+TimeoutStartSec=600
+TimeoutStopSec=60
+StandardOutput=append:/home/derek/Projects/llm-gateway/logs/gemma4.log
+StandardError=append:/home/derek/Projects/llm-gateway/logs/gemma4.log
+
+[Install]
+WantedBy=multi-user.target

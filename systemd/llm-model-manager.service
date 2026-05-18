@@ -1,0 +1,20 @@
+[Unit]
+Description=LLM Gateway — model_manager (spawns/unloads vLLM on demand, :8002)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/derek/Projects/llm-gateway
+EnvironmentFile=-/home/derek/Projects/llm-gateway/gateway.env
+ExecStart=/home/derek/Projects/llm-gateway/run_model_manager.sh
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=30
+StandardOutput=append:/home/derek/Projects/llm-gateway/logs/model_manager.log
+StandardError=append:/home/derek/Projects/llm-gateway/logs/model_manager.log
+
+[Install]
+WantedBy=default.target

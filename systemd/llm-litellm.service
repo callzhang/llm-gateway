@@ -1,0 +1,19 @@
+[Unit]
+Description=LLM Gateway — LiteLLM proxy (:8901)
+After=default.target llm-model-manager.service
+Requires=llm-model-manager.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/derek/Projects/llm-gateway
+EnvironmentFile=-/home/derek/Projects/llm-gateway/gateway.env
+ExecStart=/home/derek/Projects/llm-gateway/run_litellm.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=120
+TimeoutStopSec=30
+StandardOutput=append:/home/derek/Projects/llm-gateway/logs/litellm.log
+StandardError=append:/home/derek/Projects/llm-gateway/logs/litellm.log
+
+[Install]
+WantedBy=default.target

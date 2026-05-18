@@ -1,0 +1,20 @@
+[Unit]
+Description=LLM Gateway — Qwen3.6-35B-A3B NVFP4 vLLM (:9003, GPU 1)
+After=network.target
+
+[Service]
+Type=simple
+User=derek
+Group=derek
+WorkingDirectory=/home/derek/Projects/llm-gateway
+EnvironmentFile=-/home/derek/Projects/llm-gateway/gateway.env
+ExecStart=/home/derek/Projects/llm-gateway/run_qwen36_35b.sh
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=600
+TimeoutStopSec=60
+StandardOutput=append:/home/derek/Projects/llm-gateway/logs/qwen36_35b.log
+StandardError=append:/home/derek/Projects/llm-gateway/logs/qwen36_35b.log
+
+[Install]
+WantedBy=multi-user.target
