@@ -437,6 +437,35 @@ class GpuBackend:
             self._active_requests -= 1
             self.last_activity = time.monotonic()
 
+    async def _kill_gpu_zombies(self) -> None:
+        """Kill any CUDA processes still holding GPU memory after a crash."""
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid",
+                    "--format=csv,noheader",
+                    f"--id={self.gpu_id}",
+                ],
+                capture_output=True, text=True, timeout=5,
+            )
+            pids = [
+                int(l.strip())
+                for l in result.stdout.splitlines()
+                if l.strip().isdigit()
+            ]
+            for pid in pids:
+                self.log.warning(f"Killing GPU {self.gpu_id} zombie PID {pid} (post-crash)")
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+        except Exception as exc:
+            self.log.warning(f"GPU zombie cleanup failed: {exc}")
+
     async def _forward(self, request: web.Request, body: bytes) -> web.StreamResponse:
         target_url  = f"{self.vllm_base}{request.path_qs}"
         fwd_headers = {
@@ -457,6 +486,29 @@ class GpuBackend:
                 method=request.method, url=target_url,
                 headers=fwd_headers, data=body,
             ) as upstream:
+                # ── EngineCore crash detection ──────────────────────────────
+                # vLLM returns HTTP 500 with "EngineCore encountered an issue"
+                # when its EngineCore subprocess crashes during inference.
+                # The EngineCore process often survives the API server exit and
+                # holds GPU memory indefinitely.  Detect this early, mark the
+                # backend dead, and kill any lingering GPU processes.
+                if upstream.status == 500:
+                    err_body = await upstream.read()
+                    if b"EngineCore" in err_body:
+                        self.log.error(
+                            f"vLLM EngineCore crash detected on slot {self.slot.slot_id} "
+                            f"(GPU={self.gpu_id}) — marking backend dead"
+                        )
+                        self._ready = False
+                        self._failed = True
+                        if self.slot.backend is self:
+                            self.slot.backend = None
+                        asyncio.create_task(self._kill_gpu_zombies())
+                    return web.Response(
+                        status=500, content_type="application/json",
+                        body=err_body,
+                    )
+                # ── Normal streaming path ───────────────────────────────────
                 resp_headers = {
                     k: v for k, v in upstream.headers.items()
                     if k.lower() not in _HOP_BY_HOP | {"content-length"}
