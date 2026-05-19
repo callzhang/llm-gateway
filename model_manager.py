@@ -219,10 +219,14 @@ class GpuBackend:
             self._idle_task.cancel()
         async with self._lock:
             await self._kill_process_locked()
-        if self._session:
-            await self._session.close()
+        await self._close_session()
         if self.slot.backend is self:
             self.slot.backend = None
+
+    async def _close_session(self) -> None:
+        """Close the aiohttp session if still open.  Safe to call multiple times."""
+        if self._session and not self._session.closed:
+            await self._session.close()
 
     # ── Idle / dead-process watchdog ───────────────────────────────────────────
 
@@ -233,6 +237,7 @@ class GpuBackend:
 
                 # Backend was permanently failed before vLLM ever started
                 if self._failed:
+                    await self._close_session()
                     return
 
                 # Detect unexpected vLLM crash
@@ -245,6 +250,7 @@ class GpuBackend:
                     self.process  = None
                     if self.slot.backend is self:
                         self.slot.backend = None
+                    await self._close_session()
                     return   # this backend object is dead
 
                 if not self.is_running or self._active_requests > 0:
@@ -261,6 +267,7 @@ class GpuBackend:
                         await self._kill_process_locked()
                         if self.slot.backend is self:
                             self.slot.backend = None
+                        await self._close_session()
                         return   # slot is free; exit watchdog
         except asyncio.CancelledError:
             pass
@@ -930,7 +937,8 @@ class DynamicRouter:
         if prev_id := parsed.get("previous_response_id"):
             prior_messages = _response_store.get(prev_id, [])
             if not prior_messages:
-                self.log.warning(f"previous_response_id '{prev_id}' not found in store")
+                # Normal after a service restart — store is in-memory only
+                self.log.debug(f"previous_response_id '{prev_id}' not found in store — starting fresh")
 
         completions_payload = _responses_to_completions(parsed, prior_messages)
         resp_id  = f"resp_{uuid.uuid4().hex}"
