@@ -99,7 +99,16 @@ def _discover_gpu_slots() -> list[tuple[int, int, int]]:
         ).stdout.strip()
         all_gpu_ids = [int(x) for x in out.splitlines() if x.strip().isdigit()]
     except Exception:
-        all_gpu_ids = [0]   # safe fallback: single GPU
+        all_gpu_ids = []
+
+    if not all_gpu_ids:
+        # nvidia-smi failed, timed out, or returned nothing (e.g. drivers still
+        # initialising at boot).  Fall back to GPU 0 so the service can start.
+        logging.getLogger("model_manager").warning(
+            "nvidia-smi returned no GPU indices — falling back to GPU 0. "
+            "Set GPU_SLOTS env var for explicit configuration."
+        )
+        all_gpu_ids = [0]
 
     # 3. Optional filter
     if ids_str := os.environ.get("GPU_IDS", "").strip():
