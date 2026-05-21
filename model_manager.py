@@ -459,6 +459,13 @@ class GpuBackend:
         deadline = time.monotonic() + WAKE_TIMEOUT
         started  = time.monotonic()
         while time.monotonic() < deadline:
+            # Guard against _idle_loop clearing self.process concurrently
+            # (it runs without the lock; we're inside the lock but yield at await).
+            if self.process is None or self._failed:
+                raise RuntimeError(
+                    f"vLLM for '{self.model_name}' crashed during startup "
+                    f"(watchdog cleared process). See {self.log_path}."
+                )
             rc = self.process.poll()
             if rc is not None:
                 # Kill orphan children (e.g. EngineCore) that may still hold ports.
