@@ -126,6 +126,51 @@ def _discover_gpu_slots() -> list[tuple[int, int, int]]:
 GPU_SLOTS: list[tuple[int, int, int]] = _discover_gpu_slots()
 
 
+def _gpu_free_mib(gpu_id: int) -> float | None:
+    """Return free GPU memory in MiB for the given GPU, or None on error."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--id={gpu_id}",
+             "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return float(out.splitlines()[0]) if out else None
+    except Exception:
+        return None
+
+
+def _gpu_vllm_used_mib(gpu_id: int) -> float:
+    """Return total GPU memory (MiB) used by all vLLM processes on the given GPU.
+    Includes EngineCore subprocesses which hold most of the VRAM.  Returns 0 on
+    error so callers can still do a conservative check."""
+    try:
+        apps_out = subprocess.run(
+            ["nvidia-smi", f"--id={gpu_id}",
+             "--query-compute-apps=pid,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        total = 0.0
+        for line in apps_out.splitlines():
+            parts = line.split(",")
+            if len(parts) != 2:
+                continue
+            try:
+                pid_val, mem_val = int(parts[0].strip()), float(parts[1].strip())
+            except (ValueError, TypeError):
+                continue
+            try:
+                with open(f"/proc/{pid_val}/cmdline", "rb") as f:
+                    cmdline = f.read().decode("utf-8", errors="ignore")
+                if "vllm" in cmdline.lower():
+                    total += mem_val
+            except (FileNotFoundError, PermissionError):
+                pass
+        return total
+    except Exception:
+        return 0.0
+
+
 def _find_pid_on_port(port: int) -> int | None:
     """Return PID of the process listening on TCP port, or None."""
     try:
@@ -181,6 +226,17 @@ def _read_served_model_name(pid: int) -> str | None:
 MODEL_CONFIGS: dict[str, tuple[str, str]] = {
     "qwen3.6-35b-a3b": ("run_qwen36_35b.sh", "qwen3.6-35b-a3b"),
     "qwen3.6-27b":     ("run_qwen36_27b.sh",  "qwen3.6-27b"),
+}
+
+# Minimum free GPU memory (GiB, from nvidia-smi) required to start a model.
+# Used as a pre-eviction guard: before evicting an idle model to free a slot,
+# check that the target GPU will have enough room after the eviction — this
+# prevents destructively clearing a slot and then immediately failing the spawn.
+# Rule of thumb: gpu_memory_utilization × GPU_total_GiB + 1 GiB safety buffer.
+# If a model is not listed here no pre-check is performed (may evict & fail).
+MODEL_MIN_FREE_GIB: dict[str, float] = {
+    "qwen3.6-35b-a3b": 30.5,  # 0.93 × 32 GiB ≈ 29.8 + 0.7 GiB buffer
+    "qwen3.6-27b":     27.5,  # 0.84 × 32 GiB ≈ 26.9 + 0.6 GiB buffer
 }
 
 # Per-model context limits used for Responses API history trimming.
@@ -1011,7 +1067,15 @@ class DynamicRouter:
     # ── Scale-out ──────────────────────────────────────────────────────────────
 
     async def _maybe_scale_out(self, model_name: str) -> None:
-        """If all instances are saturated and a free slot exists, spawn another."""
+        """If all instances are saturated and a slot is available, spawn another.
+
+        "Available" means either a truly free slot (no backend) OR a slot whose
+        backend is a *different* model that is currently idle (0 active requests).
+        In the latter case we evict the idle model first so the saturated model
+        can use the slot.  This is important in a 2-slot system where both slots
+        are always occupied by different models — without this, scale-out would
+        never trigger even when one GPU is at 100% and the other is fully idle.
+        """
         # Respect cooldown after a previous failure (prevents crash-loop when a
         # slot cannot physically start the model, e.g. insufficient free VRAM).
         last_fail = self._scale_fail_time.get(model_name, 0)
@@ -1027,6 +1091,10 @@ class DynamicRouter:
         if any(b._active_requests == 0 for b in running):
             return   # at least one idle instance — no need to scale out
 
+        slot:    GpuSlot     | None = None
+        new_b:   GpuBackend  | None = None
+        evict_b: GpuBackend  | None = None   # idle foreign backend to evict
+
         async with self._router_lock:
             running = self._running_backends(model_name)
             if not running:
@@ -1039,14 +1107,73 @@ class DynamicRouter:
 
             running_slot_ids = {b.slot.slot_id for b in running}
             free = [s for s in self._free_slots() if s.slot_id not in running_slot_ids]
+
             if not free:
-                return
+                # No truly free slot — look for a slot whose backend is a
+                # *different* idle model we can evict to make room.
+                evictable = [
+                    s for s in self.slots
+                    if s.slot_id not in running_slot_ids
+                    and s.backend is not None
+                    and not s.backend._failed
+                    and s.backend.model_name != model_name
+                    and s.backend._active_requests == 0
+                ]
+                if not evictable:
+                    return
+
+                # Pre-eviction memory check: estimate free GPU memory after
+                # eviction by adding the victim's vLLM memory to the current
+                # free.  Avoids destructively clearing a slot only to
+                # immediately fail the spawn due to insufficient VRAM.
+                min_free_gib = MODEL_MIN_FREE_GIB.get(model_name)
+                if min_free_gib is not None:
+                    valid_targets = []
+                    for s in evictable:
+                        free_mib = _gpu_free_mib(s.gpu_id)
+                        if free_mib is None:
+                            valid_targets.append(s)   # can't query, allow it
+                            continue
+                        # All vLLM processes on this GPU will be gone after eviction.
+                        vllm_used_mib = _gpu_vllm_used_mib(s.gpu_id)
+                        free_after_gib = (free_mib + vllm_used_mib) / 1024.0
+                        if free_after_gib >= min_free_gib:
+                            valid_targets.append(s)
+                        else:
+                            self.log.info(
+                                f"Scale-out for {model_name}: skipping eviction of "
+                                f"{s.backend.model_name} on slot {s.slot_id} "
+                                f"(GPU {s.gpu_id}) — only {free_after_gib:.1f} GiB "
+                                f"would be free after eviction, need {min_free_gib:.1f} GiB"
+                            )
+                    evictable = valid_targets
+
+                if not evictable:
+                    return
+
+                victim_slot = evictable[0]
+                evict_b = victim_slot.backend   # save ref before we overwrite
+                # Atomically claim the slot — prevents any other request from
+                # grabbing it while we're killing the incumbent vLLM.
+                victim_slot.backend = None      # detach old backend
+                free = [victim_slot]
 
             slot   = free[0]
             script, served = self.model_configs[model_name]
             new_b  = GpuBackend(model_name, script, served, slot)
             slot.backend = new_b
             await new_b.start()
+
+        # ── Outside the router lock ─────────────────────────────────────────────
+        # If we evicted a foreign backend, kill its vLLM process first so its GPU
+        # memory is freed before we try to spawn on the same GPU.
+        if evict_b is not None:
+            self.log.info(
+                f"Scale-out for {model_name}: evicting idle {evict_b.model_name} "
+                f"from slot {slot.slot_id} (GPU {slot.gpu_id})"
+            )
+            async with evict_b._lock:
+                await evict_b._kill_process_locked()
 
         self.log.info(
             f"Scale-out: spawning {model_name} on slot {slot.slot_id} (GPU {slot.gpu_id})"
@@ -1272,6 +1399,14 @@ class DynamicRouter:
             # Only trigger scale-out on cache miss: a sticky conversation
             # already has a home, scaling out for it wouldn't help.
             self._trigger_scale_out(model_name)
+        # DEBUG-level so it's silent by default but available for diagnosing
+        # KV-cache / sticky-routing effectiveness when needed.
+        self.log.debug(
+            f"Responses: model={model_name} "
+            f"prev_id={'yes' if parsed.get('previous_response_id') else 'no'} "
+            f"prior_msgs={len(prior_messages)} "
+            f"msgs_sent={len(completions_payload['messages'])} → slot {backend.slot.slot_id}"
+        )
         resp_id  = f"resp_{uuid.uuid4().hex}"
         stream   = bool(parsed.get("stream", False))
         target_url   = f"{backend.vllm_base}/v1/chat/completions"
