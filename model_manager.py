@@ -375,14 +375,17 @@ class GpuBackend:
     # ── Process lifecycle ──────────────────────────────────────────────────────
 
     def _check_gpu_free(self) -> None:
-        """Raise RuntimeError if unexpected processes are occupying this GPU's VRAM.
+        """Raise RuntimeError if a leftover vLLM process is occupying this GPU's VRAM.
+
+        Only processes whose /proc/<pid>/cmdline contains 'vllm' are considered
+        blockers.  Other legitimate GPU users (e.g. embedding servers) are ignored
+        because they share VRAM without consuming the full allocation that vLLM needs.
 
         vLLM's EngineCore and worker sub-processes can escape process-group kills
         and linger with large CUDA allocations.  Catching this before launching
         produces a clean error instead of an inscrutable OOM 60s into startup.
         """
         try:
-            # List every compute process on this specific GPU
             result = subprocess.run(
                 [
                     "nvidia-smi",
@@ -393,25 +396,38 @@ class GpuBackend:
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode != 0:
-                return   # nvidia-smi unavailable — skip check
+                return
             lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
             if not lines:
-                return   # no compute processes on this GPU — good
-            # Something is there.  Collect PIDs/usage and warn loudly.
-            procs = []
+                return
+
+            vllm_procs = []
             for line in lines:
                 parts = [p.strip() for p in line.split(",")]
-                pid_s  = parts[0] if parts else "?"
-                mem_s  = parts[1] if len(parts) > 1 else "? MiB"
-                procs.append(f"PID {pid_s} ({mem_s})")
+                pid_s = parts[0] if parts else ""
+                mem_s = parts[1] if len(parts) > 1 else "? MiB"
+                if not pid_s.isdigit():
+                    continue
+                pid = int(pid_s)
+                # Only flag processes that look like vLLM (cmdline contains 'vllm')
+                try:
+                    with open(f"/proc/{pid}/cmdline", "rb") as f:
+                        cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+                    if "vllm" not in cmdline.lower():
+                        continue   # unrelated GPU user — ignore
+                except (FileNotFoundError, PermissionError):
+                    continue   # process gone or not readable — skip
+                vllm_procs.append(f"PID {pid} ({mem_s})")
+
+            if not vllm_procs:
+                return
+
             msg = (
-                f"GPU {self.gpu_id} is occupied by unexpected process(es) before spawn: "
-                + ", ".join(procs)
+                f"GPU {self.gpu_id} has leftover vLLM process(es) before spawn: "
+                + ", ".join(vllm_procs)
                 + ". Kill them manually or wait for them to exit, then retry."
             )
             self.log.error(msg)
-            # Do NOT mark _failed=True here — the caller will handle it.
-            # Use a transient error so the slot is freed and a future request can retry.
             raise RuntimeError(msg)
         except FileNotFoundError:
             pass  # nvidia-smi not installed — skip check
