@@ -1,10 +1,14 @@
 model_list:
 
-  # ── Qwen3.6-35B-A3B NVFP4 (multimodal, coding, OCR) — GPU 1 ─────────────
+  # ── Qwen3.6-35B-A3B NVFP4 (multimodal, coding, OCR) ─────────────────────
+  # Routes through model_manager :8002, which handles sticky routing by
+  # previous_response_id (vLLM prefix cache reuse), trim, scale-out across
+  # slots, and idle unload.  Single entry — model_manager does internal
+  # load balancing across however many slots are running this model.
   - model_name: qwen3.6-35b-a3b
     litellm_params:
       model: openai/qwen3.6-35b-a3b
-      api_base: http://127.0.0.1:8002/v1   # model_manager :8002 → vLLM :9003
+      api_base: http://127.0.0.1:8002/v1
       api_key: local-qwen36
       max_tokens: 32768
       timeout: 600
@@ -13,11 +17,13 @@ model_list:
       max_context_window_tokens: 122880
       supports_vision: true
 
-  # ── Qwen3.6-27B Text NVFP4+MTP — GPU 1 (exclusive, swaps with 35B) ───────
+  # ── Qwen3.6-27B Text NVFP4+MTP ──────────────────────────────────────────
+  # Also routes through model_manager.  27b shares the GPU pool with 35b
+  # — only spawns when requested and another slot is free or idle-unloads.
   - model_name: qwen3.6-27b
     litellm_params:
       model: openai/qwen3.6-27b
-      api_base: http://127.0.0.1:8002/v1   # model_manager :8002 → vLLM :9002
+      api_base: http://127.0.0.1:8002/v1
       api_key: local-qwen36
       max_tokens: 16384
       timeout: 600
