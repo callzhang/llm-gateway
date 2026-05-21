@@ -550,6 +550,40 @@ class GpuBackend:
 
 _response_store: dict[str, list[dict]] = {}
 
+# Trim conversation history when estimated input token count exceeds this.
+# Rule of thumb: 1 token ≈ 3 characters (conservative for mixed CN/EN text).
+# Default: 90 000 tokens × 3 = 270 000 chars — leaves ~30 k tokens for output.
+# Override with MAX_HISTORY_CHARS env var.
+_MAX_HISTORY_CHARS = int(os.environ.get("MAX_HISTORY_CHARS", "270000"))
+
+
+def _trim_messages(messages: list[dict], max_chars: int) -> list[dict]:
+    """Drop the oldest non-system turns until total chars ≤ max_chars.
+
+    Always keeps the system message (if any) and the final user turn so the
+    model always has a valid request to respond to.
+    """
+    def _msg_chars(m: dict) -> int:
+        c = m.get("content", "")
+        return len(c) if isinstance(c, str) else sum(
+            len(p.get("text", "")) for p in c if isinstance(p, dict)
+        )
+
+    total = sum(_msg_chars(m) for m in messages)
+    if total <= max_chars:
+        return messages
+
+    # Identify which messages can be dropped (not system, not the last message)
+    droppable = [i for i, m in enumerate(messages[:-1]) if m.get("role") != "system"]
+    while total > max_chars and droppable:
+        idx = droppable.pop(0)
+        total -= _msg_chars(messages[idx])
+        messages = [m for i, m in enumerate(messages) if i != idx]
+        # Rebuild droppable indices after removal
+        droppable = [i for i, m in enumerate(messages[:-1]) if m.get("role") != "system"]
+
+    return messages
+
 
 def _responses_to_completions(body: dict, prior_messages: list[dict] | None = None) -> dict:
     messages: list[dict] = []
@@ -599,10 +633,11 @@ def _responses_to_completions(body: dict, prior_messages: list[dict] | None = No
                     content = "\n".join(text_parts)
             messages.append({"role": role, "content": content})
 
+    messages = _trim_messages(messages, _MAX_HISTORY_CHARS)
     return {
         "model":       body.get("model", ""),
         "messages":    messages,
-        "max_tokens":  body.get("max_output_tokens", 4096),
+        "max_tokens":  body.get("max_output_tokens", 16384),
         "temperature": body.get("temperature", 1.0),
     }
 
