@@ -36,6 +36,7 @@ import signal
 import subprocess
 import time
 import uuid
+from collections import OrderedDict
 
 import aiohttp
 from aiohttp import web
@@ -124,6 +125,56 @@ def _discover_gpu_slots() -> list[tuple[int, int, int]]:
 
 GPU_SLOTS: list[tuple[int, int, int]] = _discover_gpu_slots()
 
+
+def _find_pid_on_port(port: int) -> int | None:
+    """Return PID of the process listening on TCP port, or None."""
+    try:
+        result = subprocess.run(
+            ["ss", "-tlnHp", "sport", f"= :{port}"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    import re
+    m = re.search(r"pid=(\d+)", result.stdout)
+    return int(m.group(1)) if m else None
+
+
+def _find_vllm_pid_for_port(port: int) -> int | None:
+    """Find a `vllm serve` process targeting this port, whether the port is
+    bound yet or not.  Lets adoption recognise vLLM instances that are still
+    cold-starting (model load takes ~30-60s; the API port is not bound until
+    then).  Prefers the listening PID if present, else falls back to pgrep
+    over the cmdline."""
+    if pid := _find_pid_on_port(port):
+        return pid
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"vllm serve.* --port {port}( |$)"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    pids = [int(p) for p in result.stdout.split() if p.isdigit()]
+    return pids[0] if pids else None
+
+
+def _read_served_model_name(pid: int) -> str | None:
+    """Extract --served-model-name from a process cmdline.  Lets adoption
+    identify which configured model a running vLLM is serving without needing
+    auth credentials to call /v1/models."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = f.read().split(b"\x00")
+    except (FileNotFoundError, PermissionError):
+        return None
+    for i, a in enumerate(args):
+        if a == b"--served-model-name" and i + 1 < len(args):
+            return args[i + 1].decode("utf-8", errors="ignore")
+    return None
+
 # Model configs: model_name → (startup_script, served_model_name)
 # Add one entry per model you want to serve.  The startup script receives
 # VLLM_CUDA_DEVICE and VLLM_PORT from model_manager at spawn time.
@@ -207,7 +258,15 @@ class GpuBackend:
         self.log_path    = os.path.join(LOG_DIR, f"{safe}_slot{slot.slot_id}.log")
         self.log         = logging.getLogger(f"mgr.s{slot.slot_id}.{model_name}")
 
-        self.process: asyncio.subprocess.Process | None = None
+        # Use subprocess.Popen (not asyncio.create_subprocess_exec) so that
+        # Python's exit doesn't auto-kill the child.  asyncio's subprocess
+        # transport SIGKILLs the child when the event loop closes; Popen leaves
+        # it alone, letting vLLM survive model_manager restarts (paired with
+        # systemd KillMode=process and adopt_existing_backends on next start).
+        self.process: subprocess.Popen | None = None
+        # Set when this backend was adopted (not spawned by us) — we kill it
+        # by PID since we don't have a Popen handle.
+        self._adopted_pid: int | None = None
         self._ready           = False
         self._failed          = False   # permanently dead; don't retry on this object
         self.last_activity    = time.monotonic()
@@ -218,7 +277,15 @@ class GpuBackend:
 
     @property
     def is_running(self) -> bool:
-        return self.process is not None and self.process.returncode is None
+        if self.process is not None:
+            return self.process.poll() is None
+        if self._adopted_pid is not None:
+            try:
+                os.kill(self._adopted_pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+        return False
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -261,14 +328,26 @@ class GpuBackend:
                     await self._close_session()
                     return
 
-                # Detect unexpected vLLM crash
-                if self.process is not None and self.process.returncode is not None:
+                # Detect unexpected vLLM crash (spawned or adopted)
+                crashed = False
+                if self.process is not None and self.process.poll() is not None:
+                    crashed = True
                     self.log.warning(
                         f"vLLM exited unexpectedly (rc={self.process.returncode}) — freeing slot"
                     )
+                elif self._adopted_pid is not None:
+                    try:
+                        os.kill(self._adopted_pid, 0)
+                    except ProcessLookupError:
+                        crashed = True
+                        self.log.warning(
+                            f"adopted vLLM pid={self._adopted_pid} gone — freeing slot"
+                        )
+                if crashed:
                     self._ready   = False
                     self._failed  = True
                     self.process  = None
+                    self._adopted_pid = None
                     if self.slot.backend is self:
                         self.slot.backend = None
                     await self._close_session()
@@ -352,8 +431,8 @@ class GpuBackend:
                 "VLLM_CUDA_DEVICE": str(self.gpu_id),
                 "VLLM_PORT":        str(self.vllm_port),
             }
-            self.process = await asyncio.create_subprocess_exec(
-                "bash", self.script,
+            self.process = subprocess.Popen(
+                ["bash", self.script],
                 stdout=log_fd, stderr=log_fd,
                 env=spawn_env,
                 start_new_session=True,
@@ -364,8 +443,8 @@ class GpuBackend:
         deadline = time.monotonic() + WAKE_TIMEOUT
         started  = time.monotonic()
         while time.monotonic() < deadline:
-            if self.process.returncode is not None:
-                rc = self.process.returncode
+            rc = self.process.poll()
+            if rc is not None:
                 # Kill orphan children (e.g. EngineCore) that may still hold ports.
                 try:
                     os.killpg(self.process.pid, signal.SIGTERM)
@@ -402,11 +481,12 @@ class GpuBackend:
 
     async def _kill_process_locked(self) -> None:
         """Kill vLLM and its children (including orphan sub-processes like EngineCore).
-        Caller must hold self._lock."""
+        Handles both subprocess-owned and adopted backends — both have pgid==pid
+        thanks to start_new_session=True.  Caller must hold self._lock."""
         self._ready = False
-        if self.process is None:
+        pid = self.process.pid if self.process is not None else self._adopted_pid
+        if pid is None:
             return
-        pid = self.process.pid
         # Always attempt to kill the entire process group, even if the APIServer
         # has already exited — orphan children (e.g. vLLM EngineCore) may still
         # hold ports or GPU memory and need to be explicitly reaped.
@@ -414,22 +494,25 @@ class GpuBackend:
         try:
             os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
-            # Process group already gone — nothing to kill
             self.process = None
+            self._adopted_pid = None
             return
-        if self.process.returncode is None:
-            # Main process still alive; wait for it to exit
+        # Poll for death up to 30s, then escalate to SIGKILL
+        for _ in range(30):
+            await asyncio.sleep(1)
             try:
-                await asyncio.wait_for(self.process.wait(), timeout=30)
-            except asyncio.TimeoutError:
-                self.log.warning("SIGTERM timeout — sending SIGKILL")
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await self.process.wait()
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+        else:
+            self.log.warning("SIGTERM timeout — sending SIGKILL")
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         self.log.info("vLLM unloaded")
         self.process = None
+        self._adopted_pid = None
 
     async def _ensure_running(self) -> None:
         """Block until this backend's vLLM is ready.  Serialised per-backend."""
@@ -562,6 +645,21 @@ class GpuBackend:
 
 _response_store: dict[str, list[dict]] = {}
 
+# ── Backend affinity for KV-cache reuse ───────────────────────────────────────
+# Maps response_id → slot_id of the backend that served it.  Subsequent turns
+# referencing this response_id via previous_response_id stick to the same slot
+# so vLLM's per-instance prefix cache (--enable-prefix-caching) keeps hitting.
+# OrderedDict gives FIFO eviction when the cap is reached.
+_response_affinity: "OrderedDict[str, int]" = OrderedDict()
+_AFFINITY_MAX = 10000
+
+
+def _set_affinity(resp_id: str, slot_id: int) -> None:
+    _response_affinity[resp_id] = slot_id
+    _response_affinity.move_to_end(resp_id)
+    while len(_response_affinity) > _AFFINITY_MAX:
+        _response_affinity.popitem(last=False)
+
 # ── Context-overflow circuit breaker ──────────────────────────────────────────
 # Maps a stable request key → monotonic timestamp of last rejection.
 # While the entry is younger than _CTX_CIRCUIT_TTL we short-circuit immediately
@@ -631,9 +729,14 @@ def _trim_to_fit(
             return sum(len(p.get("text", "")) for p in c if isinstance(p, dict))
         return 0
 
-    # Safety floor: never shrink budget below half the context window
-    budget = max(context_window - max_output_tokens - safety_margin,
-                 context_window // 2)
+    # Cap at 70% of the context window to leave headroom for the model's own
+    # output and avoid hitting vLLM's max_model_len edge.  Floor at half the
+    # window so we never shrink absurdly when max_output_tokens is huge.
+    budget = max(
+        min(int(context_window * 0.7),
+            context_window - max_output_tokens - safety_margin),
+        context_window // 2,
+    )
 
     system_msgs = [m for m in messages if m.get("role") == "system"]
     non_system  = [m for m in messages if m.get("role") != "system"]
@@ -1129,8 +1232,23 @@ class DynamicRouter:
                 body=json.dumps({"error": {"message": str(exc), "type": "startup_failed"}}),
             )
 
-        backend = self._pick(backends)
-        self._trigger_scale_out(model_name)
+        # Sticky routing: stick this conversation to the slot that served its
+        # prior turn so vLLM's per-instance prefix cache keeps hitting.  Falls
+        # back to least-connections if the slot is gone or now hosts a different
+        # model (in which case it won't appear in the candidate list).
+        sticky_backend: GpuBackend | None = None
+        if prev_id := parsed.get("previous_response_id"):
+            if (sticky_slot := _response_affinity.get(prev_id)) is not None:
+                sticky_backend = next(
+                    (b for b in backends if b.slot.slot_id == sticky_slot), None
+                )
+        if sticky_backend is not None:
+            backend = sticky_backend
+        else:
+            backend = self._pick(backends)
+            # Only trigger scale-out on cache miss: a sticky conversation
+            # already has a home, scaling out for it wouldn't help.
+            self._trigger_scale_out(model_name)
         resp_id  = f"resp_{uuid.uuid4().hex}"
         stream   = bool(parsed.get("stream", False))
         target_url   = f"{backend.vllm_base}/v1/chat/completions"
@@ -1154,6 +1272,7 @@ class DynamicRouter:
                 _response_store[resp_id] = completions_payload["messages"] + [
                     {"role": "assistant", "content": output_text}
                 ]
+                _set_affinity(resp_id, backend.slot.slot_id)
                 return web.json_response(result)
 
             # ── Streaming ──────────────────────────────────────────────────────
@@ -1260,6 +1379,7 @@ class DynamicRouter:
             _response_store[resp_id] = completions_payload["messages"] + [
                 {"role": "assistant", "content": full_text}
             ]
+            _set_affinity(resp_id, backend.slot.slot_id)
             await resp.write_eof()
             return resp
 
@@ -1276,6 +1396,92 @@ class DynamicRouter:
         except (json.JSONDecodeError, AttributeError):
             return None
 
+    # ── Adoption ───────────────────────────────────────────────────────────────
+
+    ADOPT_BOOT_WAIT = 120   # max seconds to wait for a booting vLLM to expose /v1/models
+
+    async def adopt_existing_backends(self) -> None:
+        """Probe each slot for a vLLM process and adopt it.
+
+        Paired with the systemd unit's KillMode=process so model_manager
+        restarts don't kill vLLM.  Detects vLLM via pgrep so we recognise
+        instances that are still cold-starting (port not yet bound).  Runs
+        all slots concurrently — at worst one slot delays startup by
+        ADOPT_BOOT_WAIT seconds (instead of N × slots).
+        """
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as session:
+            await asyncio.gather(*(
+                self._try_adopt_slot(slot, session) for slot in self.slots
+            ))
+
+    async def _try_adopt_slot(self, slot: GpuSlot,
+                              session: aiohttp.ClientSession) -> None:
+        pid = _find_vllm_pid_for_port(slot.port)
+        if pid is None:
+            return   # slot is genuinely free
+        # Identify the model from the process cmdline (avoids needing the
+        # vLLM api-key to call /v1/models).
+        served_name = _read_served_model_name(pid)
+        if not served_name:
+            self.log.warning(
+                f"Slot {slot.slot_id}: pid {pid} cmdline lacks --served-model-name — skipping"
+            )
+            return
+        match = next(
+            ((mn, script, served) for mn, (script, served)
+             in self.model_configs.items() if served == served_name),
+            None,
+        )
+        if not match:
+            self.log.warning(
+                f"Slot {slot.slot_id}: pid {pid} serves '{served_name}' which is "
+                f"not in MODEL_CONFIGS — skipping"
+            )
+            return
+        model_name, script, _ = match
+        self.log.info(
+            f"Slot {slot.slot_id}: found vLLM pid={pid} serving {served_name}, "
+            f"waiting for /health (up to {self.ADOPT_BOOT_WAIT}s)"
+        )
+        # Wait for /health — it doesn't require auth and means vLLM is serving.
+        deadline = time.monotonic() + self.ADOPT_BOOT_WAIT
+        healthy = False
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                self.log.warning(
+                    f"Slot {slot.slot_id}: vLLM pid={pid} died during boot — skipping"
+                )
+                return
+            try:
+                async with session.get(
+                    f"http://127.0.0.1:{slot.port}/health"
+                ) as r:
+                    if r.status == 200:
+                        healthy = True
+                        break
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+        if not healthy:
+            self.log.warning(
+                f"Slot {slot.slot_id}: pid {pid} /health not ready "
+                f"within {self.ADOPT_BOOT_WAIT}s — skipping"
+            )
+            return
+        b = GpuBackend(model_name, script, served_name, slot)
+        await b.start()                # init session + idle watchdog
+        b._adopted_pid = pid
+        b._ready       = True
+        slot.backend   = b
+        self.log.info(
+            f"Adopted vLLM on slot {slot.slot_id} (GPU={slot.gpu_id} "
+            f"port={slot.port} model={model_name} pid={pid})"
+        )
+
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
@@ -1288,9 +1494,14 @@ async def main() -> None:
     app = web.Application(client_max_size=100 * 1024 * 1024)
     app.router.add_route("*", "/{path_info:.*}", router.handle)
 
+    # Adopt any existing vLLM on slot ports before serving.  This keeps vLLM
+    # warm across model_manager restarts (the systemd unit is KillMode=process).
+    await router.adopt_existing_backends()
+
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "127.0.0.1", LISTEN_PORT).start()
+    site = web.TCPSite(runner, "127.0.0.1", LISTEN_PORT)
+    await site.start()
     log.info(
         f"Listening on :{LISTEN_PORT} — "
         f"models={list(MODEL_CONFIGS)} slots={[str(s) for s in slots]}"
@@ -1303,10 +1514,18 @@ async def main() -> None:
     try:
         await stop_event.wait()
     finally:
-        log.info("Shutdown — stopping all backends")
+        # Stop the listener FIRST so no new requests can arrive and trigger a
+        # spawn during shutdown (which previously orphaned a vLLM that we then
+        # could not adopt).  Then tear down idle watchdogs and sessions.  vLLM
+        # children are intentionally left running; next start adopts them.
+        log.info("Shutdown — stopping HTTP listener")
+        await site.stop()
+        log.info("Shutdown — leaving vLLM backends running (will adopt on next start)")
         for slot in slots:
+            if slot.backend and slot.backend._idle_task:
+                slot.backend._idle_task.cancel()
             if slot.backend:
-                await slot.backend.stop()
+                await slot.backend._close_session()
         await runner.cleanup()
 
 
