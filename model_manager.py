@@ -28,6 +28,7 @@ Environment overrides:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -561,6 +562,50 @@ class GpuBackend:
 
 _response_store: dict[str, list[dict]] = {}
 
+# ── Context-overflow circuit breaker ──────────────────────────────────────────
+# Maps a stable request key → monotonic timestamp of last rejection.
+# While the entry is younger than _CTX_CIRCUIT_TTL we short-circuit immediately
+# (no payload build, no GPU allocation, no vLLM cold start).
+_ctx_rejected: dict[str, float] = {}
+_CTX_CIRCUIT_TTL = 300.0   # seconds — covers LiteLLM's default retry window
+
+
+def _ctx_circuit_key(parsed: dict) -> str:
+    """Return a stable key for the circuit breaker.
+
+    Uses ``previous_response_id`` when present (exact conversation identity).
+    Falls back to a hash of model + instructions + first 2 kB of input for
+    fresh conversations that are already oversized.
+    """
+    prev_id = parsed.get("previous_response_id")
+    if prev_id:
+        return f"prev:{prev_id}"
+    model = parsed.get("model", "")
+    instr = parsed.get("instructions") or ""
+    inp   = parsed.get("input", "")
+    if not isinstance(inp, str):
+        inp = json.dumps(inp, ensure_ascii=False)
+    raw = f"{model}\x00{instr}\x00{inp[:2000]}"
+    return f"hash:{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
+
+
+def _ctx_circuit_check(key: str) -> bool:
+    """Return True if this key is tripped and the request should be rejected."""
+    now = time.monotonic()
+    # Lazy cleanup: sweep when the dict grows large
+    if len(_ctx_rejected) > 200:
+        expired = [k for k, ts in list(_ctx_rejected.items())
+                   if now - ts > _CTX_CIRCUIT_TTL * 2]
+        for k in expired:
+            _ctx_rejected.pop(k, None)
+    ts = _ctx_rejected.get(key)
+    return ts is not None and (now - ts) < _CTX_CIRCUIT_TTL
+
+
+def _ctx_circuit_trip(key: str) -> None:
+    """Record a rejection so subsequent calls with the same key are fast-failed."""
+    _ctx_rejected[key] = time.monotonic()
+
 # Trim conversation history when estimated input token count exceeds this.
 def _trim_to_fit(
     messages: list[dict],
@@ -1007,6 +1052,28 @@ class DynamicRouter:
                                             "type": "invalid_request_error"}}),
             )
 
+        # ── Circuit breaker: reject known-oversized requests immediately ──────
+        # Checked before any store lookup or payload work so the same bad
+        # request cannot repeatedly trigger a vLLM cold start.
+        cb_key = _ctx_circuit_key(parsed)
+        if _ctx_circuit_check(cb_key):
+            err_msg = (
+                f"Context window exceeded for model '{model_name}' — "
+                f"this conversation is too long to continue. "
+                f"Start a new conversation or reduce the message length."
+            )
+            self.log.warning(
+                f"Responses API: circuit breaker tripped, rejecting without GPU work "
+                f"(key={cb_key!r})"
+            )
+            return web.Response(
+                status=400, content_type="application/json",
+                headers={"x-should-retry": "false"},
+                body=json.dumps({"error": {"message": err_msg,
+                                            "type": "context_window_exceeded",
+                                            "code": "context_length_exceeded"}}),
+            )
+
         # ── Build payload and trim BEFORE spawning vLLM ───────────────────────
         # Fail fast with 400 if mandatory content already exceeds the context
         # window.  This prevents the infinite cold-start retry loop where an
@@ -1030,16 +1097,19 @@ class DynamicRouter:
             completions_payload["messages"], ctx_win, max_out
         )
         if not fits:
+            _ctx_circuit_trip(cb_key)
             err_msg = (
                 f"The mandatory content (system prompt + current user message) "
                 f"exceeds the context window for model '{model_name}' "
-                f"({ctx_win} tokens).  Please shorten your message."
+                f"({ctx_win} tokens). Please shorten your message."
             )
-            self.log.warning(f"Responses API: {err_msg}")
+            self.log.warning(f"Responses API: {err_msg} (circuit breaker armed for {cb_key!r})")
             return web.Response(
                 status=400, content_type="application/json",
+                headers={"x-should-retry": "false"},
                 body=json.dumps({"error": {"message": err_msg,
-                                            "type": "context_window_exceeded"}}),
+                                            "type": "context_window_exceeded",
+                                            "code": "context_length_exceeded"}}),
             )
         completions_payload["messages"] = trimmed_msgs
 
