@@ -127,12 +127,27 @@ async def proxy(request: Request, path: str) -> Response:
         if k.lower() not in ("host", "content-length")
     }
 
-    upstream = await _client.request(
-        method=request.method,
-        url=url,
-        headers=headers,
-        content=body,
-    )
+    try:
+        upstream = await _client.request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            content=body,
+        )
+    except httpx.RemoteProtocolError:
+        # Stale pooled connection (e.g. LiteLLM was restarted) — drop the
+        # pool, build a fresh client, retry once.  Without this a LiteLLM
+        # restart leaves the gateway returning 500s until it's restarted too.
+        global _client
+        if not _client.is_closed:
+            await _client.aclose()
+        _client = httpx.AsyncClient(timeout=600.0)
+        upstream = await _client.request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            content=body,
+        )
 
     return Response(
         content=upstream.content,
