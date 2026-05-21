@@ -117,6 +117,7 @@ async def health() -> JSONResponse:
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
 )
 async def proxy(request: Request, path: str) -> Response:
+    global _client
     url = f"{LITELLM_BASE}/{path}"
     if request.url.query:
         url += f"?{request.url.query}"
@@ -138,7 +139,6 @@ async def proxy(request: Request, path: str) -> Response:
         # Stale pooled connection (e.g. LiteLLM was restarted) — drop the
         # pool, build a fresh client, retry once.  Without this a LiteLLM
         # restart leaves the gateway returning 500s until it's restarted too.
-        global _client
         if not _client.is_closed:
             await _client.aclose()
         _client = httpx.AsyncClient(timeout=600.0)
