@@ -784,7 +784,6 @@ class DynamicRouter:
         self.model_configs = model_configs
         self.log           = logging.getLogger("mgr.router")
         self._router_lock  = asyncio.Lock()   # serialises slot claims
-        self._rr: dict[str, int] = {}          # round-robin counters per model
         self._scale_tasks: set[asyncio.Task] = set()
         # Per-model timestamp of last scale-out failure (monotonic clock).
         # Used to enforce SCALE_OUT_COOLDOWN before retrying.
@@ -942,12 +941,14 @@ class DynamicRouter:
                 slot.backend = None
 
     def _pick(self, backends: list[GpuBackend]) -> GpuBackend:
-        if len(backends) == 1:
-            return backends[0]
-        model = backends[0].model_name
-        idx   = self._rr.get(model, 0) % len(backends)
-        self._rr[model] = idx + 1
-        return backends[idx]
+        """Least-connections: route to the backend with fewest in-flight requests.
+
+        Round-robin doesn't account for queue depth — a backend that started
+        earlier can accumulate a large backlog while a newer one sits idle.
+        Least-connections naturally drains the lighter backend first.
+        Ties are broken by insertion order (oldest backend first).
+        """
+        return min(backends, key=lambda b: b._active_requests)
 
     def _trigger_scale_out(self, model_name: str) -> None:
         task = asyncio.create_task(self._maybe_scale_out(model_name))
