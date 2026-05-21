@@ -40,7 +40,7 @@ model_list:
 
 
 router_settings:
-  routing_strategy: simple-shuffle   # latency-based-routing sends periodic max_tokens=1 probes to all models, waking idle vLLMs unnecessarily
+  routing_strategy: latency-based-routing   # probes are intercepted by model_manager: cold models → 503 (no spawn), warm models → real latency measured
   num_retries: 0          # cold-starts block in model_manager — retries don't help
   retry_after: 0
 

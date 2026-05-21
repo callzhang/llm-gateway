@@ -1108,6 +1108,27 @@ class DynamicRouter:
             running_slot_ids = {b.slot.slot_id for b in running}
             free = [s for s in self._free_slots() if s.slot_id not in running_slot_ids]
 
+            # Apply minimum-free-memory filter to truly free slots too.
+            # A truly free slot on a GPU that doesn't have enough room for this
+            # model is just as doomed as an eviction target — skip it early.
+            min_free_gib = MODEL_MIN_FREE_GIB.get(model_name)
+            if min_free_gib is not None and free:
+                def _slot_has_room(s: GpuSlot) -> bool:
+                    free_mib = _gpu_free_mib(s.gpu_id)
+                    if free_mib is None:
+                        return True   # can't check, optimistically allow
+                    # For truly free slots the vLLM memory is 0 (no vLLM yet).
+                    vllm_used = _gpu_vllm_used_mib(s.gpu_id)
+                    return (free_mib + vllm_used) / 1024.0 >= min_free_gib
+                viable = [s for s in free if _slot_has_room(s)]
+                if not viable:
+                    self.log.info(
+                        f"Scale-out for {model_name}: all free slots lack sufficient "
+                        f"GPU memory (need {min_free_gib:.1f} GiB)"
+                    )
+                    return
+                free = viable
+
             if not free:
                 # No truly free slot — look for a slot whose backend is a
                 # *different* idle model we can evict to make room.
@@ -1247,7 +1268,12 @@ class DynamicRouter:
                 }}),
             )
 
-        # Probe detection — fake a success without cold-starting vLLM
+        # Probe / latency-check detection (e.g. LiteLLM latency-based-routing).
+        # Rule: only test models that are already loaded.
+        #   • Model loaded  → let the request through for real latency measurement.
+        #   • Model cold    → return 503 immediately, no spawn triggered.
+        #     LiteLLM treats the 503 as "high latency / unavailable" and avoids
+        #     routing to this model until it comes up naturally via a real request.
         try:
             parsed_body = json.loads(body)
             is_probe = (
@@ -1255,14 +1281,20 @@ class DynamicRouter:
                 and not parsed_body.get("messages", [{}])[-1].get("content", "").strip()
             )
             if is_probe:
-                fake = {
-                    "id": "probe-ok", "object": "chat.completion",
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": ""},
-                                 "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                    "model": model_name,
-                }
-                return web.json_response(fake)
+                running = self._running_backends(model_name)
+                if not running:
+                    # Model is cold — reject probe without spawning.
+                    return web.Response(
+                        status=503, content_type="application/json",
+                        body=json.dumps({"error": {
+                            "message": (
+                                f"Model '{model_name}' is not currently loaded. "
+                                "Probe rejected to prevent cold start."
+                            ),
+                            "type": "service_unavailable",
+                        }}),
+                    )
+                # Model is warm — fall through and measure real latency.
         except Exception:
             pass
 
@@ -1399,8 +1431,6 @@ class DynamicRouter:
             # Only trigger scale-out on cache miss: a sticky conversation
             # already has a home, scaling out for it wouldn't help.
             self._trigger_scale_out(model_name)
-        # DEBUG-level so it's silent by default but available for diagnosing
-        # KV-cache / sticky-routing effectiveness when needed.
         self.log.debug(
             f"Responses: model={model_name} "
             f"prev_id={'yes' if parsed.get('previous_response_id') else 'no'} "
