@@ -25,12 +25,12 @@ model_list:
     model_info:
       max_context_window_tokens: 65536
 
-  # ── External fallback (GPT-5.4-mini) ─────────────────────────────────────
-  - model_name: gpt-5.4-mini
-    litellm_params:
-      model: openai/gpt-5.4-mini
-      api_base: https://api.kksj.org/v1
-      api_key: os.environ/OPENAI_API_KEY
+  # ── External fallback (disabled — API key invalid) ───────────────────────
+  # - model_name: gpt-5.4-mini
+  #   litellm_params:
+  #     model: openai/gpt-5.4-mini
+  #     api_base: https://api.kksj.org/v1
+  #     api_key: os.environ/OPENAI_API_KEY
 
 
 router_settings:
@@ -38,14 +38,14 @@ router_settings:
   num_retries: 0          # cold-starts block in model_manager — retries don't help
   retry_after: 0
 
-  # Fallback: local fails → cloud only (no cross-GPU local fallback)
-  fallbacks:
-    - qwen3.6-35b-a3b: ["gpt-5.4-mini"]
-    - qwen3.6-27b: ["gpt-5.4-mini"]
+  # fallbacks disabled — re-enable when a valid external API key is available
+  # fallbacks:
+  #   - qwen3.6-35b-a3b: ["gpt-5.4-mini"]
+  #   - qwen3.6-27b: ["gpt-5.4-mini"]
 
-  context_window_fallbacks:
-    - qwen3.6-35b-a3b: ["gpt-5.4-mini"]
-    - qwen3.6-27b: ["gpt-5.4-mini"]
+  # context_window_fallbacks:
+  #   - qwen3.6-35b-a3b: ["gpt-5.4-mini"]
+  #   - qwen3.6-27b: ["gpt-5.4-mini"]
 
 litellm_settings:
   context_management:

@@ -131,6 +131,17 @@ MODEL_CONFIGS: dict[str, tuple[str, str]] = {
     "qwen3.6-27b":     ("run_qwen36_27b.sh",  "qwen3.6-27b"),
 }
 
+# Per-model context limits used for Responses API history trimming.
+# (context_window_tokens, max_output_tokens)
+# Keep in sync with vLLM --max-model-len and config.yaml max_tokens.
+MODEL_LIMITS: dict[str, tuple[int, int]] = {
+    "qwen3.6-35b-a3b": (122880, 32768),
+    "qwen3.6-27b":     (65536,  16384),
+}
+# Fallback for models not listed above.
+_DEFAULT_CONTEXT_WINDOW  = 32768
+_DEFAULT_MAX_OUTPUT      = 4096
+
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
@@ -551,38 +562,76 @@ class GpuBackend:
 _response_store: dict[str, list[dict]] = {}
 
 # Trim conversation history when estimated input token count exceeds this.
-# Rule of thumb: 1 token ≈ 3 characters (conservative for mixed CN/EN text).
-# Default: 90 000 tokens × 3 = 270 000 chars — leaves ~30 k tokens for output.
-# Override with MAX_HISTORY_CHARS env var.
-_MAX_HISTORY_CHARS = int(os.environ.get("MAX_HISTORY_CHARS", "270000"))
+def _trim_to_fit(
+    messages: list[dict],
+    context_window: int,
+    max_output_tokens: int,
+    safety_margin: int = 512,
+) -> tuple[list[dict], bool]:
+    """Trim conversation history to fit within the model's context window.
 
+    Conservative estimate: 1 char = 1 token (safe for Chinese/Japanese text).
+    Trims oldest (user, assistant) pairs first to keep turns coherent.
 
-def _trim_messages(messages: list[dict], max_chars: int) -> list[dict]:
-    """Drop the oldest non-system turns until total chars ≤ max_chars.
-
-    Always keeps the system message (if any) and the final user turn so the
-    model always has a valid request to respond to.
+    Returns:
+        (trimmed, True)   — trimmed list fits within budget
+        (original, False) — mandatory content (system + last user) alone exceeds
+                            the budget; caller should return 400 immediately
     """
-    def _msg_chars(m: dict) -> int:
+    def _char_count(m: dict) -> int:
         c = m.get("content", "")
-        return len(c) if isinstance(c, str) else sum(
-            len(p.get("text", "")) for p in c if isinstance(p, dict)
-        )
+        if isinstance(c, str):
+            return len(c)
+        if isinstance(c, list):
+            return sum(len(p.get("text", "")) for p in c if isinstance(p, dict))
+        return 0
 
-    total = sum(_msg_chars(m) for m in messages)
-    if total <= max_chars:
-        return messages
+    # Safety floor: never shrink budget below half the context window
+    budget = max(context_window - max_output_tokens - safety_margin,
+                 context_window // 2)
 
-    # Identify which messages can be dropped (not system, not the last message)
-    droppable = [i for i, m in enumerate(messages[:-1]) if m.get("role") != "system"]
-    while total > max_chars and droppable:
-        idx = droppable.pop(0)
-        total -= _msg_chars(messages[idx])
-        messages = [m for i, m in enumerate(messages) if i != idx]
-        # Rebuild droppable indices after removal
-        droppable = [i for i, m in enumerate(messages[:-1]) if m.get("role") != "system"]
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    non_system  = [m for m in messages if m.get("role") != "system"]
 
-    return messages
+    if not non_system:
+        return (messages, sum(_char_count(m) for m in messages) <= budget)
+
+    last_msg = [non_system[-1]]   # current user turn — always kept
+    history  = non_system[:-1]    # prior turns — eligible for trimming
+
+    # System + current user must always fit; if not, fail fast
+    mandatory_chars = sum(_char_count(m) for m in system_msgs + last_msg)
+    if mandatory_chars > budget:
+        return (messages, False)
+
+    # Group history into (user, assistant) pairs; skip orphaned assistant at start
+    pairs: list[tuple[dict, ...]] = []
+    i = 0
+    while i < len(history):
+        role = history[i].get("role")
+        if role == "user":
+            if i + 1 < len(history) and history[i + 1].get("role") == "assistant":
+                pairs.append((history[i], history[i + 1]))
+                i += 2
+            else:
+                pairs.append((history[i],))
+                i += 1
+        else:
+            # orphaned assistant or other role — skip
+            i += 1
+
+    # Include as many recent pairs as fit, working backwards from newest
+    remaining = budget - mandatory_chars
+    included: list[tuple[dict, ...]] = []
+    for pair in reversed(pairs):
+        pair_chars = sum(_char_count(m) for m in pair)
+        if pair_chars > remaining:
+            break   # this pair doesn't fit; drop it and everything older
+        included.insert(0, pair)
+        remaining -= pair_chars
+
+    trimmed = system_msgs + [m for pair in included for m in pair] + last_msg
+    return (trimmed, True)
 
 
 def _responses_to_completions(body: dict, prior_messages: list[dict] | None = None) -> dict:
@@ -633,7 +682,6 @@ def _responses_to_completions(body: dict, prior_messages: list[dict] | None = No
                     content = "\n".join(text_parts)
             messages.append({"role": role, "content": content})
 
-    messages = _trim_messages(messages, _MAX_HISTORY_CHARS)
     return {
         "model":       body.get("model", ""),
         "messages":    messages,
@@ -959,6 +1007,42 @@ class DynamicRouter:
                                             "type": "invalid_request_error"}}),
             )
 
+        # ── Build payload and trim BEFORE spawning vLLM ───────────────────────
+        # Fail fast with 400 if mandatory content already exceeds the context
+        # window.  This prevents the infinite cold-start retry loop where an
+        # oversized history causes vLLM to return 400, LiteLLM retries, the
+        # retry triggers a fresh vLLM cold start, and so on.
+        prior_messages: list[dict] = []
+        if prev_id := parsed.get("previous_response_id"):
+            prior_messages = _response_store.get(prev_id, [])
+            if not prior_messages:
+                # Normal after a service restart — store is in-memory only
+                self.log.debug(
+                    f"previous_response_id '{prev_id}' not found in store — starting fresh"
+                )
+
+        completions_payload = _responses_to_completions(parsed, prior_messages)
+
+        ctx_win, max_out = MODEL_LIMITS.get(
+            model_name, (_DEFAULT_CONTEXT_WINDOW, _DEFAULT_MAX_OUTPUT)
+        )
+        trimmed_msgs, fits = _trim_to_fit(
+            completions_payload["messages"], ctx_win, max_out
+        )
+        if not fits:
+            err_msg = (
+                f"The mandatory content (system prompt + current user message) "
+                f"exceeds the context window for model '{model_name}' "
+                f"({ctx_win} tokens).  Please shorten your message."
+            )
+            self.log.warning(f"Responses API: {err_msg}")
+            return web.Response(
+                status=400, content_type="application/json",
+                body=json.dumps({"error": {"message": err_msg,
+                                            "type": "context_window_exceeded"}}),
+            )
+        completions_payload["messages"] = trimmed_msgs
+
         try:
             backends = await self._get_or_start(model_name)
         except GPUBusyError as exc:
@@ -976,15 +1060,6 @@ class DynamicRouter:
 
         backend = self._pick(backends)
         self._trigger_scale_out(model_name)
-
-        prior_messages: list[dict] = []
-        if prev_id := parsed.get("previous_response_id"):
-            prior_messages = _response_store.get(prev_id, [])
-            if not prior_messages:
-                # Normal after a service restart — store is in-memory only
-                self.log.debug(f"previous_response_id '{prev_id}' not found in store — starting fresh")
-
-        completions_payload = _responses_to_completions(parsed, prior_messages)
         resp_id  = f"resp_{uuid.uuid4().hex}"
         stream   = bool(parsed.get("stream", False))
         target_url   = f"{backend.vllm_base}/v1/chat/completions"
