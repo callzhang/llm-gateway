@@ -245,7 +245,10 @@ MODEL_CONFIGS: dict[str, tuple[str, str, "set[int] | None"]] = {
 # Rule of thumb: gpu_memory_utilization × GPU_total_GiB + 1 GiB safety buffer.
 # If a model is not listed here no pre-check is performed (may evict & fail).
 MODEL_MIN_FREE_GIB: dict[str, float] = {
-    "qwen3.6-35b-a3b": 30.5,  # 0.93 × 32 GiB ≈ 29.8 + 0.7 GiB buffer
+    "qwen3.6-35b-a3b": 29.0,  # 0.93 × 32 GiB ≈ 29.8 GiB; lowered from 30.5
+                               # GPU 0 shares with embedding-provider (~2.2 GiB),
+                               # leaving only ~29.2 GiB free — actual vLLM usage
+                               # is ~29.1 GiB so 29.0 threshold gives 0.2 GiB margin.
     "qwen3.6-27b":     27.5,  # 0.84 × 32 GiB ≈ 26.9 + 0.6 GiB buffer
 }
 
@@ -953,9 +956,37 @@ def _trim_to_fit(
     return (trimmed, True)
 
 
+def _strip_anthropic_billing_header(instructions: str | None) -> str | None:
+    """Strip Claude CLI's per-call billing headers from the instructions field.
+
+    Claude CLI prepends `x-anthropic-billing-header: cc_version=...; cch=<hex>;\\n`
+    (and similar `x-anthropic-*` lines) to the Anthropic `system` field, which
+    LiteLLM passes through as OpenAI `instructions`.  The `cch` value is a
+    per-call counter that changes every request.  Since we pass `instructions`
+    as the system message to vLLM, the first system token differs every call,
+    which makes vLLM's rolling-hash prefix cache miss on ALL subsequent tokens
+    — even though the rest of the system prompt + ~17 KB of user content is
+    byte-identical between same-shape requests of the same task.
+
+    Stripping these lines stabilises the system tokens and lets the cache hit.
+    Billing identifiers have no semantic effect on the model's output.
+    """
+    if not instructions:
+        return instructions
+    while True:
+        stripped = instructions.lstrip()
+        if not stripped.lower().startswith("x-anthropic-"):
+            break
+        nl = instructions.find("\n")
+        if nl < 0:
+            return ""
+        instructions = instructions[nl + 1 :]
+    return instructions
+
+
 def _responses_to_completions(body: dict, prior_messages: list[dict] | None = None) -> dict:
     messages: list[dict] = []
-    instructions = body.get("instructions")
+    instructions = _strip_anthropic_billing_header(body.get("instructions"))
 
     if prior_messages:
         if instructions:
@@ -1491,7 +1522,6 @@ class DynamicRouter:
                 body=json.dumps({"error": {"message": "invalid JSON",
                                             "type": "invalid_request_error"}}),
             )
-
         model_name = parsed.get("model", "")
         if model_name not in self.model_configs:
             self.log.warning(f"Responses API: unknown model '{model_name}'")

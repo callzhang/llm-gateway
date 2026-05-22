@@ -12,15 +12,30 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
 
+# GPU 0 shares with embedding-provider (~2.2 GiB + CUDA ctx ~0.45 GiB overhead),
+# leaving ~28.75 GiB free for vLLM.  Must satisfy two constraints:
+#   (1) startup check: util × 31.36 GiB < 28.75 GiB  → util < 0.9168
+#   (2) KV cache min:  at 0.914 util, available KV = 1.06 GiB (46 blocks × 2096-tok)
+#       max_model_len must need ≤ 46 blocks; 81920 needs 40 blocks (0.92 GiB) ✓
+#       122880 would need 59 blocks (1.3 GiB) — too large for GPU 0.
+# GPU 1 is unshared; keep 0.93 util and full 122880 context.
+if [[ "${VLLM_CUDA_DEVICE:-1}" == "0" ]]; then
+  GPU_MEM_UTIL=0.914
+  MAX_MODEL_LEN=81920   # GPU 0: reduced context (KV cache constraint); 40 blocks × 2096
+else
+  GPU_MEM_UTIL=0.93
+  MAX_MODEL_LEN=122880  # GPU 1: unshared, full context window
+fi
+
 exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
   --api-key local-qwen36 \
   --served-model-name qwen3.6-35b-a3b \
   --quantization compressed-tensors \
-  --gpu-memory-utilization 0.93 \
-  --max-model-len 122880 \
-  --max-num-seqs 4 \
+  --gpu-memory-utilization ${GPU_MEM_UTIL} \
+  --max-model-len ${MAX_MODEL_LEN} \
+  --max-num-seqs 2 \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
   --enable-chunked-prefill \
@@ -28,5 +43,4 @@ exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve RedHatAI/Qwen3.6-35B
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --trust-remote-code \
-  --no-disable-hybrid-kv-cache-manager \
-  --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":26843545600}}'
+  --no-disable-hybrid-kv-cache-manager
