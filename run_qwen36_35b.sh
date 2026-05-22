@@ -27,4 +27,6 @@ exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve RedHatAI/Qwen3.6-35B
   --max-num-batched-tokens 4096 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
-  --trust-remote-code
+  --trust-remote-code \
+  --no-disable-hybrid-kv-cache-manager \
+  --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":26843545600}}'
