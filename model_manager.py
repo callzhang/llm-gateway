@@ -1415,23 +1415,30 @@ class DynamicRouter:
             self._trigger_scale_out(model_name)
         # Record affinity so subsequent turns of the same task pin here.
         task_id = _extract_task_id(parsed_body_for_sticky, request.headers)
+        # Approximate prompt size (sum of message-content chars) so the pipeline
+        # team can grep-by-task and see whether multi-turn history is growing.
+        msgs = (parsed_body_for_sticky or {}).get("messages", []) or []
+        approx_chars = sum(
+            len(m.get("content", "")) if isinstance(m.get("content"), str)
+            else sum(len(p.get("text", "") or "") for p in (m.get("content") or []) if isinstance(p, dict))
+            for m in msgs if isinstance(m, dict)
+        )
         if task_id:
             hit_status = "hit" if sticky_backend is not None else "fresh"
             self.log.info(
-                f"Sticky chat/completions: task_id={task_id} {hit_status} → slot {backend.slot.slot_id}"
+                f"Sticky chat/completions: task_id={task_id} {hit_status} → slot {backend.slot.slot_id} "
+                f"(msgs={len(msgs)}, chars≈{approx_chars})"
             )
             _set_task_affinity(task_id, backend.slot.slot_id)
         else:
-            # Diagnostic: when no task_id is found, log what we received so we
-            # can trace whether the upstream is passing it via header / body.user
-            # / body.metadata.task_id.
             hdr_summary = ", ".join(
                 f"{k.lower()}" for k in request.headers
                 if k.lower().startswith(("x-", "anthropic-", "authorization", "user-agent"))
             )
             body_keys = sorted(parsed_body_for_sticky.keys()) if parsed_body_for_sticky else []
             self.log.info(
-                f"chat/completions no task_id (headers: [{hdr_summary}], body keys: {body_keys})"
+                f"chat/completions no task_id (headers: [{hdr_summary}], body keys: {body_keys}, "
+                f"msgs={len(msgs)}, chars≈{approx_chars})"
             )
         return await backend.proxy(request, body)
 
@@ -1550,10 +1557,20 @@ class DynamicRouter:
             self._trigger_scale_out(model_name)
         # Record task-id affinity for subsequent turns of the same task.
         task_id = _extract_task_id(parsed, request.headers)
+        # Approximate prompt size as the sum of message-content chars (good enough
+        # for the pipeline team to grep-by-task and see whether multi-turn history
+        # is actually growing).
+        msgs = completions_payload["messages"]
+        approx_chars = sum(
+            len(m.get("content", "")) if isinstance(m.get("content"), str)
+            else sum(len(p.get("text", "") or "") for p in m.get("content", []) if isinstance(p, dict))
+            for m in msgs
+        )
         if task_id:
             hit_status = "hit" if sticky_backend is not None else "fresh"
             self.log.info(
-                f"Sticky responses: task_id={task_id} {hit_status} → slot {backend.slot.slot_id}"
+                f"Sticky responses: task_id={task_id} {hit_status} → slot {backend.slot.slot_id} "
+                f"(msgs={len(msgs)}, chars≈{approx_chars})"
             )
             _set_task_affinity(task_id, backend.slot.slot_id)
         else:
@@ -1565,7 +1582,7 @@ class DynamicRouter:
             self.log.info(
                 f"responses no task_id (headers: [{hdr_summary}], body keys: {body_keys}, "
                 f"prev_id={'yes' if parsed.get('previous_response_id') else 'no'}, "
-                f"msgs_sent={len(completions_payload['messages'])})"
+                f"msgs={len(msgs)}, chars≈{approx_chars})"
             )
         resp_id  = f"resp_{uuid.uuid4().hex}"
         stream   = bool(parsed.get("stream", False))
