@@ -220,12 +220,19 @@ def _read_served_model_name(pid: int) -> str | None:
             return args[i + 1].decode("utf-8", errors="ignore")
     return None
 
-# Model configs: model_name → (startup_script, served_model_name)
-# Add one entry per model you want to serve.  The startup script receives
-# VLLM_CUDA_DEVICE and VLLM_PORT from model_manager at spawn time.
-MODEL_CONFIGS: dict[str, tuple[str, str]] = {
-    "qwen3.6-35b-a3b": ("run_qwen36_35b.sh", "qwen3.6-35b-a3b"),
-    "qwen3.6-27b":     ("run_qwen36_27b.sh",  "qwen3.6-27b"),
+# Model configs: model_name → (startup_script, served_model_name, allowed_gpu_ids)
+#
+# allowed_gpu_ids: set of GPU IDs this model is permitted to run on.
+#   None  = no restriction (model works on any GPU in the pool).
+#   {1}   = only GPU 1 (e.g. 35B needs the full 32 GiB on GPU 1 because the
+#           embedding-provider occupies ~2.5–3.5 GiB on GPU 0, leaving only
+#           ~28.5 GiB — not enough for gpu_memory_utilization=0.93 × 32 GiB).
+#
+# The startup script receives VLLM_CUDA_DEVICE and VLLM_PORT from model_manager
+# at spawn time.
+MODEL_CONFIGS: dict[str, tuple[str, str, "set[int] | None"]] = {
+    "qwen3.6-35b-a3b": ("run_qwen36_35b.sh", "qwen3.6-35b-a3b", {1}),
+    "qwen3.6-27b":     ("run_qwen36_27b.sh",  "qwen3.6-27b",    None),
 }
 
 # Minimum free GPU memory (GiB, from nvidia-smi) required to start a model.
@@ -739,6 +746,35 @@ def _set_affinity(resp_id: str, slot_id: int) -> None:
     while len(_response_affinity) > _AFFINITY_MAX:
         _response_affinity.popitem(last=False)
 
+
+# ── Task-id affinity (for clients that propagate `x-task-id` header) ───────────
+# Stable across retries / bails / stage transitions for a given pipeline task.
+# Lets us keep all turns of one task on the same vLLM slot regardless of
+# whether they go through /v1/responses or /v1/chat/completions, and without
+# requiring `previous_response_id` (which Claude-CLI clients can't supply).
+_task_affinity: "OrderedDict[str, int]" = OrderedDict()
+
+
+def _set_task_affinity(task_id: str, slot_id: int) -> None:
+    _task_affinity[task_id] = slot_id
+    _task_affinity.move_to_end(task_id)
+    while len(_task_affinity) > _AFFINITY_MAX:
+        _task_affinity.popitem(last=False)
+
+
+def _sticky_slot_for(parsed_body: dict | None, headers) -> tuple[int | None, str]:
+    """Resolve the preferred slot for this request, given any combination of
+    `x-task-id` header (preferred — stable across a whole pipeline task) and
+    `previous_response_id` in the body.  Returns (slot_id | None, reason)."""
+    task_id = headers.get("x-task-id") or headers.get("X-Task-Id")
+    if task_id and (s := _task_affinity.get(task_id)) is not None:
+        return s, f"task:{task_id}"
+    if parsed_body:
+        prev_id = parsed_body.get("previous_response_id")
+        if prev_id and (s := _response_affinity.get(prev_id)) is not None:
+            return s, f"prev:{prev_id[:24]}"
+    return None, "none"
+
 # ── Context-overflow circuit breaker ──────────────────────────────────────────
 # Maps a stable request key → monotonic timestamp of last rejection.
 # While the entry is younger than _CTX_CIRCUIT_TTL we short-circuit immediately
@@ -961,7 +997,7 @@ class DynamicRouter:
     # (e.g. not enough free VRAM because another process is on that GPU).
     SCALE_OUT_COOLDOWN = 120  # 2 minutes — short enough to recover after transient OOM
 
-    def __init__(self, slots: list[GpuSlot], model_configs: dict[str, tuple[str, str]]):
+    def __init__(self, slots: list[GpuSlot], model_configs: dict[str, tuple[str, str, "set[int] | None"]]):
         self.slots         = slots
         self.model_configs = model_configs
         self.log           = logging.getLogger("mgr.router")
@@ -1004,6 +1040,15 @@ class DynamicRouter:
                 result.append(s)
         return result
 
+    def _allowed_gpus(self, model_name: str) -> "set[int] | None":
+        """GPU IDs this model may occupy, or None if unconstrained.
+
+        Derived from the 3rd element of each MODEL_CONFIGS entry.  A None
+        return means the model can run on any GPU in the slot pool.
+        """
+        cfg = self.model_configs.get(model_name)
+        return cfg[2] if cfg is not None else None
+
     # ── Core: get or start a backend ──────────────────────────────────────────
 
     async def _get_or_start(self, model_name: str) -> list[GpuBackend]:
@@ -1039,15 +1084,26 @@ class DynamicRouter:
                 b = claimed[0]   # another coroutine claimed while we waited — fall through
             else:
                 free = self._free_slots()
-                if not free:
+                # Apply GPU affinity: drop slots on GPUs this model cannot use.
+                allowed = self._allowed_gpus(model_name)
+                compatible = [s for s in free if allowed is None or s.gpu_id in allowed]
+                if not compatible:
                     occupied = [(s.slot_id, s.current_model) for s in self.slots
                                 if not s.is_free]
+                    if allowed is not None and free:
+                        # Free slots exist but none are on an allowed GPU.
+                        raise GPUBusyError(
+                            f"No compatible GPU slot for '{model_name}' "
+                            f"(allowed GPUs: {allowed}; free slots are on "
+                            f"non-allowed GPUs). "
+                            f"Retry after {IDLE_TIMEOUT}s idle."
+                        )
                     raise GPUBusyError(
                         f"All GPU slots are occupied: {occupied}. "
                         f"Retry after {IDLE_TIMEOUT}s idle."
                     )
-                slot   = free[0]
-                script, served = self.model_configs[model_name]
+                slot   = compatible[0]
+                script, served, _ = self.model_configs[model_name]
                 b      = GpuBackend(model_name, script, served, slot)
                 slot.backend = b          # CLAIM — blocks other models from this slot
                 await b.start()           # init session + idle watchdog
@@ -1106,7 +1162,12 @@ class DynamicRouter:
                 return
 
             running_slot_ids = {b.slot.slot_id for b in running}
-            free = [s for s in self._free_slots() if s.slot_id not in running_slot_ids]
+            allowed = self._allowed_gpus(model_name)
+            free = [
+                s for s in self._free_slots()
+                if s.slot_id not in running_slot_ids
+                and (allowed is None or s.gpu_id in allowed)
+            ]
 
             # Apply minimum-free-memory filter to truly free slots too.
             # A truly free slot on a GPU that doesn't have enough room for this
@@ -1139,6 +1200,8 @@ class DynamicRouter:
                     and not s.backend._failed
                     and s.backend.model_name != model_name
                     and s.backend._active_requests == 0
+                    and s.backend._ready              # never evict a mid-spawn backend
+                    and (allowed is None or s.gpu_id in allowed)
                 ]
                 if not evictable:
                     return
@@ -1180,7 +1243,7 @@ class DynamicRouter:
                 free = [victim_slot]
 
             slot   = free[0]
-            script, served = self.model_configs[model_name]
+            script, served, _ = self.model_configs[model_name]
             new_b  = GpuBackend(model_name, script, served, slot)
             slot.backend = new_b
             await new_b.start()
@@ -1313,8 +1376,43 @@ class DynamicRouter:
                 body=json.dumps({"error": {"message": str(exc), "type": "startup_failed"}}),
             )
 
-        backend = self._pick(backends)
-        self._trigger_scale_out(model_name)
+        # Sticky routing: prefer x-task-id header (stable across a pipeline task)
+        # so all turns of one task land on the same vLLM slot and benefit from
+        # the instance's prefix cache.  Falls back to previous_response_id, then
+        # least-connections.
+        try:
+            parsed_body_for_sticky = json.loads(body) if body else None
+        except Exception:
+            parsed_body_for_sticky = None
+        sticky_slot, sticky_reason = _sticky_slot_for(parsed_body_for_sticky, request.headers)
+        sticky_backend: GpuBackend | None = None
+        if sticky_slot is not None:
+            sticky_backend = next(
+                (b for b in backends if b.slot.slot_id == sticky_slot), None
+            )
+        if sticky_backend is not None:
+            backend = sticky_backend
+        else:
+            backend = self._pick(backends)
+            self._trigger_scale_out(model_name)
+        # Record affinity so subsequent turns of the same task pin here.
+        task_id = request.headers.get("x-task-id") or request.headers.get("X-Task-Id")
+        if task_id:
+            hit_status = "hit" if sticky_backend is not None else "fresh"
+            self.log.info(
+                f"Sticky chat/completions: x-task-id={task_id} {hit_status} → slot {backend.slot.slot_id}"
+            )
+            _set_task_affinity(task_id, backend.slot.slot_id)
+        else:
+            # Diagnostic: when x-task-id isn't present, log what we DID receive
+            # so we can trace whether the header is being stripped upstream.
+            hdr_summary = ", ".join(
+                f"{k.lower()}" for k in request.headers
+                if k.lower().startswith(("x-", "anthropic-", "authorization", "user-agent"))
+            )
+            self.log.info(
+                f"chat/completions no x-task-id (headers seen: [{hdr_summary}])"
+            )
         return await backend.proxy(request, body)
 
     # ── Responses API ──────────────────────────────────────────────────────────
@@ -1414,16 +1512,15 @@ class DynamicRouter:
                 body=json.dumps({"error": {"message": str(exc), "type": "startup_failed"}}),
             )
 
-        # Sticky routing: stick this conversation to the slot that served its
-        # prior turn so vLLM's per-instance prefix cache keeps hitting.  Falls
-        # back to least-connections if the slot is gone or now hosts a different
-        # model (in which case it won't appear in the candidate list).
+        # Sticky routing: prefer x-task-id (stable across pipeline task lifetime),
+        # fall back to previous_response_id, then least-connections.  Keeps all
+        # turns of one conversation on the same vLLM slot for prefix cache reuse.
+        sticky_slot, _ = _sticky_slot_for(parsed, request.headers)
         sticky_backend: GpuBackend | None = None
-        if prev_id := parsed.get("previous_response_id"):
-            if (sticky_slot := _response_affinity.get(prev_id)) is not None:
-                sticky_backend = next(
-                    (b for b in backends if b.slot.slot_id == sticky_slot), None
-                )
+        if sticky_slot is not None:
+            sticky_backend = next(
+                (b for b in backends if b.slot.slot_id == sticky_slot), None
+            )
         if sticky_backend is not None:
             backend = sticky_backend
         else:
@@ -1431,6 +1528,10 @@ class DynamicRouter:
             # Only trigger scale-out on cache miss: a sticky conversation
             # already has a home, scaling out for it wouldn't help.
             self._trigger_scale_out(model_name)
+        # Record task-id affinity for subsequent turns of the same task.
+        task_id = request.headers.get("x-task-id") or request.headers.get("X-Task-Id")
+        if task_id:
+            _set_task_affinity(task_id, backend.slot.slot_id)
         self.log.debug(
             f"Responses: model={model_name} "
             f"prev_id={'yes' if parsed.get('previous_response_id') else 'no'} "
@@ -1586,7 +1687,12 @@ class DynamicRouter:
 
     # ── Adoption ───────────────────────────────────────────────────────────────
 
-    ADOPT_BOOT_WAIT = 120   # max seconds to wait for a booting vLLM to expose /v1/models
+    ADOPT_BOOT_WAIT = 5     # max seconds to wait for a booting vLLM to expose /v1/models
+    # NOTE: Keep this short (≤5s). Long values cause instance pile-up: with RestartSec=10
+    # and ADOPT_BOOT_WAIT=120, up to 12 instances accumulate waiting for the same vLLM.
+    # When vLLM finally responds, all instances complete adoption, port 8002 contention
+    # causes crashes, and the ExecStartPre fuser (now removed) SIGKILLs stable instances.
+    # At 5s, if vLLM isn't ready yet, skip adoption — first request triggers a fresh spawn.
 
     async def adopt_existing_backends(self) -> None:
         """Probe each slot for a vLLM process and adopt it.
@@ -1618,7 +1724,7 @@ class DynamicRouter:
             )
             return
         match = next(
-            ((mn, script, served) for mn, (script, served)
+            ((mn, script, served) for mn, (script, served, _allowed)
              in self.model_configs.items() if served == served_name),
             None,
         )
