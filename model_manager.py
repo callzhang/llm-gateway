@@ -1896,15 +1896,31 @@ async def main() -> None:
         # spawn during shutdown (which previously orphaned a vLLM that we then
         # could not adopt).  Then tear down idle watchdogs and sessions.  vLLM
         # children are intentionally left running; next start adopts them.
+        #
+        # All phases are bounded so total shutdown is < 10s — keeps systemd's
+        # state machine from getting confused during heavy in-flight load
+        # (the "mm zombie" pattern: slow shutdown overlaps a queued restart,
+        # the new instance races against the old one, and systemd loses
+        # MainPID tracking).  Half-completed in-flight requests get cut off —
+        # callers retry, which is fine.
         log.info("Shutdown — stopping HTTP listener")
-        await site.stop()
+        try:
+            await asyncio.wait_for(site.stop(), timeout=5.0)
+        except asyncio.TimeoutError:
+            log.warning("site.stop() exceeded 5s — forcing exit")
         log.info("Shutdown — leaving vLLM backends running (will adopt on next start)")
         for slot in slots:
             if slot.backend and slot.backend._idle_task:
                 slot.backend._idle_task.cancel()
             if slot.backend:
-                await slot.backend._close_session()
-        await runner.cleanup()
+                try:
+                    await asyncio.wait_for(slot.backend._close_session(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+        try:
+            await asyncio.wait_for(runner.cleanup(), timeout=3.0)
+        except asyncio.TimeoutError:
+            log.warning("runner.cleanup() exceeded 3s — forcing exit")
 
 
 if __name__ == "__main__":
