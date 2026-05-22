@@ -407,9 +407,21 @@ class GpuBackend:
                             f"adopted vLLM pid={self._adopted_pid} gone — freeing slot"
                         )
                 if crashed:
-                    self._ready   = False
-                    self._failed  = True
-                    self.process  = None
+                    self._ready  = False
+                    self._failed = True
+                    # Kill orphan children before dropping the handle — EngineCore ignores
+                    # SIGTERM and survives the APIServer exit, holding GPU memory.
+                    if self.process is not None:
+                        try:
+                            os.killpg(self.process.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
+                    elif self._adopted_pid is not None:
+                        try:
+                            os.killpg(self._adopted_pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
+                    self.process      = None
                     self._adopted_pid = None
                     if self.slot.backend is self:
                         self.slot.backend = None
@@ -519,22 +531,37 @@ class GpuBackend:
         finally:
             log_fd.close()
 
+        # Save the pid immediately after Popen so we can kill the process group
+        # even if _idle_loop races and clears self.process before we detect the
+        # failure.  EngineCore (a subprocess) inherits the same pgid and ignores
+        # SIGTERM, so we must use SIGKILL to reclaim GPU memory on any failure.
+        spawn_pid = self.process.pid
+
         deadline = time.monotonic() + WAKE_TIMEOUT
         started  = time.monotonic()
         while time.monotonic() < deadline:
             # Guard against _idle_loop clearing self.process concurrently
             # (it runs without the lock; we're inside the lock but yield at await).
             if self.process is None or self._failed:
+                # Orphan-kill: _idle_loop dropped the handle but EngineCore
+                # may still be running with 29+ GiB of GPU memory.
+                try:
+                    os.killpg(spawn_pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
                 raise RuntimeError(
                     f"vLLM for '{self.model_name}' crashed during startup "
                     f"(watchdog cleared process). See {self.log_path}."
                 )
             rc = self.process.poll()
             if rc is not None:
-                # Kill orphan children (e.g. EngineCore) that may still hold ports.
+                # APIServer exited — SIGKILL the process group immediately.
+                # vLLM EngineCore subprocesses ignore SIGTERM and would otherwise
+                # hold GPU memory until the next spawn attempt triggers a "leftover
+                # process" error.
                 try:
-                    os.killpg(self.process.pid, signal.SIGTERM)
-                except ProcessLookupError:
+                    os.killpg(spawn_pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
                     pass
                 self.process = None
                 raise RuntimeError(
@@ -554,8 +581,8 @@ class GpuBackend:
                         )
                         self._ready = True
                         return
-            except Exception:
-                pass
+            except Exception as exc:
+                self.log.debug(f"health poll: {type(exc).__name__}: {exc}")
             await asyncio.sleep(HEALTH_POLL)
 
         self.log.error(f"Startup timed out after {WAKE_TIMEOUT}s — killing")
@@ -764,18 +791,26 @@ def _set_task_affinity(task_id: str, slot_id: int) -> None:
 
 def _extract_task_id(parsed_body: dict | None, headers) -> str | None:
     """Locate a stable per-task identifier across several places, in priority order:
-      1. `x-task-id` HTTP header (cleanest, but LiteLLM strips client headers when
-         proxying via openai-python SDK so this rarely arrives).
-      2. `user` field in body (OpenAI-standard; LiteLLM always forwards body).
-      3. `metadata.task_id` in body (LiteLLM-style metadata passthrough).
+      1. `x-task-id` HTTP header — cleanest, but LiteLLM strips client headers
+         when proxying via openai-python SDK, so this rarely arrives.
+      2. `metadata.user_id.device_id` in body — annotation-pipeline path
+         (commit 837f876).  Field is named "device_id" but value is the
+         per-task identifier injected by claude CLI via .claude.json:userID.
+      3. `metadata.task_id` in body — generic LiteLLM metadata passthrough.
+      4. `user` field in body — OpenAI-standard; legacy path that previously
+         carried device_id (per-device, not per-task) so a poor sticky key.
     """
     if tid := (headers.get("x-task-id") or headers.get("X-Task-Id")):
         return tid
     if parsed_body:
-        if tid := parsed_body.get("user"):
-            return str(tid)
         meta = parsed_body.get("metadata")
-        if isinstance(meta, dict) and (tid := meta.get("task_id")):
+        if isinstance(meta, dict):
+            user_id = meta.get("user_id")
+            if isinstance(user_id, dict) and (tid := user_id.get("device_id")):
+                return str(tid)
+            if tid := meta.get("task_id"):
+                return str(tid)
+        if tid := parsed_body.get("user"):
             return str(tid)
     return None
 
