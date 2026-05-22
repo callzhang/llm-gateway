@@ -224,14 +224,17 @@ def _read_served_model_name(pid: int) -> str | None:
 #
 # allowed_gpu_ids: set of GPU IDs this model is permitted to run on.
 #   None  = no restriction (model works on any GPU in the pool).
-#   {1}   = only GPU 1 (e.g. 35B needs the full 32 GiB on GPU 1 because the
-#           embedding-provider occupies ~2.5–3.5 GiB on GPU 0, leaving only
-#           ~28.5 GiB — not enough for gpu_memory_utilization=0.93 × 32 GiB).
+#
+# 35B-A3B used to be pinned to GPU 1 because the embedding-provider on GPU 0
+# took ~2.5–3.5 GiB, leaving only ~28.5 GiB free vs the 29.16 GiB needed for
+# gpu_memory_utilization=0.93 × 32 GiB.  Relaxing to None now: _check_gpu_free
+# guards against actually-too-tight cases at spawn time, and most of the time
+# GPU 0 has enough headroom to host a scale-out 35B replica.
 #
 # The startup script receives VLLM_CUDA_DEVICE and VLLM_PORT from model_manager
 # at spawn time.
 MODEL_CONFIGS: dict[str, tuple[str, str, "set[int] | None"]] = {
-    "qwen3.6-35b-a3b": ("run_qwen36_35b.sh", "qwen3.6-35b-a3b", {1}),
+    "qwen3.6-35b-a3b": ("run_qwen36_35b.sh", "qwen3.6-35b-a3b", None),
     "qwen3.6-27b":     ("run_qwen36_27b.sh",  "qwen3.6-27b",    None),
 }
 
