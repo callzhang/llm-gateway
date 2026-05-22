@@ -762,11 +762,29 @@ def _set_task_affinity(task_id: str, slot_id: int) -> None:
         _task_affinity.popitem(last=False)
 
 
+def _extract_task_id(parsed_body: dict | None, headers) -> str | None:
+    """Locate a stable per-task identifier across several places, in priority order:
+      1. `x-task-id` HTTP header (cleanest, but LiteLLM strips client headers when
+         proxying via openai-python SDK so this rarely arrives).
+      2. `user` field in body (OpenAI-standard; LiteLLM always forwards body).
+      3. `metadata.task_id` in body (LiteLLM-style metadata passthrough).
+    """
+    if tid := (headers.get("x-task-id") or headers.get("X-Task-Id")):
+        return tid
+    if parsed_body:
+        if tid := parsed_body.get("user"):
+            return str(tid)
+        meta = parsed_body.get("metadata")
+        if isinstance(meta, dict) and (tid := meta.get("task_id")):
+            return str(tid)
+    return None
+
+
 def _sticky_slot_for(parsed_body: dict | None, headers) -> tuple[int | None, str]:
     """Resolve the preferred slot for this request, given any combination of
-    `x-task-id` header (preferred — stable across a whole pipeline task) and
-    `previous_response_id` in the body.  Returns (slot_id | None, reason)."""
-    task_id = headers.get("x-task-id") or headers.get("X-Task-Id")
+    `x-task-id` (header or body) and `previous_response_id` in the body.
+    Returns (slot_id | None, reason)."""
+    task_id = _extract_task_id(parsed_body, headers)
     if task_id and (s := _task_affinity.get(task_id)) is not None:
         return s, f"task:{task_id}"
     if parsed_body:
@@ -1396,22 +1414,24 @@ class DynamicRouter:
             backend = self._pick(backends)
             self._trigger_scale_out(model_name)
         # Record affinity so subsequent turns of the same task pin here.
-        task_id = request.headers.get("x-task-id") or request.headers.get("X-Task-Id")
+        task_id = _extract_task_id(parsed_body_for_sticky, request.headers)
         if task_id:
             hit_status = "hit" if sticky_backend is not None else "fresh"
             self.log.info(
-                f"Sticky chat/completions: x-task-id={task_id} {hit_status} → slot {backend.slot.slot_id}"
+                f"Sticky chat/completions: task_id={task_id} {hit_status} → slot {backend.slot.slot_id}"
             )
             _set_task_affinity(task_id, backend.slot.slot_id)
         else:
-            # Diagnostic: when x-task-id isn't present, log what we DID receive
-            # so we can trace whether the header is being stripped upstream.
+            # Diagnostic: when no task_id is found, log what we received so we
+            # can trace whether the upstream is passing it via header / body.user
+            # / body.metadata.task_id.
             hdr_summary = ", ".join(
                 f"{k.lower()}" for k in request.headers
                 if k.lower().startswith(("x-", "anthropic-", "authorization", "user-agent"))
             )
+            body_keys = sorted(parsed_body_for_sticky.keys()) if parsed_body_for_sticky else []
             self.log.info(
-                f"chat/completions no x-task-id (headers seen: [{hdr_summary}])"
+                f"chat/completions no task_id (headers: [{hdr_summary}], body keys: {body_keys})"
             )
         return await backend.proxy(request, body)
 
@@ -1529,15 +1549,24 @@ class DynamicRouter:
             # already has a home, scaling out for it wouldn't help.
             self._trigger_scale_out(model_name)
         # Record task-id affinity for subsequent turns of the same task.
-        task_id = request.headers.get("x-task-id") or request.headers.get("X-Task-Id")
+        task_id = _extract_task_id(parsed, request.headers)
         if task_id:
+            hit_status = "hit" if sticky_backend is not None else "fresh"
+            self.log.info(
+                f"Sticky responses: task_id={task_id} {hit_status} → slot {backend.slot.slot_id}"
+            )
             _set_task_affinity(task_id, backend.slot.slot_id)
-        self.log.debug(
-            f"Responses: model={model_name} "
-            f"prev_id={'yes' if parsed.get('previous_response_id') else 'no'} "
-            f"prior_msgs={len(prior_messages)} "
-            f"msgs_sent={len(completions_payload['messages'])} → slot {backend.slot.slot_id}"
-        )
+        else:
+            hdr_summary = ", ".join(
+                f"{k.lower()}" for k in request.headers
+                if k.lower().startswith(("x-", "anthropic-", "authorization", "user-agent"))
+            )
+            body_keys = sorted(parsed.keys())
+            self.log.info(
+                f"responses no task_id (headers: [{hdr_summary}], body keys: {body_keys}, "
+                f"prev_id={'yes' if parsed.get('previous_response_id') else 'no'}, "
+                f"msgs_sent={len(completions_payload['messages'])})"
+            )
         resp_id  = f"resp_{uuid.uuid4().hex}"
         stream   = bool(parsed.get("stream", False))
         target_url   = f"{backend.vllm_base}/v1/chat/completions"
