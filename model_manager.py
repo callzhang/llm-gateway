@@ -28,6 +28,7 @@ Environment overrides:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -760,20 +761,6 @@ def _set_task_affinity(task_id: str, slot_id: int) -> None:
         _task_affinity.popitem(last=False)
 
 
-# Regex for the annotation-pipeline's user-content embedded task_id.  The
-# pipeline serialises `{"task":{"task_id":"...","source_ref":{...}}, ...}`
-# inside the user message content.  The exact offset varies across pipeline
-# versions: pre-12a2caa it was at char 11 (content started with the JSON);
-# post-12a2caa the user content starts with a per-project conventions block
-# (~1 KB) and the JSON begins after that.  Using `search` over the first 5 KB
-# tolerates both shapes and any future reshuffling that keeps task_id within
-# the early portion of the prompt.
-_CONTENT_TASK_ID_RE = re.compile(
-    r'"task"\s*:\s*\{\s*"task_id"\s*:\s*"([^"]+)"'
-)
-_CONTENT_TASK_ID_SCAN_WINDOW = 5000
-
-
 def _flatten_user_text(content) -> str | None:
     """messages[i].content (chat/completions) or input[i].content (responses)
     can be a plain string OR a list of dicts (multimodal parts).  Return the
@@ -789,34 +776,64 @@ def _flatten_user_text(content) -> str | None:
     return None
 
 
-def _extract_task_id_from_content(parsed_body: dict) -> str | None:
-    """Last-resort task_id extraction: the annotation pipeline embeds the
-    canonical task_id at the very start of the first user message content as
-    JSON `{"task":{"task_id":"v3_initial_deployment-NNNNNN", ...`.  Probe the
-    first 200 chars of the first user turn to find it.
+_STICKY_HASH_MIN_BLOB = 50  # below this, the content is too short to bother
+                            # (e.g. "ping" probes); skip sticky and let
+                            # least-connections handle them.
 
-    Works for /v1/chat/completions (`messages[]`) and /v1/responses
-    (`input` as a string or as a list of role-tagged dicts)."""
-    # /v1/chat/completions: messages[]
+
+def _content_sticky_key(parsed_body: dict) -> str | None:
+    """Pipeline-agnostic sticky key: hash of system + first user message.
+
+    Same logical task across multi-turn re-attempts: messages[1] (the original
+    user turn) doesn't change when later turns (assistant + QC feedback) get
+    appended, so the hash is stable.
+
+    Distinct tasks: the first user message differs → distinct hashes →
+    natural load balancing across slots.
+
+    Works uniformly for /v1/chat/completions (messages[]) and /v1/responses
+    (instructions + input, where `input` may be a string or list).
+    """
+    parts: list[tuple[str, str]] = []
+
+    # chat/completions: walk messages, collect at most system + first user
     for m in (parsed_body.get("messages") or []):
-        if isinstance(m, dict) and m.get("role") == "user":
-            txt = _flatten_user_text(m.get("content"))
-            if txt and (mm := _CONTENT_TASK_ID_RE.search(txt[:_CONTENT_TASK_ID_SCAN_WINDOW])):
-                return mm.group(1)
-            break  # only inspect the first user message
-    # /v1/responses: input may be a flat string OR a list of messages
-    inp = parsed_body.get("input")
-    if isinstance(inp, str):
-        if mm := _CONTENT_TASK_ID_RE.search(inp[:_CONTENT_TASK_ID_SCAN_WINDOW]):
-            return mm.group(1)
-    elif isinstance(inp, list):
-        for m in inp:
-            if isinstance(m, dict) and m.get("role") == "user":
-                txt = _flatten_user_text(m.get("content"))
-                if txt and (mm := _CONTENT_TASK_ID_RE.search(txt[:_CONTENT_TASK_ID_SCAN_WINDOW])):
-                    return mm.group(1)
-                break
-    return None
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "system":
+            if (txt := _flatten_user_text(m.get("content"))):
+                parts.append(("system", txt))
+        elif role == "user":
+            if (txt := _flatten_user_text(m.get("content"))):
+                parts.append(("user", txt))
+            break  # stop at first user — later turns are per-attempt noise
+
+    # responses API: instructions + first user from input
+    if not parts:
+        ins = parsed_body.get("instructions")
+        if isinstance(ins, str) and ins:
+            parts.append(("system", ins))
+        inp = parsed_body.get("input")
+        if isinstance(inp, str) and inp:
+            parts.append(("user", inp))
+        elif isinstance(inp, list):
+            for item in inp:
+                if isinstance(item, dict) and item.get("role") == "user":
+                    if (txt := _flatten_user_text(item.get("content"))):
+                        parts.append(("user", txt))
+                    break
+
+    if not parts:
+        return None
+    blob = "\n".join(f"{r}:{c}" for r, c in parts)
+    if len(blob) < _STICKY_HASH_MIN_BLOB:
+        return None
+    # 16-hex-char key from blake2b-64.  Prefix "h:" so logs distinguish
+    # content-derived sticky keys from real task_ids when grepping.
+    return "h:" + hashlib.blake2b(
+        blob.encode("utf-8", errors="replace"), digest_size=8
+    ).hexdigest()
 
 
 def _extract_task_id(parsed_body: dict | None, headers) -> str | None:
@@ -828,9 +845,10 @@ def _extract_task_id(parsed_body: dict | None, headers) -> str | None:
          injected by claude CLI via .claude.json:userID.
       3. `metadata.task_id` in body — generic LiteLLM metadata passthrough.
       4. `user` field in body — OpenAI-standard; legacy path.
-      5. First user message content: pipeline embeds the canonical task_id at
-         offset 0 as JSON `{"task":{"task_id":"..."}}`.  Works without any
-         pipeline-side cooperation; survives LiteLLM-side metadata stripping.
+      5. Content-derived hash: blake2b of system + first user message.
+         Pipeline-agnostic fallback; works for any request shape whose task
+         identity sits in the first user turn (the typical agent layout).
+         Keys returned by this path are prefixed "h:" so they're greppable.
     """
     if tid := (headers.get("x-task-id") or headers.get("X-Task-Id")):
         return tid
@@ -844,7 +862,7 @@ def _extract_task_id(parsed_body: dict | None, headers) -> str | None:
                 return str(tid)
         if tid := parsed_body.get("user"):
             return str(tid)
-        if tid := _extract_task_id_from_content(parsed_body):
+        if tid := _content_sticky_key(parsed_body):
             return tid
     return None
 
