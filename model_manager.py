@@ -28,14 +28,12 @@ Environment overrides:
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import signal
 import subprocess
 import time
-import uuid
 from collections import OrderedDict
 
 import aiohttp
@@ -251,17 +249,6 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
                                # is ~29.1 GiB so 29.0 threshold gives 0.2 GiB margin.
     "qwen3.6-27b":     27.5,  # 0.84 × 32 GiB ≈ 26.9 + 0.6 GiB buffer
 }
-
-# Per-model context limits used for Responses API history trimming.
-# (context_window_tokens, max_output_tokens)
-# Keep in sync with vLLM --max-model-len and config.yaml max_tokens.
-MODEL_LIMITS: dict[str, tuple[int, int]] = {
-    "qwen3.6-35b-a3b": (122880, 32768),
-    "qwen3.6-27b":     (65536,  16384),
-}
-# Fallback for models not listed above.
-_DEFAULT_CONTEXT_WINDOW  = 32768
-_DEFAULT_MAX_OUTPUT      = 4096
 
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -760,31 +747,8 @@ class GpuBackend:
             return web.Response(status=502, text=f"Proxy error: {exc}")
 
 
-# ── Responses API translation helpers ──────────────────────────────────────────
-
-_response_store: dict[str, list[dict]] = {}
-
-# ── Backend affinity for KV-cache reuse ───────────────────────────────────────
-# Maps response_id → slot_id of the backend that served it.  Subsequent turns
-# referencing this response_id via previous_response_id stick to the same slot
-# so vLLM's per-instance prefix cache (--enable-prefix-caching) keeps hitting.
-# OrderedDict gives FIFO eviction when the cap is reached.
-_response_affinity: "OrderedDict[str, int]" = OrderedDict()
-_AFFINITY_MAX = 10000
-
-
-def _set_affinity(resp_id: str, slot_id: int) -> None:
-    _response_affinity[resp_id] = slot_id
-    _response_affinity.move_to_end(resp_id)
-    while len(_response_affinity) > _AFFINITY_MAX:
-        _response_affinity.popitem(last=False)
-
-
 # ── Task-id affinity (for clients that propagate `x-task-id` header) ───────────
-# Stable across retries / bails / stage transitions for a given pipeline task.
-# Lets us keep all turns of one task on the same vLLM slot regardless of
-# whether they go through /v1/responses or /v1/chat/completions, and without
-# requiring `previous_response_id` (which Claude-CLI clients can't supply).
+_AFFINITY_MAX = 10000
 _task_affinity: "OrderedDict[str, int]" = OrderedDict()
 
 
@@ -799,12 +763,11 @@ def _extract_task_id(parsed_body: dict | None, headers) -> str | None:
     """Locate a stable per-task identifier across several places, in priority order:
       1. `x-task-id` HTTP header — cleanest, but LiteLLM strips client headers
          when proxying via openai-python SDK, so this rarely arrives.
-      2. `metadata.user_id.device_id` in body — annotation-pipeline path
-         (commit 837f876).  Field is named "device_id" but value is the
-         per-task identifier injected by claude CLI via .claude.json:userID.
+      2. `metadata.user_id.device_id` in body — annotation-pipeline path.
+         Field is named "device_id" but value is the per-task identifier
+         injected by claude CLI via .claude.json:userID.
       3. `metadata.task_id` in body — generic LiteLLM metadata passthrough.
-      4. `user` field in body — OpenAI-standard; legacy path that previously
-         carried device_id (per-device, not per-task) so a poor sticky key.
+      4. `user` field in body — OpenAI-standard; legacy path.
     """
     if tid := (headers.get("x-task-id") or headers.get("X-Task-Id")):
         return tid
@@ -822,250 +785,12 @@ def _extract_task_id(parsed_body: dict | None, headers) -> str | None:
 
 
 def _sticky_slot_for(parsed_body: dict | None, headers) -> tuple[int | None, str]:
-    """Resolve the preferred slot for this request, given any combination of
-    `x-task-id` (header or body) and `previous_response_id` in the body.
+    """Resolve the preferred slot for this request via x-task-id.
     Returns (slot_id | None, reason)."""
     task_id = _extract_task_id(parsed_body, headers)
     if task_id and (s := _task_affinity.get(task_id)) is not None:
         return s, f"task:{task_id}"
-    if parsed_body:
-        prev_id = parsed_body.get("previous_response_id")
-        if prev_id and (s := _response_affinity.get(prev_id)) is not None:
-            return s, f"prev:{prev_id[:24]}"
     return None, "none"
-
-# ── Context-overflow circuit breaker ──────────────────────────────────────────
-# Maps a stable request key → monotonic timestamp of last rejection.
-# While the entry is younger than _CTX_CIRCUIT_TTL we short-circuit immediately
-# (no payload build, no GPU allocation, no vLLM cold start).
-_ctx_rejected: dict[str, float] = {}
-_CTX_CIRCUIT_TTL = 300.0   # seconds — covers LiteLLM's default retry window
-
-
-def _ctx_circuit_key(parsed: dict) -> str:
-    """Return a stable key for the circuit breaker.
-
-    Uses ``previous_response_id`` when present (exact conversation identity).
-    Falls back to a hash of model + instructions + first 2 kB of input for
-    fresh conversations that are already oversized.
-    """
-    prev_id = parsed.get("previous_response_id")
-    if prev_id:
-        return f"prev:{prev_id}"
-    model = parsed.get("model", "")
-    instr = parsed.get("instructions") or ""
-    inp   = parsed.get("input", "")
-    if not isinstance(inp, str):
-        inp = json.dumps(inp, ensure_ascii=False)
-    raw = f"{model}\x00{instr}\x00{inp[:2000]}"
-    return f"hash:{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
-
-
-def _ctx_circuit_check(key: str) -> bool:
-    """Return True if this key is tripped and the request should be rejected."""
-    now = time.monotonic()
-    # Lazy cleanup: sweep when the dict grows large
-    if len(_ctx_rejected) > 200:
-        expired = [k for k, ts in list(_ctx_rejected.items())
-                   if now - ts > _CTX_CIRCUIT_TTL * 2]
-        for k in expired:
-            _ctx_rejected.pop(k, None)
-    ts = _ctx_rejected.get(key)
-    return ts is not None and (now - ts) < _CTX_CIRCUIT_TTL
-
-
-def _ctx_circuit_trip(key: str) -> None:
-    """Record a rejection so subsequent calls with the same key are fast-failed."""
-    _ctx_rejected[key] = time.monotonic()
-
-# Trim conversation history when estimated input token count exceeds this.
-def _trim_to_fit(
-    messages: list[dict],
-    context_window: int,
-    max_output_tokens: int,
-    safety_margin: int = 512,
-) -> tuple[list[dict], bool]:
-    """Trim conversation history to fit within the model's context window.
-
-    Conservative estimate: 1 char = 1 token (safe for Chinese/Japanese text).
-    Trims oldest (user, assistant) pairs first to keep turns coherent.
-
-    Returns:
-        (trimmed, True)   — trimmed list fits within budget
-        (original, False) — mandatory content (system + last user) alone exceeds
-                            the budget; caller should return 400 immediately
-    """
-    def _char_count(m: dict) -> int:
-        c = m.get("content", "")
-        if isinstance(c, str):
-            return len(c)
-        if isinstance(c, list):
-            return sum(len(p.get("text", "")) for p in c if isinstance(p, dict))
-        return 0
-
-    # Cap at 70% of the context window to leave headroom for the model's own
-    # output and avoid hitting vLLM's max_model_len edge.  Floor at half the
-    # window so we never shrink absurdly when max_output_tokens is huge.
-    budget = max(
-        min(int(context_window * 0.7),
-            context_window - max_output_tokens - safety_margin),
-        context_window // 2,
-    )
-
-    system_msgs = [m for m in messages if m.get("role") == "system"]
-    non_system  = [m for m in messages if m.get("role") != "system"]
-
-    if not non_system:
-        return (messages, sum(_char_count(m) for m in messages) <= budget)
-
-    last_msg = [non_system[-1]]   # current user turn — always kept
-    history  = non_system[:-1]    # prior turns — eligible for trimming
-
-    # System + current user must always fit; if not, fail fast
-    mandatory_chars = sum(_char_count(m) for m in system_msgs + last_msg)
-    if mandatory_chars > budget:
-        return (messages, False)
-
-    # Group history into (user, assistant) pairs; skip orphaned assistant at start
-    pairs: list[tuple[dict, ...]] = []
-    i = 0
-    while i < len(history):
-        role = history[i].get("role")
-        if role == "user":
-            if i + 1 < len(history) and history[i + 1].get("role") == "assistant":
-                pairs.append((history[i], history[i + 1]))
-                i += 2
-            else:
-                pairs.append((history[i],))
-                i += 1
-        else:
-            # orphaned assistant or other role — skip
-            i += 1
-
-    # Include as many recent pairs as fit, working backwards from newest
-    remaining = budget - mandatory_chars
-    included: list[tuple[dict, ...]] = []
-    for pair in reversed(pairs):
-        pair_chars = sum(_char_count(m) for m in pair)
-        if pair_chars > remaining:
-            break   # this pair doesn't fit; drop it and everything older
-        included.insert(0, pair)
-        remaining -= pair_chars
-
-    trimmed = system_msgs + [m for pair in included for m in pair] + last_msg
-    return (trimmed, True)
-
-
-def _strip_anthropic_billing_header(instructions: str | None) -> str | None:
-    """Strip Claude CLI's per-call billing headers from the instructions field.
-
-    Claude CLI prepends `x-anthropic-billing-header: cc_version=...; cch=<hex>;\\n`
-    (and similar `x-anthropic-*` lines) to the Anthropic `system` field, which
-    LiteLLM passes through as OpenAI `instructions`.  The `cch` value is a
-    per-call counter that changes every request.  Since we pass `instructions`
-    as the system message to vLLM, the first system token differs every call,
-    which makes vLLM's rolling-hash prefix cache miss on ALL subsequent tokens
-    — even though the rest of the system prompt + ~17 KB of user content is
-    byte-identical between same-shape requests of the same task.
-
-    Stripping these lines stabilises the system tokens and lets the cache hit.
-    Billing identifiers have no semantic effect on the model's output.
-    """
-    if not instructions:
-        return instructions
-    while True:
-        stripped = instructions.lstrip()
-        if not stripped.lower().startswith("x-anthropic-"):
-            break
-        nl = instructions.find("\n")
-        if nl < 0:
-            return ""
-        instructions = instructions[nl + 1 :]
-    return instructions
-
-
-def _responses_to_completions(body: dict, prior_messages: list[dict] | None = None) -> dict:
-    messages: list[dict] = []
-    instructions = _strip_anthropic_billing_header(body.get("instructions"))
-
-    if prior_messages:
-        if instructions:
-            messages.append({"role": "system", "content": instructions})
-            messages.extend(m for m in prior_messages if m.get("role") != "system")
-        else:
-            messages.extend(prior_messages)
-    elif instructions:
-        messages.append({"role": "system", "content": instructions})
-
-    input_val = body.get("input", [])
-    if isinstance(input_val, str):
-        messages.append({"role": "user", "content": input_val})
-    elif isinstance(input_val, list):
-        for item in input_val:
-            if isinstance(item, str):
-                messages.append({"role": "user", "content": item})
-                continue
-            if not isinstance(item, dict):
-                continue
-            role    = item.get("role", "user")
-            content = item.get("content", "")
-            if isinstance(content, list):
-                text_parts:  list[str]  = []
-                image_parts: list[dict] = []
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    ptype = part.get("type", "")
-                    if ptype in ("input_text", "text", "output_text"):
-                        text_parts.append(part.get("text", ""))
-                    elif ptype in ("input_image", "image_url"):
-                        url = part.get("image_url") or part.get("url") or ""
-                        if isinstance(url, dict):
-                            url = url.get("url", "")
-                        if url:
-                            image_parts.append({"type": "image_url", "image_url": {"url": url}})
-                if image_parts:
-                    content = image_parts + (
-                        [{"type": "text", "text": "\n".join(text_parts)}] if text_parts else []
-                    )
-                else:
-                    content = "\n".join(text_parts)
-            messages.append({"role": role, "content": content})
-
-    return {
-        "model":       body.get("model", ""),
-        "messages":    messages,
-        "max_tokens":  body.get("max_output_tokens", 16384),
-        "temperature": body.get("temperature", 1.0),
-    }
-
-
-def _completions_to_responses(chat_resp: dict | None, model_name: str, resp_id: str) -> dict:
-    if not chat_resp:
-        chat_resp = {}
-    output_text = (chat_resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-    usage = chat_resp.get("usage", {})
-    return {
-        "id":         resp_id,
-        "object":     "response",
-        "created_at": int(time.time()),
-        "model":      chat_resp.get("model", model_name),
-        "status":     "completed",
-        "output": [{
-            "type":    "message",
-            "id":      f"msg_{uuid.uuid4().hex}",
-            "status":  "completed",
-            "role":    "assistant",
-            "content": [{"type": "output_text", "text": output_text, "annotations": []}],
-        }],
-        "output_text": output_text,
-        "usage": {
-            "input_tokens":  usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-            "total_tokens":  usage.get("total_tokens", 0),
-        },
-        "store": True,
-    }
 
 
 # ── Dynamic Router ─────────────────────────────────────────────────────────────
@@ -1394,9 +1119,6 @@ class DynamicRouter:
                 ],
             })
 
-        if request.method == "POST" and request.path in ("/v1/responses", "/responses"):
-            return await self._handle_responses_api(request)
-
         body = await request.read()
         model_name = self._extract_model(body)
         if not model_name:
@@ -1463,10 +1185,8 @@ class DynamicRouter:
                 body=json.dumps({"error": {"message": str(exc), "type": "startup_failed"}}),
             )
 
-        # Sticky routing: prefer x-task-id header (stable across a pipeline task)
-        # so all turns of one task land on the same vLLM slot and benefit from
-        # the instance's prefix cache.  Falls back to previous_response_id, then
-        # least-connections.
+        # Sticky routing: x-task-id header pins all turns of one task to the same
+        # vLLM slot for prefix cache reuse.  Falls back to least-connections.
         try:
             parsed_body_for_sticky = json.loads(body) if body else None
         except Exception:
@@ -1510,285 +1230,6 @@ class DynamicRouter:
                 f"msgs={len(msgs)}, chars≈{approx_chars})"
             )
         return await backend.proxy(request, body)
-
-    # ── Responses API ──────────────────────────────────────────────────────────
-
-    async def _handle_responses_api(self, request: web.Request) -> web.StreamResponse:
-        try:
-            parsed: dict = json.loads(await request.read())
-        except Exception:
-            return web.Response(
-                status=400, content_type="application/json",
-                body=json.dumps({"error": {"message": "invalid JSON",
-                                            "type": "invalid_request_error"}}),
-            )
-        model_name = parsed.get("model", "")
-        if model_name not in self.model_configs:
-            self.log.warning(f"Responses API: unknown model '{model_name}'")
-            return web.Response(
-                status=404, content_type="application/json",
-                body=json.dumps({"error": {"message": f"Unknown model: {model_name}",
-                                            "type": "invalid_request_error"}}),
-            )
-
-        # ── Circuit breaker: reject known-oversized requests immediately ──────
-        # Checked before any store lookup or payload work so the same bad
-        # request cannot repeatedly trigger a vLLM cold start.
-        cb_key = _ctx_circuit_key(parsed)
-        if _ctx_circuit_check(cb_key):
-            err_msg = (
-                f"Context window exceeded for model '{model_name}' — "
-                f"this conversation is too long to continue. "
-                f"Start a new conversation or reduce the message length."
-            )
-            self.log.warning(
-                f"Responses API: circuit breaker tripped, rejecting without GPU work "
-                f"(key={cb_key!r})"
-            )
-            return web.Response(
-                status=400, content_type="application/json",
-                headers={"x-should-retry": "false"},
-                body=json.dumps({"error": {"message": err_msg,
-                                            "type": "context_window_exceeded",
-                                            "code": "context_length_exceeded"}}),
-            )
-
-        # ── Build payload and trim BEFORE spawning vLLM ───────────────────────
-        # Fail fast with 400 if mandatory content already exceeds the context
-        # window.  This prevents the infinite cold-start retry loop where an
-        # oversized history causes vLLM to return 400, LiteLLM retries, the
-        # retry triggers a fresh vLLM cold start, and so on.
-        prior_messages: list[dict] = []
-        if prev_id := parsed.get("previous_response_id"):
-            prior_messages = _response_store.get(prev_id, [])
-            if not prior_messages:
-                # Normal after a service restart — store is in-memory only
-                self.log.debug(
-                    f"previous_response_id '{prev_id}' not found in store — starting fresh"
-                )
-
-        completions_payload = _responses_to_completions(parsed, prior_messages)
-
-        ctx_win, max_out = MODEL_LIMITS.get(
-            model_name, (_DEFAULT_CONTEXT_WINDOW, _DEFAULT_MAX_OUTPUT)
-        )
-        trimmed_msgs, fits = _trim_to_fit(
-            completions_payload["messages"], ctx_win, max_out
-        )
-        if not fits:
-            _ctx_circuit_trip(cb_key)
-            err_msg = (
-                f"The mandatory content (system prompt + current user message) "
-                f"exceeds the context window for model '{model_name}' "
-                f"({ctx_win} tokens). Please shorten your message."
-            )
-            self.log.warning(f"Responses API: {err_msg} (circuit breaker armed for {cb_key!r})")
-            return web.Response(
-                status=400, content_type="application/json",
-                headers={"x-should-retry": "false"},
-                body=json.dumps({"error": {"message": err_msg,
-                                            "type": "context_window_exceeded",
-                                            "code": "context_length_exceeded"}}),
-            )
-        completions_payload["messages"] = trimmed_msgs
-
-        try:
-            backends = await self._get_or_start(model_name)
-        except GPUBusyError as exc:
-            self.log.warning(str(exc))
-            return web.Response(
-                status=503, content_type="application/json",
-                body=json.dumps({"error": {"message": str(exc), "type": "gpu_busy"}}),
-            )
-        except RuntimeError as exc:
-            self.log.error(str(exc))
-            return web.Response(
-                status=503, content_type="application/json",
-                body=json.dumps({"error": {"message": str(exc), "type": "startup_failed"}}),
-            )
-
-        # Sticky routing: prefer x-task-id (stable across pipeline task lifetime),
-        # fall back to previous_response_id, then least-connections.  Keeps all
-        # turns of one conversation on the same vLLM slot for prefix cache reuse.
-        sticky_slot, _ = _sticky_slot_for(parsed, request.headers)
-        sticky_backend: GpuBackend | None = None
-        if sticky_slot is not None:
-            sticky_backend = next(
-                (b for b in backends if b.slot.slot_id == sticky_slot), None
-            )
-        if sticky_backend is not None:
-            backend = sticky_backend
-        else:
-            backend = self._pick(backends)
-            # Only trigger scale-out on cache miss: a sticky conversation
-            # already has a home, scaling out for it wouldn't help.
-            self._trigger_scale_out(model_name)
-        # Record task-id affinity for subsequent turns of the same task.
-        task_id = _extract_task_id(parsed, request.headers)
-        # Approximate prompt size as the sum of message-content chars (good enough
-        # for the pipeline team to grep-by-task and see whether multi-turn history
-        # is actually growing).
-        msgs = completions_payload["messages"]
-        approx_chars = sum(
-            len(m.get("content", "")) if isinstance(m.get("content"), str)
-            else sum(len(p.get("text", "") or "") for p in m.get("content", []) if isinstance(p, dict))
-            for m in msgs
-        )
-        if task_id:
-            hit_status = "hit" if sticky_backend is not None else "fresh"
-            self.log.info(
-                f"Sticky responses: task_id={task_id} {hit_status} → slot {backend.slot.slot_id} "
-                f"(msgs={len(msgs)}, chars≈{approx_chars})"
-            )
-            _set_task_affinity(task_id, backend.slot.slot_id)
-        else:
-            hdr_summary = ", ".join(
-                f"{k.lower()}" for k in request.headers
-                if k.lower().startswith(("x-", "anthropic-", "authorization", "user-agent"))
-            )
-            body_keys = sorted(parsed.keys())
-            self.log.info(
-                f"responses no task_id (headers: [{hdr_summary}], body keys: {body_keys}, "
-                f"prev_id={'yes' if parsed.get('previous_response_id') else 'no'}, "
-                f"msgs={len(msgs)}, chars≈{approx_chars})"
-            )
-        resp_id  = f"resp_{uuid.uuid4().hex}"
-        stream   = bool(parsed.get("stream", False))
-        target_url   = f"{backend.vllm_base}/v1/chat/completions"
-        vllm_headers = {}
-        if auth := request.headers.get("Authorization"):
-            vllm_headers["Authorization"] = auth
-
-        backend._active_requests += 1
-        backend.last_activity = time.monotonic()
-        try:
-            if not stream:
-                async with backend._session.post(target_url, json=completions_payload,
-                                                  headers=vllm_headers) as upstream:
-                    if upstream.status != 200:
-                        data = await upstream.read()
-                        return web.Response(status=upstream.status,
-                                            content_type="application/json", body=data)
-                    chat_resp = await upstream.json()
-                result = _completions_to_responses(chat_resp, model_name, resp_id)
-                output_text = result["output_text"]
-                _response_store[resp_id] = completions_payload["messages"] + [
-                    {"role": "assistant", "content": output_text}
-                ]
-                _set_affinity(resp_id, backend.slot.slot_id)
-                return web.json_response(result)
-
-            # ── Streaming ──────────────────────────────────────────────────────
-            msg_id  = f"msg_{uuid.uuid4().hex}"
-            created = int(time.time())
-
-            def sse(event_type: str, payload: dict) -> bytes:
-                return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n".encode()
-
-            resp = web.StreamResponse(headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            })
-            await resp.prepare(request)
-            await resp.write(sse("response.created", {
-                "type": "response.created",
-                "response": {"id": resp_id, "object": "response", "created_at": created,
-                             "model": model_name, "status": "in_progress",
-                             "output": [], "output_text": ""},
-            }))
-            await resp.write(sse("response.output_item.added", {
-                "type": "response.output_item.added", "output_index": 0,
-                "item": {"id": msg_id, "type": "message", "status": "in_progress",
-                         "role": "assistant", "content": []},
-            }))
-            await resp.write(sse("response.content_part.added", {
-                "type": "response.content_part.added", "item_id": msg_id,
-                "output_index": 0, "content_index": 0,
-                "part": {"type": "output_text", "text": "", "annotations": []},
-            }))
-
-            full_text = ""
-            usage: dict = {}
-            streaming_payload = dict(completions_payload, stream=True)
-
-            async with backend._session.post(target_url, json=streaming_payload,
-                                              headers=vllm_headers) as upstream:
-                if upstream.status != 200:
-                    err = await upstream.read()
-                    await resp.write(sse("error", {"type": "error",
-                                                   "message": err.decode(errors="ignore")}))
-                    await resp.write_eof()
-                    return resp
-
-                async for line_bytes in upstream.content:
-                    line = line_bytes.decode("utf-8", errors="ignore").strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if not data or data == "[DONE]":
-                        continue
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    if chunk.get("usage"):
-                        usage = chunk["usage"]
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    piece = (choices[0].get("delta") or {}).get("content")
-                    if piece:
-                        full_text += piece
-                        await resp.write(sse("response.output_text.delta", {
-                            "type": "response.output_text.delta",
-                            "item_id": msg_id, "output_index": 0,
-                            "content_index": 0, "delta": piece,
-                        }))
-
-            await resp.write(sse("response.output_text.done", {
-                "type": "response.output_text.done", "item_id": msg_id,
-                "output_index": 0, "content_index": 0, "text": full_text,
-            }))
-            await resp.write(sse("response.content_part.done", {
-                "type": "response.content_part.done", "item_id": msg_id,
-                "output_index": 0, "content_index": 0,
-                "part": {"type": "output_text", "text": full_text, "annotations": []},
-            }))
-            await resp.write(sse("response.output_item.done", {
-                "type": "response.output_item.done", "output_index": 0,
-                "item": {"id": msg_id, "type": "message", "status": "completed",
-                         "role": "assistant",
-                         "content": [{"type": "output_text", "text": full_text,
-                                      "annotations": []}]},
-            }))
-            await resp.write(sse("response.completed", {
-                "type": "response.completed",
-                "response": {
-                    "id": resp_id, "object": "response", "created_at": created,
-                    "model": model_name, "status": "completed",
-                    "output": [{"id": msg_id, "type": "message", "status": "completed",
-                                "role": "assistant",
-                                "content": [{"type": "output_text", "text": full_text,
-                                             "annotations": []}]}],
-                    "output_text": full_text,
-                    "usage": {
-                        "input_tokens":  usage.get("prompt_tokens", 0),
-                        "output_tokens": usage.get("completion_tokens", 0),
-                        "total_tokens":  usage.get("total_tokens", 0),
-                    },
-                },
-            }))
-            _response_store[resp_id] = completions_payload["messages"] + [
-                {"role": "assistant", "content": full_text}
-            ]
-            _set_affinity(resp_id, backend.slot.slot_id)
-            await resp.write_eof()
-            return resp
-
-        finally:
-            backend._active_requests -= 1
-            backend.last_activity = time.monotonic()
 
     @staticmethod
     def _extract_model(body: bytes) -> str | None:
