@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import time
@@ -759,6 +760,65 @@ def _set_task_affinity(task_id: str, slot_id: int) -> None:
         _task_affinity.popitem(last=False)
 
 
+# Regex for the annotation-pipeline's user-content embedded task_id.  The
+# pipeline serialises `{"task":{"task_id":"...","source_ref":{...}}, ...}`
+# inside the user message content.  The exact offset varies across pipeline
+# versions: pre-12a2caa it was at char 11 (content started with the JSON);
+# post-12a2caa the user content starts with a per-project conventions block
+# (~1 KB) and the JSON begins after that.  Using `search` over the first 5 KB
+# tolerates both shapes and any future reshuffling that keeps task_id within
+# the early portion of the prompt.
+_CONTENT_TASK_ID_RE = re.compile(
+    r'"task"\s*:\s*\{\s*"task_id"\s*:\s*"([^"]+)"'
+)
+_CONTENT_TASK_ID_SCAN_WINDOW = 5000
+
+
+def _flatten_user_text(content) -> str | None:
+    """messages[i].content (chat/completions) or input[i].content (responses)
+    can be a plain string OR a list of dicts (multimodal parts).  Return the
+    first text chunk we find, or None."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                txt = part.get("text") or part.get("content")
+                if isinstance(txt, str):
+                    return txt
+    return None
+
+
+def _extract_task_id_from_content(parsed_body: dict) -> str | None:
+    """Last-resort task_id extraction: the annotation pipeline embeds the
+    canonical task_id at the very start of the first user message content as
+    JSON `{"task":{"task_id":"v3_initial_deployment-NNNNNN", ...`.  Probe the
+    first 200 chars of the first user turn to find it.
+
+    Works for /v1/chat/completions (`messages[]`) and /v1/responses
+    (`input` as a string or as a list of role-tagged dicts)."""
+    # /v1/chat/completions: messages[]
+    for m in (parsed_body.get("messages") or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            txt = _flatten_user_text(m.get("content"))
+            if txt and (mm := _CONTENT_TASK_ID_RE.search(txt[:_CONTENT_TASK_ID_SCAN_WINDOW])):
+                return mm.group(1)
+            break  # only inspect the first user message
+    # /v1/responses: input may be a flat string OR a list of messages
+    inp = parsed_body.get("input")
+    if isinstance(inp, str):
+        if mm := _CONTENT_TASK_ID_RE.search(inp[:_CONTENT_TASK_ID_SCAN_WINDOW]):
+            return mm.group(1)
+    elif isinstance(inp, list):
+        for m in inp:
+            if isinstance(m, dict) and m.get("role") == "user":
+                txt = _flatten_user_text(m.get("content"))
+                if txt and (mm := _CONTENT_TASK_ID_RE.search(txt[:_CONTENT_TASK_ID_SCAN_WINDOW])):
+                    return mm.group(1)
+                break
+    return None
+
+
 def _extract_task_id(parsed_body: dict | None, headers) -> str | None:
     """Locate a stable per-task identifier across several places, in priority order:
       1. `x-task-id` HTTP header — cleanest, but LiteLLM strips client headers
@@ -768,6 +828,9 @@ def _extract_task_id(parsed_body: dict | None, headers) -> str | None:
          injected by claude CLI via .claude.json:userID.
       3. `metadata.task_id` in body — generic LiteLLM metadata passthrough.
       4. `user` field in body — OpenAI-standard; legacy path.
+      5. First user message content: pipeline embeds the canonical task_id at
+         offset 0 as JSON `{"task":{"task_id":"..."}}`.  Works without any
+         pipeline-side cooperation; survives LiteLLM-side metadata stripping.
     """
     if tid := (headers.get("x-task-id") or headers.get("X-Task-Id")):
         return tid
@@ -781,6 +844,8 @@ def _extract_task_id(parsed_body: dict | None, headers) -> str | None:
                 return str(tid)
         if tid := parsed_body.get("user"):
             return str(tid)
+        if tid := _extract_task_id_from_content(parsed_body):
+            return tid
     return None
 
 
