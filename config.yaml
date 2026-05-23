@@ -1,13 +1,12 @@
 model_list:
 
   # ── Qwen3.6-35B-A3B NVFP4 (multimodal, coding, OCR) ─────────────────────
-  # Routes through model_manager :8002, which handles sticky routing by
-  # previous_response_id (vLLM prefix cache reuse), trim, scale-out across
-  # slots, and idle unload.  Single entry — model_manager does internal
-  # load balancing across however many slots are running this model.
+  # Routes through model_manager :8002, which handles GPU slot management,
+  # scale-out, idle unload, and x-task-id sticky routing for prefix cache
+  # reuse.  Responses API → chat/completions conversion done by LiteLLM.
   - model_name: qwen3.6-35b-a3b
     litellm_params:
-      model: openai/qwen3.6-35b-a3b
+      model: custom_openai/qwen3.6-35b-a3b
       api_base: http://127.0.0.1:8002/v1
       api_key: local-qwen36
       max_tokens: 32768
@@ -22,7 +21,7 @@ model_list:
   # — only spawns when requested and another slot is free or idle-unloads.
   - model_name: qwen3.6-27b
     litellm_params:
-      model: openai/qwen3.6-27b
+      model: custom_openai/qwen3.6-27b
       api_base: http://127.0.0.1:8002/v1
       api_key: local-qwen36
       max_tokens: 16384
@@ -54,14 +53,15 @@ router_settings:
   #   - qwen3.6-27b: ["gpt-5.4-mini"]
 
 litellm_settings:
-  context_management:
-    enabled: true
-    compact_threshold: 92160  # 75% of 122880
-
   drop_params: true
   set_verbose: false
 
   store_responses: true
+
+  # Trim over-long histories before they reach vLLM, instead of returning 400.
+  # trim_hook.py is in the same directory as this config file.
+  callbacks:
+    - trim_hook.context_trim_hook
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

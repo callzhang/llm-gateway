@@ -19,13 +19,16 @@ GPU 0 :9000    GPU 1 :9010      GPU N :9000+N×10
 (on-demand)    (on-demand, scale-out)
 ```
 
-**model_manager** is the core piece. It sits between LiteLLM and vLLM and handles:
+**model_manager** is a thin routing and scheduling layer. It sits between LiteLLM and vLLM and handles:
 
 - **Cold start** — first request for a model spins up vLLM on a free GPU slot
 - **Idle unload** — no requests for N seconds → kill vLLM, free the slot
 - **Scale-out** — ≥2 concurrent requests on an occupied slot → spawn a second instance on the next free slot, round-robin across both
 - **Scale-in** — the extra instance idles out naturally
 - **gpu_busy 503** — all slots occupied by other models → immediate error (no queue)
+- **Sticky routing** — `x-task-id` header pins all turns of a task to the same vLLM slot for KV-cache reuse
+
+model_manager does **no data transformation** — it receives standard OpenAI chat/completions requests from LiteLLM and proxies them verbatim to vLLM.
 
 ## Key design decisions
 
@@ -139,10 +142,12 @@ Edit `config.yaml` — point each model's `api_base` at model_manager (`:8002`):
 model_list:
   - model_name: your-model-name
     litellm_params:
-      model: openai/your-model-name
+      model: custom_openai/your-model-name
       api_base: http://127.0.0.1:8002/v1
       api_key: your-vllm-api-key
 ```
+
+> **Important:** Use the `custom_openai/` provider prefix (not `openai/`). The `openai/` prefix causes LiteLLM to pass Responses API calls through to model_manager unchanged. `custom_openai/` makes LiteLLM handle `/v1/responses` itself — converting to chat/completions, storing history in Postgres, and supporting `previous_response_id` and tool use.
 
 ### 5. Run
 
@@ -236,14 +241,21 @@ ANOMALIES
 
 ## Responses API
 
-model_manager implements a minimal [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses) shim (`POST /v1/responses`) with in-memory conversation history, allowing clients that use the Responses API to talk to vLLM backends.
+The Responses API (`POST /v1/responses`, `previous_response_id`, tool use) is handled entirely by LiteLLM — not model_manager. LiteLLM's `LiteLLMCompletionTransformationHandler`:
+
+1. Looks up prior conversation history from Postgres using `previous_response_id`
+2. Converts the Responses API body (including `tools` and `function_call_output`) to a standard chat/completions request
+3. Calls model_manager at `/v1/chat/completions` as usual
+4. Converts the response back to Responses API format and stores it in Postgres
+
+This requires `store_responses: true` in `litellm_settings` and a Postgres `DATABASE_URL` in the environment. The `custom_openai/` provider prefix (see [Configure LiteLLM](#4-configure-litellm-optional)) is what triggers this path — `openai/` would bypass it.
 
 ## Tested with
 
 - vLLM 0.19.0
 - Qwen3.6-35B-A3B-NVFP4 (`compressed-tensors` quantization, 2× RTX 5090)
 - Qwen3.6-27B-Text-NVFP4-MTP (speculative decoding with MTP)
-- LiteLLM 1.83.x
+- LiteLLM 1.83.x — 1.85.x
 
 ## License
 
