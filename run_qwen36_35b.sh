@@ -12,15 +12,18 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
 
-# GPU 0 shares with embedding-provider (~2.2 GiB + CUDA ctx ~0.45 GiB overhead),
-# leaving ~28.75 GiB free for vLLM.  Must satisfy two constraints:
-#   (1) startup check: util × 31.36 GiB < 28.75 GiB  → util < 0.9168
-#   (2) KV cache min:  at 0.914 util, available KV = 1.06 GiB (46 blocks × 2096-tok)
-#       max_model_len must need ≤ 46 blocks; 81920 needs 40 blocks (0.92 GiB) ✓
-#       122880 would need 59 blocks (1.3 GiB) — too large for GPU 0.
+# GPU 0 shares with embedding-provider (~2.2 GiB idle, up to ~2.73 GiB under load).
+# Must satisfy two constraints:
+#   (1) startup check: util × 31.36 GiB < free_at_scaleout
+#       embedding peaks at ~2.73 GiB → free = 28.63 GiB
+#       0.912 × 31.36 = 28.60 GiB < 28.63 GiB → 30 MiB margin ✓
+#       (was 0.914 → 28.66 GiB > 28.63 GiB → failed during high-load scale-out)
+#   (2) KV cache min:  at 0.912 util, available KV ≈ 0.996 GiB (~42 blocks × 2096-tok)
+#       max_model_len must need ≤ 42 blocks; 81920 needs 40 blocks ✓
+#       122880 would need 59 blocks — too large for GPU 0.
 # GPU 1 is unshared; keep 0.93 util and full 122880 context.
 if [[ "${VLLM_CUDA_DEVICE:-1}" == "0" ]]; then
-  GPU_MEM_UTIL=0.914
+  GPU_MEM_UTIL=0.912
   MAX_MODEL_LEN=81920   # GPU 0: reduced context (KV cache constraint); 40 blocks × 2096
 else
   GPU_MEM_UTIL=0.93
