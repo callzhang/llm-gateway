@@ -248,7 +248,9 @@ The Responses API (`POST /v1/responses`, `previous_response_id`, tool use) is ha
 3. Calls model_manager at `/v1/chat/completions` as usual
 4. Converts the response back to Responses API format and stores it in Postgres
 
-This requires `store_responses: true` in `litellm_settings` and a Postgres `DATABASE_URL` in the environment. The `custom_openai/` provider prefix (see [Configure LiteLLM](#4-configure-litellm-optional)) is what triggers this path — `openai/` would bypass it.
+This requires a Postgres `DATABASE_URL` in the environment. The `custom_openai/` provider prefix (see [Configure LiteLLM](#4-configure-litellm-optional)) is what triggers this path — `openai/` would bypass it.
+
+> **Limitation:** `previous_response_id` (conversation continuity across API calls) is not supported for `custom_openai/` providers in LiteLLM ≤ 1.85.x. The chat-provider bridge ignores it with a debug log. vLLM uses chat/completions natively and has no Responses API session storage. Clients that need multi-turn continuity must send the full conversation history in `messages[]` on each request.
 
 ## Tested with
 

@@ -56,8 +56,6 @@ litellm_settings:
   drop_params: true
   set_verbose: false
 
-  store_responses: true
-
   # Trim over-long histories before they reach vLLM, instead of returning 400.
   # trim_hook.py is in the same directory as this config file.
   callbacks:
