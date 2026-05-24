@@ -9,10 +9,10 @@ model_list:
       model: custom_openai/qwen3.6-35b-a3b
       api_base: http://127.0.0.1:8002/v1
       api_key: local-qwen36
-      # 32000, not 32768: leaves ≥880 tokens of headroom under the 122880
-      # max_model_len.  Removing max_tokens entirely lets the server default
-      # back to 32768 and an input of 90113 pushes total to 122881 (1 over).
-      max_tokens: 32000
+      # Theoretical max — trim_hook dynamically caps to ctx_win - input_est
+      # - SAFETY at request time, so this value only fires when input is
+      # small enough that 32768 fits comfortably.
+      max_tokens: 32768
       timeout: 600
       stream_timeout: 600
     model_info:

@@ -1,18 +1,28 @@
-"""LiteLLM pre-call hook: trim messages to fit within the model's context window.
+"""LiteLLM pre-call hook: keep input + max_tokens ≤ model context window.
 
 Registered in config.yaml:
     litellm_settings:
       callbacks:
-        - trim_hook.ContextTrimHook
+        - trim_hook.context_trim_hook
 
-The hook fires before every chat/completions call.  When the estimated token
-count (1 char ≈ 1 token — conservative for Chinese/Japanese) exceeds the
-budget, it drops the oldest (user, assistant) conversation pairs until the
-messages fit.  The system prompt and the current user turn are always kept.
+Two layered guarantees, in this order:
+  1. **Dynamic max_tokens cap**: every request gets `max_tokens` shrunk to
+     `ctx_win - input_token_estimate - SAFETY_MARGIN` (floored at MIN_OUTPUT).
+     This alone is enough to prevent the "input + output > context window"
+     400 in the common case where input fits comfortably.
+  2. **Input trim**: when input alone is so large that even MIN_OUTPUT
+     wouldn't fit, drop oldest (user, assistant) history pairs until it does.
+     System prompt and the latest user turn are always kept.
 
-If even the mandatory content alone exceeds the budget the messages are passed
-through unchanged and vLLM will return a 400 — nothing else can be done at that
+If even system + last user exceeds the trim target, we pass through with the
+clamped max_tokens and let vLLM return 400 — no algorithmic way out at that
 point.
+
+Token estimation uses an ASCII/non-ASCII heuristic (4 chars/token for ASCII,
+1 char/token for CJK) — close enough at the context-window boundary to keep
+us from either over-trimming English or under-trimming Chinese.  Exact counts
+would require running the model's tokenizer, which is too heavy to do per
+request.
 """
 from __future__ import annotations
 
@@ -23,49 +33,72 @@ from litellm.integrations.custom_logger import CustomLogger
 
 logger = logging.getLogger("litellm.trim_hook")
 
-# (context_window_tokens, max_output_tokens) — keep in sync with config.yaml
-# max_tokens and vLLM --max-model-len.
+# (context_window_tokens, default_max_output) — keep in sync with config.yaml
+# litellm_params.max_tokens and vLLM --max-model-len.  max_output is only used
+# when the request itself doesn't carry max_tokens; the hook caps whichever
+# value it sees against the actual input size.
 _MODEL_LIMITS: dict[str, tuple[int, int]] = {
     "qwen3.6-35b-a3b": (122880, 32000),
     "qwen3.6-27b":     (65536,  16384),
 }
 _DEFAULT_CTX = 32768
 _DEFAULT_OUT = 4096
+
+# Leave a small reserve for chat-template overhead (BOS/EOS, role markers,
+# tokenizer rounding), so the actual prompt has room to be ≤ ctx_win.
 _SAFETY_MARGIN = 512
 
+# Minimum output budget.  If dynamic capping would push max_tokens below this,
+# we trim input messages instead — preserving the model's ability to actually
+# answer rather than truncating mid-token.
+_MIN_OUTPUT = 1024
 
-def _char_count(msg: dict) -> int:
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token count.  ASCII is ~4 chars/token (English BPE), non-ASCII is
+    closer to 1 char/token (CJK).  Sum both for mixed-script content."""
+    if not isinstance(text, str) or not text:
+        return 0
+    ascii_chars = sum(1 for c in text if c.isascii())
+    return ascii_chars // 4 + (len(text) - ascii_chars)
+
+
+def _msg_tokens(msg: dict) -> int:
     c = msg.get("content", "")
     if isinstance(c, str):
-        return len(c)
+        return _estimate_tokens(c)
     if isinstance(c, list):
-        return sum(len(p.get("text", "")) for p in c if isinstance(p, dict))
+        return sum(
+            _estimate_tokens(p.get("text", ""))
+            for p in c if isinstance(p, dict)
+        )
     return 0
 
 
 def _trim_messages(
     messages: list[dict],
-    budget: int,
+    token_budget: int,
 ) -> tuple[list[dict], int]:
-    """Trim oldest history pairs to fit within budget chars.
+    """Drop oldest (user, assistant) pairs from history until total token
+    estimate ≤ token_budget.  System prompt and the last non-system message
+    are always retained.
 
     Returns (trimmed_messages, n_pairs_dropped).
     If mandatory content alone exceeds budget, returns (original, 0).
     """
     system_msgs = [m for m in messages if m.get("role") == "system"]
     non_system  = [m for m in messages if m.get("role") != "system"]
-
     if not non_system:
         return messages, 0
 
-    last_msg = [non_system[-1]]   # current turn — always kept
-    history  = non_system[:-1]    # eligible for trimming
+    last_msg = [non_system[-1]]
+    history  = non_system[:-1]
 
-    mandatory_chars = sum(_char_count(m) for m in system_msgs + last_msg)
-    if mandatory_chars > budget:
-        return messages, 0  # caller will let vLLM reject it
+    mandatory_tokens = sum(_msg_tokens(m) for m in system_msgs + last_msg)
+    if mandatory_tokens > token_budget:
+        return messages, 0
 
-    # Group history into (user [, assistant]) pairs
+    # Group history into (user, assistant?) pairs so we drop turns atomically.
     pairs: list[tuple[dict, ...]] = []
     i = 0
     while i < len(history):
@@ -81,16 +114,16 @@ def _trim_messages(
             pairs.append((history[i],))
             i += 1
         else:
-            i += 1  # tool / other roles: skip (rare in this pipeline)
+            i += 1   # tool / other roles: skip (rare in this pipeline)
 
-    remaining = budget - mandatory_chars
+    remaining = token_budget - mandatory_tokens
     included: list[tuple[dict, ...]] = []
     for pair in reversed(pairs):
-        pair_chars = sum(_char_count(m) for m in pair)
-        if pair_chars > remaining:
-            break   # this pair doesn't fit; drop it and everything older
+        pair_tokens = sum(_msg_tokens(m) for m in pair)
+        if pair_tokens > remaining:
+            break   # this pair (and everything older) doesn't fit
         included.insert(0, pair)
-        remaining -= pair_chars
+        remaining -= pair_tokens
 
     n_dropped = len(pairs) - len(included)
     if n_dropped == 0:
@@ -101,7 +134,7 @@ def _trim_messages(
 
 
 class ContextTrimHook(CustomLogger):
-    """Trim over-long chat histories before they reach vLLM."""
+    """Dynamic max_tokens cap + reactive message trim so input + output fits."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -120,41 +153,58 @@ class ContextTrimHook(CustomLogger):
         if not messages:
             return None
 
-        # Strip provider prefix so "custom_openai/qwen3.6-35b-a3b" → "qwen3.6-35b-a3b"
+        # Strip provider prefix: "custom_openai/qwen3.6-35b-a3b" → "qwen3.6-35b-a3b"
         model_name = (data.get("model") or "").rsplit("/", 1)[-1]
-        ctx_win, max_out = _MODEL_LIMITS.get(model_name, (_DEFAULT_CTX, _DEFAULT_OUT))
-
-        # Budget: leave headroom for output tokens and overhead.
-        # Floor at half the context so we don't trim absurdly when max_out is large.
-        budget = max(
-            min(int(ctx_win * 0.7), ctx_win - max_out - _SAFETY_MARGIN),
-            ctx_win // 2,
+        ctx_win, default_max_out = _MODEL_LIMITS.get(
+            model_name, (_DEFAULT_CTX, _DEFAULT_OUT)
         )
+        requested_max = data.get("max_tokens") or default_max_out
 
-        total_chars = sum(_char_count(m) for m in messages)
-        if total_chars <= budget:
-            return None  # nothing to do
+        input_est = sum(_msg_tokens(m) for m in messages)
+        changed = False
 
-        trimmed, n_dropped = _trim_messages(messages, budget)
-        if n_dropped == 0:
-            # Mandatory content alone is too large — pass through, let vLLM fail
-            logger.warning(
-                "trim_hook: mandatory content exceeds budget for model=%s "
-                "(chars=%d, budget=%d) — passing through",
-                model_name, total_chars, budget,
+        # Step 1: if input alone leaves less than _MIN_OUTPUT for the model to
+        # speak, trim oldest history pairs until at least _MIN_OUTPUT fits.
+        trim_target = ctx_win - _MIN_OUTPUT - _SAFETY_MARGIN
+        if input_est > trim_target:
+            trimmed, n_dropped = _trim_messages(messages, trim_target)
+            if n_dropped > 0:
+                new_input = sum(_msg_tokens(m) for m in trimmed)
+                logger.warning(
+                    "trim_hook: trimmed %d pair(s) for %s "
+                    "(input_est tokens: %d → %d, msgs: %d → %d, ctx_win=%d)",
+                    n_dropped, model_name,
+                    input_est, new_input,
+                    len(messages), len(trimmed),
+                    ctx_win,
+                )
+                data["messages"] = trimmed
+                input_est = new_input
+                changed = True
+            else:
+                # System + last user alone is already over.  Fall through to
+                # cap max_tokens to _MIN_OUTPUT and let vLLM decide.
+                logger.warning(
+                    "trim_hook: mandatory content (%d tokens) > trim target "
+                    "(%d) for %s — passing through with capped max_tokens",
+                    input_est, trim_target, model_name,
+                )
+
+        # Step 2: always cap max_tokens so input + output fits.  This is the
+        # primary guarantee — even with input_est == 0 we still apply it so
+        # an oversized requested_max gets clipped to the model's actual ceiling.
+        max_safe = max(_MIN_OUTPUT, ctx_win - input_est - _SAFETY_MARGIN)
+        new_max = min(requested_max, max_safe)
+        if new_max != data.get("max_tokens"):
+            logger.info(
+                "trim_hook: capped max_tokens %s → %d for %s "
+                "(input_est=%d, ctx_win=%d)",
+                data.get("max_tokens"), new_max, model_name, input_est, ctx_win,
             )
-            return None
+            data["max_tokens"] = new_max
+            changed = True
 
-        trimmed_chars = sum(_char_count(m) for m in trimmed)
-        logger.warning(
-            "trim_hook: dropped %d pair(s) for model=%s "
-            "(chars: %d → %d, budget=%d, msgs: %d → %d)",
-            n_dropped, model_name,
-            total_chars, trimmed_chars, budget,
-            len(messages), len(trimmed),
-        )
-        data["messages"] = trimmed
-        return data
+        return data if changed else None
 
 
 # Module-level instance — config.yaml references this via "trim_hook.context_trim_hook"
