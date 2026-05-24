@@ -26,7 +26,7 @@ logger = logging.getLogger("litellm.trim_hook")
 # (context_window_tokens, max_output_tokens) — keep in sync with config.yaml
 # max_tokens and vLLM --max-model-len.
 _MODEL_LIMITS: dict[str, tuple[int, int]] = {
-    "qwen3.6-35b-a3b": (122880, 32768),
+    "qwen3.6-35b-a3b": (122880, 32000),
     "qwen3.6-27b":     (65536,  16384),
 }
 _DEFAULT_CTX = 32768
