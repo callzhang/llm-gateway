@@ -618,6 +618,11 @@ class GpuBackend:
                 os.killpg(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+        # EngineCore ignores SIGTERM and may outlive the APIServer (which dies
+        # quickly, causing the poll above to exit early via ProcessLookupError).
+        # Always sweep the GPU for orphan processes so the next spawn isn't
+        # blocked by a zombie holding VRAM.
+        await self._kill_gpu_zombies()
         self.log.info("vLLM unloaded")
         self.process = None
         self._adopted_pid = None
