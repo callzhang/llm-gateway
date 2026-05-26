@@ -38,8 +38,8 @@ logger = logging.getLogger("litellm.trim_hook")
 # when the request itself doesn't carry max_tokens; the hook caps whichever
 # value it sees against the actual input size.
 _MODEL_LIMITS: dict[str, tuple[int, int]] = {
-    "qwen3.6-35b-a3b": (122880, 32000),
-    "qwen3.6-27b":     (65536,  16384),
+    "qwen3.6-35b-a3b": (81920, 32000),   # vLLM loaded with --max-model-len 81920
+    "qwen3.6-27b":     (65536, 16384),
 }
 _DEFAULT_CTX = 32768
 _DEFAULT_OUT = 4096
@@ -193,8 +193,33 @@ class ContextTrimHook(CustomLogger):
         # Step 2: always cap max_tokens so input + output fits.  This is the
         # primary guarantee — even with input_est == 0 we still apply it so
         # an oversized requested_max gets clipped to the model's actual ceiling.
-        max_safe = max(_MIN_OUTPUT, ctx_win - input_est - _SAFETY_MARGIN)
-        new_max = min(requested_max, max_safe)
+        #
+        # NO _MIN_OUTPUT floor here on purpose: when input alone leaves <1024
+        # tokens of room, forcing max_tokens up to 1024 would re-create the
+        # overflow we're trying to prevent.  Instead we shrink max_tokens to
+        # the actual remaining budget (possibly <1024) and just warn — the
+        # model may truncate its answer, which is strictly better than 400.
+        raw_safe = ctx_win - input_est - _SAFETY_MARGIN
+        if raw_safe < 1:
+            # Input alone exceeds (ctx_win - safety): vLLM will still 400.
+            # Set max_tokens=1 so OpenAI API doesn't reject for non-positive
+            # max_tokens — vLLM's own context check will produce the 400 with
+            # a clear "input too large" message instead of our crashing here.
+            logger.warning(
+                "trim_hook: input_est %d ≥ ctx_win %d - safety %d for %s — "
+                "vLLM will return 400 (no algorithmic recourse)",
+                input_est, ctx_win, _SAFETY_MARGIN, model_name,
+            )
+            new_max = 1
+        else:
+            new_max = min(requested_max, raw_safe)
+            if new_max < _MIN_OUTPUT:
+                logger.warning(
+                    "trim_hook: cramped output budget %d < soft min %d for %s "
+                    "(input_est=%d, ctx_win=%d) — model may truncate",
+                    new_max, _MIN_OUTPUT, model_name, input_est, ctx_win,
+                )
+
         if new_max != data.get("max_tokens"):
             logger.info(
                 "trim_hook: capped max_tokens %s → %d for %s "
