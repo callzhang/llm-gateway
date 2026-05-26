@@ -38,8 +38,8 @@ logger = logging.getLogger("litellm.trim_hook")
 # when the request itself doesn't carry max_tokens; the hook caps whichever
 # value it sees against the actual input size.
 _MODEL_LIMITS: dict[str, tuple[int, int]] = {
-    "qwen3.6-35b-a3b": (81920, 32000),   # vLLM loaded with --max-model-len 81920
-    "qwen3.6-27b":     (65536, 16384),
+    "qwen3.6-35b-a3b": (122880, 32000),   # both slots run --max-model-len 122880
+    "qwen3.6-27b":     (65536,  16384),
 }
 _DEFAULT_CTX = 32768
 _DEFAULT_OUT = 4096

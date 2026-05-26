@@ -12,23 +12,13 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
 
-# GPU 0 shares with embedding-provider (~2.2 GiB idle, up to ~2.73 GiB under load).
-# Must satisfy two constraints:
-#   (1) startup check: util × 31.36 GiB < free_at_scaleout
-#       embedding peaks at ~2.73 GiB → free = 28.63 GiB
-#       0.912 × 31.36 = 28.60 GiB < 28.63 GiB → 30 MiB margin ✓
-#       (was 0.914 → 28.66 GiB > 28.63 GiB → failed during high-load scale-out)
-#   (2) KV cache min:  at 0.912 util, available KV ≈ 0.996 GiB (~42 blocks × 2096-tok)
-#       max_model_len must need ≤ 42 blocks; 81920 needs 40 blocks ✓
-#       122880 would need 59 blocks — too large for GPU 0.
-# GPU 1 is unshared; keep 0.93 util and full 122880 context.
-if [[ "${VLLM_CUDA_DEVICE:-1}" == "0" ]]; then
-  GPU_MEM_UTIL=0.912
-  MAX_MODEL_LEN=81920   # GPU 0: reduced context (KV cache constraint); 40 blocks × 2096
-else
-  GPU_MEM_UTIL=0.93
-  MAX_MODEL_LEN=122880  # GPU 1: unshared, full context window
-fi
+# Both GPUs run identical config.  embedding-provider has idle-offload enabled
+# (300s timeout) so when annotation traffic dominates, GPU 0 has full ~32 GiB
+# available — same as the unshared GPU 1.  vLLM will refuse to start on GPU 0
+# when embedding is actively loaded (~2.7 GiB) and util=0.93 doesn't fit; mm's
+# scale-out cooldown handles the retry until embedding offloads.
+GPU_MEM_UTIL=0.93
+MAX_MODEL_LEN=122880
 
 exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
   --host 127.0.0.1 \
