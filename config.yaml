@@ -9,14 +9,14 @@ model_list:
       model: custom_openai/qwen3.6-35b-a3b
       api_base: http://127.0.0.1:8002/v1
       api_key: local-qwen36
-      # Theoretical max — trim_hook dynamically caps to ctx_win - input_est
-      # - SAFETY at request time, so this value only fires when input is
-      # small enough that 32768 fits comfortably.
+      # trim_hook dynamically caps to ctx_win - input_est - SAFETY at request
+      # time.  vLLM was loaded with --max-model-len 81920 (not theoretical
+      # 122880) so trim_hook and model_info must both reflect the real limit.
       max_tokens: 32768
       timeout: 600
       stream_timeout: 600
     model_info:
-      max_context_window_tokens: 122880
+      max_context_window_tokens: 81920
       supports_vision: true
 
   # ── Qwen3.6-27B Text NVFP4+MTP ──────────────────────────────────────────
@@ -66,6 +66,6 @@ litellm_settings:
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
-  port: 8901
+  port: 8900
   proxy_base_url: "http://stardust-gpu4:8900"
   health_check_interval: 0   # disable background probes — they hit vLLM and reset idle timer

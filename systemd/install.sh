@@ -8,7 +8,6 @@ USER_SYSTEMD="$HOME/.config/systemd/user"
 SERVICES=(
   llm-model-manager.service
   llm-litellm.service
-  llm-gateway.service
 )
 
 # Remove old system-level units if present
@@ -19,7 +18,6 @@ LEGACY=(
   llm-ocr-middleware.service
   llm-model-manager.service
   llm-litellm.service
-  llm-gateway.service
 )
 for svc in "${LEGACY[@]}"; do
   if [ -f "/etc/systemd/system/$svc" ]; then
@@ -53,7 +51,7 @@ done
 
 echo ""
 echo "Done. Manage with:"
-echo "  systemctl --user start   llm-model-manager llm-litellm llm-gateway"
-echo "  systemctl --user status  llm-model-manager llm-litellm llm-gateway"
+echo "  systemctl --user start   llm-model-manager llm-litellm"
+echo "  systemctl --user status  llm-model-manager llm-litellm"
 echo "  systemctl --user restart llm-litellm"
-echo "  systemctl --user stop    llm-gateway llm-litellm llm-model-manager"
+echo "  systemctl --user stop    llm-litellm llm-model-manager"

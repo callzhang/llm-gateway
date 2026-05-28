@@ -7,5 +7,5 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
 exec "$SCRIPT_DIR/.venv/bin/litellm" \
   --config "$SCRIPT_DIR/config.yaml" \
-  --port 8901 \
-  --host 127.0.0.1
+  --port 8900 \
+  --host 0.0.0.0

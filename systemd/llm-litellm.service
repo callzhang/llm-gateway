@@ -1,7 +1,6 @@
 [Unit]
-Description=LLM Gateway — LiteLLM proxy (:8901)
-After=default.target llm-model-manager.service
-Requires=llm-model-manager.service
+Description=LLM Gateway — LiteLLM proxy (:8900)
+After=default.target
 
 [Service]
 Type=simple
