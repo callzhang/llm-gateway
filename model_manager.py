@@ -576,8 +576,16 @@ class GpuBackend:
                         )
                         self._ready = True
                         return
+                    else:
+                        self.log.warning(
+                            f"health poll: HTTP {r.status} after "
+                            f"{int(time.monotonic()-started)}s"
+                        )
             except Exception as exc:
-                self.log.debug(f"health poll: {type(exc).__name__}: {exc}")
+                self.log.warning(
+                    f"health poll: {type(exc).__name__}: {exc} after "
+                    f"{int(time.monotonic()-started)}s"
+                )
             await asyncio.sleep(HEALTH_POLL)
 
         self.log.error(f"Startup timed out after {WAKE_TIMEOUT}s — killing")
