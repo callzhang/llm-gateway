@@ -2,7 +2,7 @@
 # Run Open WebUI — foreground for systemd
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── OpenAI-compatible backend: route through gateway.py ──────────────────────
+# ── OpenAI-compatible backend: LiteLLM proxy on :8900 ─────────────────────────
 export OPENAI_API_BASE_URL="http://127.0.0.1:8900/v1"
 export OPENAI_API_KEY="${LITELLM_MASTER_KEY:-sk-local-gateway}"
 
