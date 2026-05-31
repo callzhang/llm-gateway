@@ -8,6 +8,7 @@ USER_SYSTEMD="$HOME/.config/systemd/user"
 SERVICES=(
   llm-model-manager.service
   llm-litellm.service
+  llm-open-webui.service
 )
 
 # Remove old system-level units if present
@@ -51,7 +52,9 @@ done
 
 echo ""
 echo "Done. Manage with:"
-echo "  systemctl --user start   llm-model-manager llm-litellm"
-echo "  systemctl --user status  llm-model-manager llm-litellm"
-echo "  systemctl --user restart llm-litellm"
-echo "  systemctl --user stop    llm-litellm llm-model-manager"
+echo "  systemctl --user start   llm-model-manager llm-litellm llm-open-webui"
+echo "  systemctl --user status  llm-model-manager llm-litellm llm-open-webui"
+echo "  systemctl --user restart llm-litellm llm-open-webui"
+echo "  systemctl --user stop    llm-open-webui llm-litellm llm-model-manager"
+echo ""
+echo "  Chat UI: http://$(hostname -I | awk '{print $1}'):3000"

@@ -1,5 +1,5 @@
 [Unit]
-Description=LLM Gateway — LiteLLM proxy (:8900)
+Description=LLM Gateway — LiteLLM proxy (:8901, internal)
 After=default.target
 
 [Service]

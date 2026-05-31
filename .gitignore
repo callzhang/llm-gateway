@@ -1,4 +1,5 @@
 .venv/
+.venv-owui/
 __pycache__/
 *.pyc
 *.pyo
@@ -10,3 +11,5 @@ prisma/
 .env
 gateway.env
 .claude/
+open-webui-data/
+.webui_secret_key

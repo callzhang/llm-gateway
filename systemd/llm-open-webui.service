@@ -1,0 +1,18 @@
+[Unit]
+Description=LLM Gateway — Open WebUI chat interface (:3000)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/derek/Projects/llm-gateway
+EnvironmentFile=-/home/derek/Projects/llm-gateway/gateway.env
+ExecStart=/home/derek/Projects/llm-gateway/run_open_webui.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=60
+TimeoutStopSec=15
+StandardOutput=append:/home/derek/Projects/llm-gateway/logs/open_webui.log
+StandardError=append:/home/derek/Projects/llm-gateway/logs/open_webui.log
+
+[Install]
+WantedBy=default.target
