@@ -29,9 +29,20 @@ export DEFAULT_USER_ROLE=user
 # Keep open signup enabled (the company-domain allowlist above is the gate).
 export ENABLE_SIGNUP=True
 
-# ── RAG: use the upstream LLM for embeddings; skip local model download ───────
+# ── RAG embeddings: local Jina embedding-provider (OpenAI-compatible) ─────────
+# Open WebUI's RAG embedding uses its OWN OpenAI endpoint (RAG_OPENAI_API_*),
+# NOT the chat OPENAI_API_BASE_URL above.  Without RAG_OPENAI_API_BASE_URL it
+# silently defaults to https://api.openai.com/v1 → 401.  Point it at the local
+# jina-embeddings-v5-text-small service on :7997 (same host; the public tunnel
+# https://embed.preseen.ai/v1 maps here, but loopback avoids the round-trip).
+# Note: qwen3.6-27b is a CHAT model and cannot embed — that was also wrong.
 export RAG_EMBEDDING_ENGINE=openai
-export RAG_EMBEDDING_MODEL=qwen3.6-27b
+export RAG_EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-small
+export RAG_OPENAI_API_BASE_URL="http://127.0.0.1:7997/v1"
+# Key injected from gateway.env via systemd EnvironmentFile (kept out of git).
+export RAG_OPENAI_API_KEY="${RAG_OPENAI_API_KEY:-}"
+# jina-v5-small advertises max_batch_size=2; keep Open WebUI's batches within it.
+export RAG_EMBEDDING_BATCH_SIZE=2
 
 # ── Listen ────────────────────────────────────────────────────────────────────
 # NOTE: `open-webui serve` ignores the PORT/HOST env vars — it only honours the
