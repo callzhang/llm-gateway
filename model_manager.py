@@ -46,6 +46,23 @@ IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "300"))
 WAKE_TIMEOUT = int(os.environ.get("WAKE_TIMEOUT", "300"))
 HEALTH_POLL  = float(os.environ.get("HEALTH_POLL", "2.0"))
 LISTEN_PORT  = int(os.environ.get("LISTEN_PORT", "8002"))
+# Bind 0.0.0.0 so tailnet peers can reach it (Tailscale's ts-input iptables
+# chain ACCEPTs tailscale0 traffic before ufw; LAN stays blocked by ufw
+# default-deny; 0.0.0.0 still covers 127.0.0.1 so internal loopback is intact).
+LISTEN_HOST  = os.environ.get("LISTEN_HOST", "0.0.0.0")
+
+# ── Scale-out gating (sustained real-queue trigger) ──────────────────────────────
+# Scale a model onto a 2nd GPU only when vLLM's *real* internal queue
+# (num_requests_waiting, summed across the model's running instances) stays above
+# SCALE_OUT_QUEUE for at least SCALE_OUT_SUSTAIN seconds.  In-flight count is a
+# poor signal — continuous batching keeps many concurrent requests fast — so we
+# trigger on what vLLM actually can't fit in its current batch.  The sustain
+# timer avoids thrash-evicting another model on a brief concurrency spike.
+SCALE_OUT_QUEUE      = int(os.environ.get("SCALE_OUT_QUEUE", "4"))
+SCALE_OUT_SUSTAIN    = int(os.environ.get("SCALE_OUT_SUSTAIN", "120"))
+# Extra replicas (a model running on >1 slot) idle out faster than the primary so
+# a borrowed slot is returned to its evicted model promptly (asymmetric scale-in).
+REPLICA_IDLE_TIMEOUT = int(os.environ.get("REPLICA_IDLE_TIMEOUT", "120"))
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR    = os.path.join(SCRIPT_DIR, "logs")
@@ -275,6 +292,97 @@ class GPUBusyError(Exception):
     pass
 
 
+# ── Admin dashboard (served at GET /admin) ─────────────────────────────────────
+ADMIN_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Gateway — slots</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.45 system-ui, sans-serif; margin: 0; padding: 24px;
+         background:#0e1116; color:#e6edf3; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color:#8b949e; margin-bottom: 18px; }
+  .grid { display:flex; flex-wrap:wrap; gap:16px; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:10px;
+          padding:16px; width:340px; }
+  .row { display:flex; justify-content:space-between; margin:3px 0; }
+  .k { color:#8b949e; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:999px;
+           font-size:12px; font-weight:600; }
+  .free    { background:#21262d; color:#8b949e; }
+  .ready   { background:#1a7f37; color:#fff; }
+  .starting{ background:#9e6a03; color:#fff; }
+  .failed  { background:#b62324; color:#fff; }
+  .model { font-size:15px; font-weight:600; margin:2px 0 10px; }
+  select, button { font:inherit; padding:6px 10px; border-radius:6px;
+                   border:1px solid #30363d; background:#21262d; color:#e6edf3; }
+  button { cursor:pointer; }
+  button.kill   { border-color:#b62324; color:#ff7b72; }
+  button.start  { border-color:#1a7f37; color:#3fb950; }
+  button.switch { border-color:#9e6a03; color:#d29922; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .ctl { display:flex; gap:8px; margin-top:10px; align-items:center; }
+  .msg { color:#8b949e; font-size:12px; margin-top:10px; min-height:16px; }
+  .meta { color:#6e7681; font-size:12px; margin-top:14px; }
+</style>
+</head>
+<body>
+<h1>LLM Gateway — GPU slots</h1>
+<div class="sub">Auto-refresh every 2s · loopback admin only</div>
+<div id="grid" class="grid"></div>
+<div id="meta" class="meta"></div>
+<script>
+async function post(path, payload) {
+  await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+                     body: JSON.stringify(payload)});
+  setTimeout(refresh, 300);
+}
+function opts(models, current) {
+  return models.map(m => `<option value="${m}" ${m===current?'selected':''}>${m}</option>`).join('');
+}
+function card(s) {
+  const occupied = s.model !== null;
+  const sel = `<select id="m${s.slot_id}">${opts(s.allowed_models, s.model)}</select>`;
+  let ctl;
+  if (!occupied) {
+    ctl = `${sel}<button class="start" onclick="start(${s.slot_id})">Start</button>`;
+  } else {
+    ctl = `${sel}`
+        + `<button class="switch" onclick="switchM(${s.slot_id})">Switch</button>`
+        + `<button class="kill" onclick="kill(${s.slot_id})">Kill</button>`;
+  }
+  const idle = s.idle_seconds==null ? '—' : s.idle_seconds + 's';
+  return `<div class="card">
+    <div class="row"><span class="k">slot ${s.slot_id} · GPU ${s.gpu_id} · :${s.port}</span>
+      <span class="badge ${s.state}">${s.state}</span></div>
+    <div class="model">${occupied ? s.model : '<i style="color:#6e7681">free</i>'}</div>
+    <div class="row"><span class="k">active requests</span><span>${s.active_requests}</span></div>
+    <div class="row"><span class="k">idle</span><span>${idle}</span></div>
+    <div class="ctl">${ctl}</div>
+    <div class="msg">${s.msg || ''}</div>
+  </div>`;
+}
+function start(id)   { post('/admin/start',  {slot_id:id, model:document.getElementById('m'+id).value}); }
+function switchM(id) { post('/admin/switch', {slot_id:id, model:document.getElementById('m'+id).value}); }
+function kill(id)    { if (confirm('Kill vLLM on slot '+id+'?')) post('/admin/kill', {slot_id:id}); }
+async function refresh() {
+  try {
+    const r = await fetch('/admin/status'); const d = await r.json();
+    document.getElementById('grid').innerHTML = d.slots.map(card).join('');
+    document.getElementById('meta').textContent =
+      `models: ${d.models.join(', ')} · idle_timeout ${d.idle_timeout}s · wake_timeout ${d.wake_timeout}s`;
+  } catch (e) { document.getElementById('meta').textContent = 'status error: ' + e; }
+}
+refresh(); setInterval(refresh, 2000);
+</script>
+</body>
+</html>
+"""
+
+
 # ── GPU slot (physical resource) ───────────────────────────────────────────────
 
 class GpuSlot:
@@ -334,6 +442,9 @@ class GpuBackend:
         self._lock            = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
         self._session: aiohttp.ClientSession | None = None
+        # Set by DynamicRouter after construction; used for replica-aware idle
+        # timeout (count sibling instances of the same model).
+        self.router: "DynamicRouter | None" = None
 
     @property
     def is_running(self) -> bool:
@@ -351,15 +462,59 @@ class GpuBackend:
 
     async def start(self) -> None:
         """Initialise aiohttp session and idle watchdog.  Does NOT spawn vLLM yet."""
-        self._session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=100, keepalive_timeout=60),
-            timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_read=None),
-        )
-        self._idle_task = asyncio.create_task(self._idle_loop())
+        self._ensure_session()
+        self._ensure_idle_task()
         self.log.info(
             f"Backend claimed slot {self.slot.slot_id} "
             f"(GPU={self.gpu_id} port={self.vllm_port})"
         )
+
+    def _ensure_session(self) -> None:
+        """(Re)create the aiohttp session if it was never opened or has been
+        closed.  An idle-unload that races with a new request closes this
+        backend's session before the request's spawn acquires the lock; without
+        re-opening it every /health poll raises 'Session is closed' and the
+        spawn falsely times out after WAKE_TIMEOUT, killing a healthy vLLM."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=100, keepalive_timeout=60),
+                timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_read=None),
+            )
+
+    def _ensure_idle_task(self) -> None:
+        """Restart the idle/crash watchdog if it has exited.  The idle-unload
+        path returns from _idle_loop, so a revived backend would otherwise spawn
+        vLLM with no supervision (no idle unload, no crash detection)."""
+        if self._idle_task is None or self._idle_task.done():
+            self._idle_task = asyncio.create_task(self._idle_loop())
+
+    async def queue_depth(self) -> int:
+        """vLLM's real internal queue (num_requests_waiting) for this backend.
+
+        This is the count of requests vLLM cannot fit into its current batch
+        (KV-cache full or max_num_seqs reached) — the true saturation signal.
+        Returns 0 on any error so a flaky /metrics never blocks scale decisions.
+        """
+        if not self._ready or not self.is_running:
+            return 0
+        self._ensure_session()
+        try:
+            async with self._session.get(
+                f"{self.vllm_base}/metrics",
+                timeout=aiohttp.ClientTimeout(total=3),
+            ) as r:
+                if r.status != 200:
+                    return 0
+                text = await r.text()
+        except Exception:
+            return 0
+        for line in text.splitlines():
+            if line.startswith("vllm:num_requests_waiting"):
+                try:
+                    return int(float(line.rsplit(" ", 1)[1]))
+                except (ValueError, IndexError):
+                    return 0
+        return 0
 
     async def stop(self) -> None:
         """Gracefully stop this backend and release its slot."""
@@ -427,15 +582,28 @@ class GpuBackend:
 
                 if not self.is_running or self._active_requests > 0:
                     continue
+                # Asymmetric scale-in: when this model runs on >1 slot, the
+                # highest-slot instance is an "extra replica" and sheds early so
+                # the borrowed slot returns to its evicted model promptly.  The
+                # lowest-slot instance is the primary and keeps the full timeout.
+                timeout = IDLE_TIMEOUT
+                if self.router is not None:
+                    siblings = self.router._running_backends(self.model_name)
+                    if len(siblings) > 1 and \
+                       self is not min(siblings, key=lambda b: b.slot.slot_id):
+                        timeout = REPLICA_IDLE_TIMEOUT
                 idle = time.monotonic() - self.last_activity
-                if idle < IDLE_TIMEOUT:
+                if idle < timeout:
                     continue
                 async with self._lock:
                     if not self.is_running or self._active_requests > 0:
                         continue
                     idle = time.monotonic() - self.last_activity
-                    if idle >= IDLE_TIMEOUT:
-                        self.log.info(f"Idle {int(idle)}s — unloading {self.model_name}")
+                    if idle >= timeout:
+                        self.log.info(
+                            f"Idle {int(idle)}s (timeout {timeout}s) — "
+                            f"unloading {self.model_name}"
+                        )
                         await self._kill_process_locked()
                         if self.slot.backend is self:
                             self.slot.backend = None
@@ -507,6 +675,17 @@ class GpuBackend:
     async def _spawn_locked(self) -> None:
         """Spawn vLLM subprocess and wait for /health.  Caller must hold self._lock."""
         self._ready = False
+        # ── Revival guard ──────────────────────────────────────────────────────
+        # This backend object can be revived after an idle-unload that raced with
+        # a new request: while this coroutine was blocked on the lock, the idle
+        # watchdog killed the old vLLM, detached the slot, closed our aiohttp
+        # session, and exited.  Re-establish all three before spawning — otherwise
+        # every /health poll raises "Session is closed", the spawn times out after
+        # WAKE_TIMEOUT, and we kill a perfectly healthy vLLM (→ 503 to the caller).
+        self._ensure_session()
+        self._ensure_idle_task()
+        if self.slot.backend is None:
+            self.slot.backend = self
         self._check_gpu_free()
         log_fd = open(self.log_path, "ab")
         try:
@@ -896,11 +1075,10 @@ def _sticky_slot_for(parsed_body: dict | None, headers) -> tuple[int | None, str
 class DynamicRouter:
     """Routes requests to GPU backends with dynamic slot assignment and scale-out."""
 
-    # Minimum number of simultaneous active requests across all running instances
-    # before a scale-out is considered.  Setting this to 2 means a single
-    # background heartbeat or probe never triggers a second GPU spawn; only real
-    # concurrent user load does.
-    SCALE_OUT_MIN_CONCURRENCY = 2
+    # Scale-out is driven by the background saturation monitor
+    # (_saturation_loop), which fires when vLLM's real queue (num_requests_waiting)
+    # stays above SCALE_OUT_QUEUE for SCALE_OUT_SUSTAIN seconds — see the module
+    # constants.  There is no instantaneous in-flight-count trigger any more.
 
     # Seconds to wait before re-attempting scale-out after a failure.
     # Prevents a crash-loop when a slot cannot physically start a model
@@ -916,6 +1094,16 @@ class DynamicRouter:
         # Per-model timestamp of last scale-out failure (monotonic clock).
         # Used to enforce SCALE_OUT_COOLDOWN before retrying.
         self._scale_fail_time: dict[str, float] = {}
+        # Per-slot last admin-action message, surfaced on the /admin dashboard
+        # (e.g. "starting qwen3.6-27b…", "kill failed: …").
+        self._admin_msg: dict[int, str] = {}
+        # Background admin tasks (start/kill/switch), kept referenced so the
+        # event loop doesn't GC them mid-flight.
+        self._admin_tasks: set[asyncio.Task] = set()
+        # Per-model monotonic timestamp when the real vLLM queue first crossed
+        # SCALE_OUT_QUEUE; scale-out fires once it stays crossed for SUSTAIN secs.
+        self._saturated_since: dict[str, float] = {}
+        self._sat_task: asyncio.Task | None = None
 
     # ── Slot / backend helpers ─────────────────────────────────────────────────
 
@@ -958,6 +1146,110 @@ class DynamicRouter:
         """
         cfg = self.model_configs.get(model_name)
         return cfg[2] if cfg is not None else None
+
+    # ── Admin / dashboard ──────────────────────────────────────────────────────
+
+    def status(self) -> dict:
+        """Live snapshot of every slot for the /admin dashboard."""
+        now = time.monotonic()
+        slots = []
+        for s in self.slots:
+            b = s.backend
+            allowed_here = {
+                m for m in self.model_configs
+                if (g := self._allowed_gpus(m)) is None or s.gpu_id in g
+            }
+            entry = {
+                "slot_id": s.slot_id,
+                "gpu_id":  s.gpu_id,
+                "port":    s.port,
+                "allowed_models": sorted(allowed_here),
+                "msg":     self._admin_msg.get(s.slot_id, ""),
+            }
+            if b is None:
+                entry.update(model=None, state="free", ready=False,
+                             running=False, active_requests=0, idle_seconds=None)
+            else:
+                entry.update(
+                    model=b.model_name,
+                    ready=b._ready,
+                    running=b.is_running,
+                    failed=b._failed,
+                    active_requests=b._active_requests,
+                    idle_seconds=int(now - b.last_activity),
+                    adopted=b._adopted_pid is not None,
+                    state=("failed" if b._failed else
+                           "ready" if (b._ready and b.is_running) else
+                           "starting"),
+                )
+            slots.append(entry)
+        return {
+            "slots": slots,
+            "models": list(self.model_configs),
+            "idle_timeout": IDLE_TIMEOUT,
+            "wake_timeout": WAKE_TIMEOUT,
+        }
+
+    def _track_admin(self, coro) -> None:
+        """Run an admin coroutine in the background, keeping a reference."""
+        task = asyncio.create_task(coro)
+        self._admin_tasks.add(task)
+        task.add_done_callback(self._admin_tasks.discard)
+
+    def _slot_by_id(self, slot_id: int) -> GpuSlot:
+        for s in self.slots:
+            if s.slot_id == slot_id:
+                return s
+        raise KeyError(f"no slot with id {slot_id}")
+
+    async def admin_kill(self, slot_id: int) -> None:
+        """Unload whatever vLLM occupies a slot, freeing it."""
+        slot = self._slot_by_id(slot_id)
+        b = slot.backend
+        if b is None:
+            self._admin_msg[slot_id] = "already free"
+            return
+        self._admin_msg[slot_id] = f"killing {b.model_name}…"
+        try:
+            await b.stop()
+            self._admin_msg[slot_id] = "freed"
+        except Exception as exc:
+            self._admin_msg[slot_id] = f"kill failed: {exc}"
+
+    async def admin_start(self, slot_id: int, model_name: str) -> None:
+        """Spawn a specific model on a specific (currently free) slot."""
+        if model_name not in self.model_configs:
+            self._admin_msg[slot_id] = f"unknown model {model_name}"
+            return
+        async with self._router_lock:
+            slot = self._slot_by_id(slot_id)
+            if slot.backend is not None:
+                self._admin_msg[slot_id] = (
+                    f"slot busy ({slot.backend.model_name}) — kill or switch first")
+                return
+            allowed = self._allowed_gpus(model_name)
+            if allowed is not None and slot.gpu_id not in allowed:
+                self._admin_msg[slot_id] = (
+                    f"{model_name} not allowed on GPU {slot.gpu_id}")
+                return
+            script, served, _ = self.model_configs[model_name]
+            b = GpuBackend(model_name, script, served, slot)
+            b.router = self
+            slot.backend = b           # CLAIM
+            await b.start()            # init session + watchdog
+        self._admin_msg[slot_id] = f"starting {model_name}…"
+        try:
+            await b._ensure_running()
+            self._admin_msg[slot_id] = f"{model_name} ready"
+        except Exception as exc:
+            if b.slot.backend is b:
+                b.slot.backend = None
+            self._admin_msg[slot_id] = f"start failed: {exc}"
+
+    async def admin_switch(self, slot_id: int, model_name: str) -> None:
+        """Kill the current backend on a slot then start a different model there."""
+        await self.admin_kill(slot_id)
+        await self.admin_start(slot_id, model_name)
 
     # ── Core: get or start a backend ──────────────────────────────────────────
 
@@ -1015,6 +1307,7 @@ class DynamicRouter:
                 slot   = compatible[0]
                 script, served, _ = self.model_configs[model_name]
                 b      = GpuBackend(model_name, script, served, slot)
+                b.router = self
                 slot.backend = b          # CLAIM — blocks other models from this slot
                 await b.start()           # init session + idle watchdog
 
@@ -1051,11 +1344,8 @@ class DynamicRouter:
         running = self._running_backends(model_name)
         if not running:
             return
-        total_active = sum(b._active_requests for b in running)
-        if total_active < self.SCALE_OUT_MIN_CONCURRENCY:
-            return   # not enough concurrent load to warrant a second GPU
-        if any(b._active_requests == 0 for b in running):
-            return   # at least one idle instance — no need to scale out
+        if len(running) > 1:
+            return   # already scaled out onto multiple slots
 
         slot:    GpuSlot     | None = None
         new_b:   GpuBackend  | None = None
@@ -1065,11 +1355,8 @@ class DynamicRouter:
             running = self._running_backends(model_name)
             if not running:
                 return
-            total_active = sum(b._active_requests for b in running)
-            if total_active < self.SCALE_OUT_MIN_CONCURRENCY:
-                return
-            if any(b._active_requests == 0 for b in running):
-                return
+            if len(running) > 1:
+                return   # another scale-out already completed
 
             running_slot_ids = {b.slot.slot_id for b in running}
             allowed = self._allowed_gpus(model_name)
@@ -1155,6 +1442,7 @@ class DynamicRouter:
             slot   = free[0]
             script, served, _ = self.model_configs[model_name]
             new_b  = GpuBackend(model_name, script, served, slot)
+            new_b.router = self
             slot.backend = new_b
             await new_b.start()
 
@@ -1202,6 +1490,62 @@ class DynamicRouter:
         self._scale_tasks.add(task)
         task.add_done_callback(self._scale_tasks.discard)
 
+    def start_saturation_monitor(self) -> None:
+        """Launch the background queue sampler that drives sustained scale-out."""
+        if self._sat_task is None or self._sat_task.done():
+            self._sat_task = asyncio.create_task(self._saturation_loop())
+
+    async def _saturation_loop(self) -> None:
+        """Sample each model's real vLLM queue every 10s.  When a model running
+        on a single slot keeps num_requests_waiting (summed) above SCALE_OUT_QUEUE
+        for at least SCALE_OUT_SUSTAIN seconds, trigger a scale-out.  Models that
+        are already on >1 slot, or have nothing running, are skipped — that's why
+        the per-request instantaneous trigger was removed: scale-out is decided
+        here, on sustained real load, never on a transient in-flight spike."""
+        try:
+            while True:
+                await asyncio.sleep(10)
+                now = time.monotonic()
+                for model_name in self.model_configs:
+                    running = self._running_backends(model_name)
+                    if len(running) != 1:
+                        # 0 running → nothing to scale; >1 → already scaled out.
+                        self._saturated_since.pop(model_name, None)
+                        continue
+                    try:
+                        depths = await asyncio.gather(
+                            *(b.queue_depth() for b in running)
+                        )
+                    except Exception:
+                        continue
+                    total_waiting = sum(depths)
+                    if total_waiting > SCALE_OUT_QUEUE:
+                        since = self._saturated_since.get(model_name)
+                        if since is None:
+                            self._saturated_since[model_name] = now
+                            self.log.info(
+                                f"{model_name}: queue={total_waiting} > "
+                                f"{SCALE_OUT_QUEUE} — sustain timer started "
+                                f"(need {SCALE_OUT_SUSTAIN}s)"
+                            )
+                        elif now - since >= SCALE_OUT_SUSTAIN:
+                            self.log.info(
+                                f"{model_name}: queue={total_waiting} sustained "
+                                f"{int(now - since)}s ≥ {SCALE_OUT_SUSTAIN}s — "
+                                f"scaling out"
+                            )
+                            self._trigger_scale_out(model_name)
+                            # Reset so we don't re-fire every 10s while the
+                            # replica is spawning (it'll be len>1 next tick).
+                            self._saturated_since.pop(model_name, None)
+                    else:
+                        if self._saturated_since.pop(model_name, None) is not None:
+                            self.log.info(
+                                f"{model_name}: queue drained — sustain timer reset"
+                            )
+        except asyncio.CancelledError:
+            pass
+
     # ── aiohttp request handler ────────────────────────────────────────────────
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
@@ -1216,6 +1560,36 @@ class DynamicRouter:
                     for name in self.model_configs
                 ],
             })
+
+        # ── Admin dashboard ─────────────────────────────────────────────────────
+        # Bare root and favicon are not OpenAI routes; send a browser to /admin
+        # instead of falling through to the "cannot determine model" error.
+        if request.method == "GET" and request.path in ("/", "/favicon.ico"):
+            return web.HTTPFound("/admin")
+        if request.method == "GET" and request.path in ("/admin", "/admin/"):
+            return web.Response(text=ADMIN_HTML, content_type="text/html")
+        if request.method == "GET" and request.path == "/admin/status":
+            return web.json_response(self.status())
+        if request.method == "POST" and request.path in (
+            "/admin/kill", "/admin/start", "/admin/switch"
+        ):
+            try:
+                data = await request.json()
+                slot_id = int(data["slot_id"])
+            except Exception as exc:
+                return web.json_response(
+                    {"error": f"bad request: {exc}"}, status=400)
+            action = request.path.rsplit("/", 1)[1]
+            if action == "kill":
+                self._track_admin(self.admin_kill(slot_id))
+            else:
+                model = data.get("model")
+                if not model:
+                    return web.json_response(
+                        {"error": "missing 'model'"}, status=400)
+                fn = self.admin_start if action == "start" else self.admin_switch
+                self._track_admin(fn(slot_id, model))
+            return web.json_response({"ok": True, "action": action, "slot_id": slot_id})
 
         body = await request.read()
         model_name = self._extract_model(body)
@@ -1299,7 +1673,8 @@ class DynamicRouter:
             backend = sticky_backend
         else:
             backend = self._pick(backends)
-            self._trigger_scale_out(model_name)
+            # Scale-out is decided by the background saturation monitor based on
+            # vLLM's sustained real queue — not triggered per request here.
         # Record affinity so subsequent turns of the same task pin here.
         task_id = _extract_task_id(parsed_body_for_sticky, request.headers)
         # Approximate prompt size (sum of message-content chars) so the pipeline
@@ -1420,6 +1795,7 @@ class DynamicRouter:
             )
             return
         b = GpuBackend(model_name, script, served_name, slot)
+        b.router = self
         await b.start()                # init session + idle watchdog
         b._adopted_pid = pid
         b._ready       = True
@@ -1445,9 +1821,12 @@ async def main() -> None:
     # warm across model_manager restarts (the systemd unit is KillMode=process).
     await router.adopt_existing_backends()
 
+    # Background queue sampler that drives sustained-load scale-out.
+    router.start_saturation_monitor()
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", LISTEN_PORT)
+    site = web.TCPSite(runner, LISTEN_HOST, LISTEN_PORT)
     await site.start()
     log.info(
         f"Listening on :{LISTEN_PORT} — "
