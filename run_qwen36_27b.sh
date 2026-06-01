@@ -12,12 +12,14 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
 
+GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.84}   # model_manager lowers this to fit free VRAM
+
 exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
   --api-key local-qwen36 \
   --served-model-name qwen3.6-27b \
-  --gpu-memory-utilization 0.84 \
+  --gpu-memory-utilization ${GPU_MEM_UTIL} \
   --max-model-len 65536 \
   --max-num-seqs 4 \
   --kv-cache-dtype fp8 \

@@ -156,6 +156,19 @@ def _gpu_free_mib(gpu_id: int) -> float | None:
         return None
 
 
+def _gpu_total_mib(gpu_id: int) -> float | None:
+    """Return total GPU memory in MiB for the given GPU, or None on error."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--id={gpu_id}",
+             "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return float(out.splitlines()[0]) if out else None
+    except Exception:
+        return None
+
+
 def _gpu_vllm_used_mib(gpu_id: int) -> float:
     """Return total GPU memory (MiB) used by all vLLM processes on the given GPU.
     Includes EngineCore subprocesses which hold most of the VRAM.  Returns 0 on
@@ -270,6 +283,41 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
     "qwen3.6-35b-a3b-heretic": 29.0,  # same util=0.93 as stock 35b
     "qwen3.6-27b":     27.5,  # 0.84 × 32 GiB ≈ 26.9 + 0.6 GiB buffer
 }
+
+# Per-model preferred (maximum) gpu_memory_utilization — mirrors the run scripts.
+# At spawn time model_manager reads the GPU's *current* free VRAM and lowers util
+# to whatever actually fits, so a model can still start on a GPU that another
+# process (e.g. the embedding-provider) is sharing.  util is only ever lowered,
+# never raised above these tuned defaults.  vLLM treats --gpu-memory-utilization
+# as a fraction of TOTAL memory and refuses to start when util×total exceeds the
+# memory free at launch — that's the failure this avoids.
+MODEL_GPU_MEM_UTIL: dict[str, float] = {
+    "qwen3.6-35b-a3b":         0.93,
+    "qwen3.6-35b-a3b-heretic": 0.93,
+    "qwen3.6-27b":             0.84,
+}
+# Margin (MiB) held back from current free VRAM when computing util — absorbs
+# nvidia-smi jitter and small growth by other GPU processes during vLLM startup.
+GPU_MEM_UTIL_BUFFER_MIB = float(os.environ.get("GPU_MEM_UTIL_BUFFER_MIB", "768"))
+
+# Per-model MINIMUM viable gpu_memory_utilization.  vLLM allocates: weights +
+# activations first, then *all remaining* budget (util×total − used) becomes the
+# KV cache.  Lowering util shrinks the KV cache, not the weights.  The 35B models
+# are hybrid Mamba+attention with a tiny KV cache even at 0.93 (~1.8 GiB); drop
+# util a little and KV allocation hits zero → vLLM dies ~40 s into startup with
+# "No available memory for the cache blocks".  So util can only be lowered within
+# a narrow safe band.  Below the floor we DON'T spawn: we raise immediately so the
+# failure is fast and legible (mirroring _check_gpu_free) instead of a slow OOM.
+#
+# Floors are empirical: 35B needs ≈0.90 (verified 0.875 fails with zero KV);
+# 27B is dense with a normal KV cache and tolerates more headroom (~0.78).
+MODEL_MIN_GPU_MEM_UTIL: dict[str, float] = {
+    "qwen3.6-35b-a3b":         0.90,
+    "qwen3.6-35b-a3b-heretic": 0.90,
+    "qwen3.6-27b":             0.78,
+}
+# Fallback floor for models not listed above (best-effort attempt, not fail-fast).
+GPU_MEM_UTIL_FLOOR = float(os.environ.get("GPU_MEM_UTIL_FLOOR", "0.78"))
 
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -672,6 +720,65 @@ class GpuBackend:
         except FileNotFoundError:
             pass  # nvidia-smi not installed — skip check
 
+    def _gpu_mem_util_for_spawn(self) -> float | None:
+        """Compute a gpu_memory_utilization that fits this GPU's *current* free VRAM.
+
+        Returns a value in [min_viable, default] to pass as VLLM_GPU_MEM_UTIL, or
+        None if VRAM can't be read (the script then uses its own baked-in default).
+
+        util is capped at the model's tuned default and only ever lowered to fit
+        the GPU's current free VRAM, so a model can still start on a GPU shared
+        with another process instead of OOM-ing on vLLM's "free memory < desired
+        utilization" startup check.
+
+        Crucially, util can only be lowered within a SAFE BAND.  vLLM gives all
+        budget left after weights+activations to the KV cache, so lowering util
+        shrinks the KV cache — and the hybrid Mamba+attention 35B models have a
+        tiny KV cache even at their default, so a small drop starves it to zero
+        and vLLM dies ~40 s in with "No available memory for the cache blocks".
+        If the fit would fall below the model's min-viable util we raise here so
+        the failure is fast and legible (mirroring _check_gpu_free) rather than a
+        slow KV-allocation OOM after the weights have already loaded.
+        """
+        default = MODEL_GPU_MEM_UTIL.get(self.model_name)
+        if default is None:
+            return None
+        total = _gpu_total_mib(self.gpu_id)
+        free  = _gpu_free_mib(self.gpu_id)
+        if not total or free is None:
+            self.log.info(
+                f"VRAM-aware util: could not read GPU {self.gpu_id} memory — "
+                f"using script default util ({default})"
+            )
+            return None
+
+        min_viable = MODEL_MIN_GPU_MEM_UTIL.get(self.model_name, GPU_MEM_UTIL_FLOOR)
+        fit  = (free - GPU_MEM_UTIL_BUFFER_MIB) / total
+        util = round(min(default, fit), 3)
+
+        # Fail fast below the safe band: spawning here would OOM ~40 s later at KV
+        # allocation.  Raise like _check_gpu_free so the slot is freed immediately
+        # and the caller can retry/scale-out once VRAM frees up.
+        if util < min_viable:
+            needed_mib = min_viable * total + GPU_MEM_UTIL_BUFFER_MIB
+            msg = (
+                f"GPU {self.gpu_id} only {free/1024:.1f} GiB free — too tight for "
+                f"{self.model_name}: fits util={util} but min-viable is {min_viable} "
+                f"(KV cache would be starved). Need ≥{needed_mib/1024:.1f} GiB free. "
+                f"Not spawning; will retry when VRAM frees up."
+            )
+            self.log.error(msg)
+            raise RuntimeError(msg)
+
+        if util < default:
+            self.log.info(
+                f"VRAM-aware util for {self.model_name}: GPU {self.gpu_id} "
+                f"free={free/1024:.1f} GiB / total={total/1024:.1f} GiB "
+                f"→ util={util} (default {default}, min-viable {min_viable}, "
+                f"buffer {GPU_MEM_UTIL_BUFFER_MIB/1024:.1f} GiB)"
+            )
+        return util
+
     async def _spawn_locked(self) -> None:
         """Spawn vLLM subprocess and wait for /health.  Caller must hold self._lock."""
         self._ready = False
@@ -698,6 +805,11 @@ class GpuBackend:
                 "VLLM_CUDA_DEVICE": str(self.gpu_id),
                 "VLLM_PORT":        str(self.vllm_port),
             }
+            # VRAM-aware gpu_memory_utilization: lower it to fit current free VRAM
+            # so a shared GPU can still host the model instead of OOM-ing.
+            util = self._gpu_mem_util_for_spawn()
+            if util is not None:
+                spawn_env["VLLM_GPU_MEM_UTIL"] = f"{util:.3f}"
             self.process = subprocess.Popen(
                 ["bash", self.script],
                 stdout=log_fd, stderr=log_fd,

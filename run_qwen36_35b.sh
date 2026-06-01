@@ -17,7 +17,7 @@ fi
 # available — same as the unshared GPU 1.  vLLM will refuse to start on GPU 0
 # when embedding is actively loaded (~2.7 GiB) and util=0.93 doesn't fit; mm's
 # scale-out cooldown handles the retry until embedding offloads.
-GPU_MEM_UTIL=0.93
+GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.93}   # model_manager lowers this to fit free VRAM
 MAX_MODEL_LEN=122880
 
 exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \

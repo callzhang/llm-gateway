@@ -20,7 +20,7 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
 
-GPU_MEM_UTIL=0.93
+GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.93}   # model_manager lowers this to fit free VRAM
 MAX_MODEL_LEN=122880
 
 # served-model-name kept distinct so you can A/B against the stock 35b.
