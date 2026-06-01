@@ -234,8 +234,9 @@ def _read_served_model_name(pid: int) -> str | None:
 # The startup script receives VLLM_CUDA_DEVICE and VLLM_PORT from model_manager
 # at spawn time.
 MODEL_CONFIGS: dict[str, tuple[str, str, "set[int] | None"]] = {
-    "qwen3.6-35b-a3b": ("run_qwen36_35b.sh", "qwen3.6-35b-a3b", None),
-    "qwen3.6-27b":     ("run_qwen36_27b.sh",  "qwen3.6-27b",    None),
+    "qwen3.6-35b-a3b":         ("run_qwen36_35b.sh",         "qwen3.6-35b-a3b",         None),
+    "qwen3.6-35b-a3b-heretic": ("run_qwen36_35b_heretic.sh", "qwen3.6-35b-a3b-heretic", None),
+    "qwen3.6-27b":             ("run_qwen36_27b.sh",         "qwen3.6-27b",             None),
 }
 
 # Minimum free GPU memory (GiB, from nvidia-smi) required to start a model.
@@ -249,6 +250,7 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
                                # GPU 0 shares with embedding-provider (~2.2 GiB),
                                # leaving only ~29.2 GiB free — actual vLLM usage
                                # is ~29.1 GiB so 29.0 threshold gives 0.2 GiB margin.
+    "qwen3.6-35b-a3b-heretic": 29.0,  # same util=0.93 as stock 35b
     "qwen3.6-27b":     27.5,  # 0.84 × 32 GiB ≈ 26.9 + 0.6 GiB buffer
 }
 
