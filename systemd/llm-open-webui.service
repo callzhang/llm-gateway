@@ -1,6 +1,7 @@
 [Unit]
-Description=LLM Gateway — Open WebUI chat interface (:3000)
-After=default.target
+Description=LLM Gateway — Open WebUI chat interface (127.0.0.1:8080)
+After=llm-litellm.service
+PartOf=llm-gateway.target
 
 [Service]
 Type=simple
@@ -15,4 +16,4 @@ StandardOutput=append:/home/derek/Projects/llm-gateway/logs/open_webui.log
 StandardError=append:/home/derek/Projects/llm-gateway/logs/open_webui.log
 
 [Install]
-WantedBy=default.target
+WantedBy=llm-gateway.target

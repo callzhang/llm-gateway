@@ -55,6 +55,77 @@ If you assign consecutive ports (e.g. 9000 and 9001), slot 1 will always fail wi
 
 Scale-out only fires when **total concurrent active requests ≥ 2**. A single background health-check from LiteLLM is not enough to trigger a second GPU spawn. This prevents runaway GPU usage for low-load scenarios.
 
+## Public-facing stack (Open WebUI + systemd target + tunnel)
+
+Beyond the model_manager/LiteLLM/vLLM core, the deployment on this host exposes a
+colleague-facing chat UI and groups every component under one systemd target.
+
+```
+https://llm.preseen.ai
+   │  (Cloudflare tunnel — see "Public tunnel" below; NOT part of this repo)
+   ▼
+Open WebUI      127.0.0.1:8080   chat UI, login required
+   ▼
+LiteLLM proxy   127.0.0.1:8900   OpenAI-compatible API
+   ▼
+model_manager   127.0.0.1:8002   dynamic GPU slots → vLLM
+```
+
+### One unit to manage them all — `llm-gateway.target`
+
+The stack is grouped under `systemd/llm-gateway.target`. Each service declares
+`PartOf=llm-gateway.target`, so start/stop/restart on the target propagates to
+all members, while each keeps its own `Restart=` supervision and log file.
+
+```bash
+systemctl --user start    llm-gateway.target   # bring up the whole stack
+systemctl --user stop     llm-gateway.target   # tear it all down
+systemctl --user restart  llm-gateway.target
+systemctl --user status   llm-gateway.target
+# components remain independently controllable, e.g.:
+systemctl --user restart  llm-litellm
+```
+
+Members: `llm-model-manager` · `llm-litellm` · `llm-open-webui`. Install/enable
+everything with `systemd/install.sh` (linger is enabled so the stack survives
+logout and starts at boot).
+
+### Loopback-only binding
+
+Both `run_litellm.sh` (`--host 127.0.0.1`, :8900) and `run_open_webui.sh`
+(`--host 127.0.0.1`, :8080) bind loopback only. There is **no** open port on the
+LAN; the sole external entrypoint is the Cloudflare tunnel, which reaches these
+services over `127.0.0.1` on this same host.
+
+### Open WebUI signup restriction
+
+Self-signup is restricted to company accounts. The allowlist is enforced by a
+**local patch** in the Open WebUI venv
+(`open_webui/routers/auths.py`) keyed off `SIGNUP_ALLOWED_EMAIL_DOMAINS`
+(default `stardust.ai`, set in `run_open_webui.sh`). The very first user
+(initial admin) is exempt; everyone else must use an allowed company domain.
+Self-signup users get `DEFAULT_USER_ROLE=user` — signup cannot create admins.
+
+> The patch lives in the gitignored venv and is lost on `pip install --upgrade
+> open-webui`; re-apply it after any Open WebUI upgrade.
+
+### Public tunnel — external root service, not in this repo
+
+`https://llm.preseen.ai` is served by a **single host-wide Cloudflare tunnel**
+that also fronts the other `preseen.ai` origins on this machine (embed, ocr,
+eval-tracking, the memory-connector backends). It runs as a **root system
+service** (`/etc/systemd/system/cloudflared.service`), with its source of truth
+in a separate local repo: **`~stardust/preseen-ai-gateway`**.
+
+This used to be a per-service `llm-cloudflared` *user* service inside
+`llm-gateway.target`; it was consolidated out. To manage the public tunnel:
+
+```bash
+sudo systemctl status cloudflared
+journalctl -u cloudflared -f
+# add/change a hostname: edit ingress.json in ~stardust/preseen-ai-gateway, then ./sync-ingress.sh
+```
+
 ## Requirements
 
 - Python 3.12+

@@ -1,6 +1,7 @@
 [Unit]
-Description=LLM Gateway — LiteLLM proxy (:8900)
-After=default.target
+Description=LLM Gateway — LiteLLM proxy (127.0.0.1:8900)
+After=llm-model-manager.service
+PartOf=llm-gateway.target
 
 [Service]
 Type=simple
@@ -15,4 +16,4 @@ StandardOutput=append:/home/derek/Projects/llm-gateway/logs/litellm.log
 StandardError=append:/home/derek/Projects/llm-gateway/logs/litellm.log
 
 [Install]
-WantedBy=default.target
+WantedBy=llm-gateway.target
