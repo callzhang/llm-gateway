@@ -21,7 +21,7 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
 fi
 
 GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.93}   # model_manager lowers this to fit free VRAM
-MAX_MODEL_LEN=122880
+MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-122880}   # model_manager lowers this on a tight GPU to fit KV
 
 # served-model-name kept distinct so you can A/B against the stock 35b.
 # To make this a drop-in replacement instead, rename to: qwen3.6-35b-a3b

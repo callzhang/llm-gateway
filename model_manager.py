@@ -319,6 +319,24 @@ MODEL_MIN_GPU_MEM_UTIL: dict[str, float] = {
 # Fallback floor for models not listed above (best-effort attempt, not fail-fast).
 GPU_MEM_UTIL_FLOOR = float(os.environ.get("GPU_MEM_UTIL_FLOOR", "0.78"))
 
+# Per-model default --max-model-len — mirrors the run scripts.  Needed so the
+# VRAM-aware max-len fallback knows the baseline before reducing it.  At the
+# min-viable util a tight GPU may not hold the KV cache for this full context;
+# vLLM then exits with "estimated maximum model length is N", and we retry the
+# spawn once with VLLM_MAX_MODEL_LEN ≈ N so the model comes up at shorter context
+# rather than failing.  (35B/heretic 122880, 27B 65536 — see the run scripts.)
+MODEL_MAX_MODEL_LEN: dict[str, int] = {
+    "qwen3.6-35b-a3b":         122880,
+    "qwen3.6-35b-a3b-heretic": 122880,
+    "qwen3.6-27b":             65536,
+}
+# Don't bother reducing below this — a context this short is rarely useful, so we
+# fail the spawn instead and let the model run elsewhere / retry when VRAM frees.
+MIN_USEFUL_MODEL_LEN = int(os.environ.get("MIN_USEFUL_MODEL_LEN", "16384"))
+# Safety haircut applied to vLLM's estimated-max-len before retrying, so we sit
+# comfortably under the limit (KV must hold ≥1 full sequence plus a little slack).
+MODEL_LEN_RETRY_FRACTION = float(os.environ.get("MODEL_LEN_RETRY_FRACTION", "0.92"))
+
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
@@ -493,6 +511,12 @@ class GpuBackend:
         # Set by DynamicRouter after construction; used for replica-aware idle
         # timeout (count sibling instances of the same model).
         self.router: "DynamicRouter | None" = None
+        # VRAM-aware max-model-len fallback: when a tight GPU can't hold the
+        # KV cache for the full default context, vLLM exits at startup and tells
+        # us the largest context that *does* fit.  We capture that here and retry
+        # the spawn once with the reduced length so the model still comes up
+        # (at shorter context) instead of failing outright.  None = use default.
+        self._max_model_len_override: int | None = None
 
     @property
     def is_running(self) -> bool:
@@ -756,16 +780,40 @@ class GpuBackend:
         fit  = (free - GPU_MEM_UTIL_BUFFER_MIB) / total
         util = round(min(default, fit), 3)
 
-        # Fail fast below the safe band: spawning here would OOM ~40 s later at KV
-        # allocation.  Raise like _check_gpu_free so the slot is freed immediately
-        # and the caller can retry/scale-out once VRAM frees up.
         if util < min_viable:
-            needed_mib = min_viable * total + GPU_MEM_UTIL_BUFFER_MIB
+            # The buffered fit dropped below the safe band.  Two cases:
+            #
+            #  (a) the floor itself STILL PHYSICALLY FITS in free VRAM — the only
+            #      thing pushing us under was the comfort buffer.  Per "try hard to
+            #      bring it up", clamp UP to the floor and spawn (best effort).  This
+            #      is the common shared-GPU case: GPU 0 hosts the embedding-provider
+            #      (~2-3 GiB), leaving ~29.3 GiB free → buffered fit 0.897 < 0.90,
+            #      but 0.90×total still fits with room to spare.
+            #
+            #  (b) even the floor doesn't fit (would OOM ~40 s in at KV allocation).
+            #      Raise like _check_gpu_free so the slot frees immediately and the
+            #      caller retries/scales out once VRAM frees up.
+            #
+            # HARD_MARGIN is the minimum slack we insist on between the floor's raw
+            # reservation and free VRAM, so a tiny nvidia-smi jitter doesn't OOM us.
+            HARD_MARGIN_MIB = 256.0
+            floor_needs_mib = min_viable * total
+            if free >= floor_needs_mib + HARD_MARGIN_MIB:
+                self.log.warning(
+                    f"VRAM-aware util for {self.model_name}: GPU {self.gpu_id} "
+                    f"free={free/1024:.1f} GiB / total={total/1024:.1f} GiB → buffered "
+                    f"fit {util} below min-viable {min_viable}, but floor still fits "
+                    f"({floor_needs_mib/1024:.1f} GiB + {HARD_MARGIN_MIB/1024:.1f} GiB "
+                    f"margin ≤ free) — clamping up to {min_viable} (tight, best effort)"
+                )
+                return min_viable
+            needed_mib = floor_needs_mib + HARD_MARGIN_MIB
             msg = (
                 f"GPU {self.gpu_id} only {free/1024:.1f} GiB free — too tight for "
-                f"{self.model_name}: fits util={util} but min-viable is {min_viable} "
-                f"(KV cache would be starved). Need ≥{needed_mib/1024:.1f} GiB free. "
-                f"Not spawning; will retry when VRAM frees up."
+                f"{self.model_name}: even min-viable util {min_viable} "
+                f"({floor_needs_mib/1024:.1f} GiB) won't fit (KV cache would be "
+                f"starved). Need ≥{needed_mib/1024:.1f} GiB free. Not spawning; "
+                f"will retry when VRAM frees up."
             )
             self.log.error(msg)
             raise RuntimeError(msg)
@@ -779,8 +827,38 @@ class GpuBackend:
             )
         return util
 
+    def _scan_kv_max_model_len(self) -> int | None:
+        """If the last spawn died because the KV cache couldn't hold the full
+        context, return vLLM's estimate of the largest context that *would* fit.
+
+        vLLM's _check_enough_kv_cache_memory raises a ValueError whose message
+        ends with "the estimated maximum model length is N." — we parse N from
+        the tail of the spawn log.  Returns None if that pattern isn't present
+        (i.e. the spawn failed for some other reason — don't second-guess it).
+        """
+        try:
+            with open(self.log_path, "rb") as f:
+                # Only the tail matters; the error is near the end of startup.
+                try:
+                    f.seek(-65536, os.SEEK_END)
+                except OSError:
+                    f.seek(0)
+                tail = f.read().decode("utf-8", errors="ignore")
+        except OSError:
+            return None
+        m = re.findall(r"estimated maximum model length is (\d+)", tail)
+        if not m:
+            return None
+        return int(m[-1])
+
     async def _spawn_locked(self) -> None:
-        """Spawn vLLM subprocess and wait for /health.  Caller must hold self._lock."""
+        """Spawn vLLM subprocess and wait for /health.  Caller must hold self._lock.
+
+        On a tight GPU the model may load but fail because the KV cache can't hold
+        the full default context.  We retry the spawn once with a reduced
+        --max-model-len (VLLM_MAX_MODEL_LEN) taken from vLLM's own estimate, so the
+        model comes up at shorter context instead of failing outright.
+        """
         self._ready = False
         # ── Revival guard ──────────────────────────────────────────────────────
         # This backend object can be revived after an idle-unload that raced with
@@ -794,6 +872,57 @@ class GpuBackend:
         if self.slot.backend is None:
             self.slot.backend = self
         self._check_gpu_free()
+        # Re-evaluate context length from scratch each wake: GPU free VRAM
+        # fluctuates (the embedding-provider idle-offloads), so a backend revived
+        # when its GPU has room should try the full default context again rather
+        # than stay capped at a reduction computed during an earlier tight spawn.
+        self._max_model_len_override = None
+        # VRAM-aware gpu_memory_utilization computed once up front (raises if even
+        # the min-viable util doesn't fit, so the slot frees immediately).
+        util = self._gpu_mem_util_for_spawn()
+
+        # At most 2 attempts: the initial spawn, plus one retry with a reduced
+        # max-model-len if the KV cache couldn't hold the full context.
+        for attempt in range(2):
+            if await self._spawn_attempt_locked(util):
+                return
+            # _spawn_attempt_locked returned False ⇒ process exited.  See whether
+            # it was the KV-can't-hold-full-context case and we can shrink to fit.
+            if attempt == 0 and self._max_model_len_override is None:
+                est = self._scan_kv_max_model_len()
+                if est is not None:
+                    default_len = MODEL_MAX_MODEL_LEN.get(self.model_name)
+                    reduced = int(est * MODEL_LEN_RETRY_FRACTION)
+                    # Round down to a multiple of 256 for tidy block alignment.
+                    reduced -= reduced % 256
+                    if reduced >= MIN_USEFUL_MODEL_LEN and (
+                        default_len is None or reduced < default_len
+                    ):
+                        self._max_model_len_override = reduced
+                        self.log.warning(
+                            f"KV cache too small for full context on GPU "
+                            f"{self.gpu_id}; vLLM estimates max len {est}. Retrying "
+                            f"with --max-model-len {reduced} "
+                            f"(default {default_len}) — reduced context, best effort."
+                        )
+                        # Let the SIGKILL'd process group fully release its CUDA
+                        # memory before respawning, so the retry sees the freed VRAM.
+                        await asyncio.sleep(3)
+                        continue
+                    self.log.error(
+                        f"KV cache too small and reduced len {reduced} < "
+                        f"{MIN_USEFUL_MODEL_LEN} (or ≥ default) — not retrying."
+                    )
+            raise RuntimeError(
+                f"vLLM for '{self.model_name}' exited during startup on slot "
+                f"{self.slot.slot_id}. See {self.log_path}."
+            )
+
+    async def _spawn_attempt_locked(self, util: float | None) -> bool:
+        """One spawn + health-wait cycle.  Returns True if vLLM became healthy,
+        False if the process exited (caller decides whether to retry).  Raises on
+        watchdog-clear or startup timeout.  Caller must hold self._lock."""
+        self._ready = False
         log_fd = open(self.log_path, "ab")
         try:
             self.log.info(
@@ -807,9 +936,12 @@ class GpuBackend:
             }
             # VRAM-aware gpu_memory_utilization: lower it to fit current free VRAM
             # so a shared GPU can still host the model instead of OOM-ing.
-            util = self._gpu_mem_util_for_spawn()
             if util is not None:
                 spawn_env["VLLM_GPU_MEM_UTIL"] = f"{util:.3f}"
+            # VRAM-aware max-model-len: set on a retry when the full context's KV
+            # cache didn't fit (the run scripts read VLLM_MAX_MODEL_LEN).
+            if self._max_model_len_override is not None:
+                spawn_env["VLLM_MAX_MODEL_LEN"] = str(self._max_model_len_override)
             self.process = subprocess.Popen(
                 ["bash", self.script],
                 stdout=log_fd, stderr=log_fd,
@@ -852,10 +984,11 @@ class GpuBackend:
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
                 self.process = None
-                raise RuntimeError(
-                    f"vLLM for '{self.model_name}' exited (rc={rc}) on slot {self.slot.slot_id}. "
-                    f"See {self.log_path}."
+                self.log.warning(
+                    f"vLLM for '{self.model_name}' exited (rc={rc}) on slot "
+                    f"{self.slot.slot_id}. See {self.log_path}."
                 )
+                return False
             try:
                 async with self._session.get(
                     f"{self.vllm_base}/health",
@@ -868,7 +1001,7 @@ class GpuBackend:
                             f"(slot {self.slot.slot_id} GPU={self.gpu_id})"
                         )
                         self._ready = True
-                        return
+                        return True
                     else:
                         self.log.warning(
                             f"health poll: HTTP {r.status} after "

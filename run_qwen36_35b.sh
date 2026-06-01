@@ -18,7 +18,7 @@ fi
 # when embedding is actively loaded (~2.7 GiB) and util=0.93 doesn't fit; mm's
 # scale-out cooldown handles the retry until embedding offloads.
 GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.93}   # model_manager lowers this to fit free VRAM
-MAX_MODEL_LEN=122880
+MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-122880}   # model_manager lowers this on a tight GPU to fit KV
 
 exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
   --host 127.0.0.1 \

@@ -13,6 +13,7 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
 fi
 
 GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.84}   # model_manager lowers this to fit free VRAM
+MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-65536}   # model_manager lowers this on a tight GPU to fit KV
 
 exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
   --host 127.0.0.1 \
@@ -20,7 +21,7 @@ exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve sakamakismile/Qwen3.
   --api-key local-qwen36 \
   --served-model-name qwen3.6-27b \
   --gpu-memory-utilization ${GPU_MEM_UTIL} \
-  --max-model-len 65536 \
+  --max-model-len ${MAX_MODEL_LEN} \
   --max-num-seqs 4 \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
