@@ -1385,7 +1385,7 @@ class DynamicRouter:
     # Seconds to wait before re-attempting scale-out after a failure.
     # Prevents a crash-loop when a slot cannot physically start a model
     # (e.g. not enough free VRAM because another process is on that GPU).
-    SCALE_OUT_COOLDOWN = 120  # 2 minutes — short enough to recover after transient OOM
+    SCALE_OUT_COOLDOWN = 600  # 10 minutes — back off longer after a failed scale-out
 
     def __init__(self, slots: list[GpuSlot], model_configs: dict[str, tuple[str, str, "set[int] | None"]]):
         self.slots         = slots
