@@ -1406,6 +1406,9 @@ class DynamicRouter:
         # SCALE_OUT_QUEUE; scale-out fires once it stays crossed for SUSTAIN secs.
         self._saturated_since: dict[str, float] = {}
         self._sat_task: asyncio.Task | None = None
+        # Dedup for scale-out decline logging: (reason, monotonic) per model, so a
+        # persistent blocker (e.g. GPU busy) logs once per window, not every cycle.
+        self._scale_decline_log: dict[str, tuple[str, float]] = {}
 
     # ── Slot / backend helpers ─────────────────────────────────────────────────
 
@@ -1627,6 +1630,19 @@ class DynamicRouter:
 
     # ── Scale-out ──────────────────────────────────────────────────────────────
 
+    def _log_scale_decline(self, model_name: str, reason: str) -> None:
+        """Log why a scale-out attempt declined, at most once per 300s per
+        (model, reason).  The saturation loop re-attempts every ~SUSTAIN seconds
+        while a model stays saturated; without dedup a persistent blocker (GPU
+        busy, insufficient VRAM) would spam an identical line every cycle and
+        make it look like scale-out is firing when it's actually stuck."""
+        prev = self._scale_decline_log.get(model_name)
+        now = time.monotonic()
+        if prev is not None and prev[0] == reason and now - prev[1] < 300:
+            return
+        self._scale_decline_log[model_name] = (reason, now)
+        self.log.info(f"Scale-out for {model_name} declined: {reason}")
+
     async def _maybe_scale_out(self, model_name: str) -> None:
         """If all instances are saturated and a slot is available, spawn another.
 
@@ -1640,7 +1656,12 @@ class DynamicRouter:
         # Respect cooldown after a previous failure (prevents crash-loop when a
         # slot cannot physically start the model, e.g. insufficient free VRAM).
         last_fail = self._scale_fail_time.get(model_name, 0)
-        if time.monotonic() - last_fail < self.SCALE_OUT_COOLDOWN:
+        cooldown_left = self.SCALE_OUT_COOLDOWN - (time.monotonic() - last_fail)
+        if cooldown_left > 0:
+            self._log_scale_decline(
+                model_name,
+                f"in cooldown after a prior failed spawn ({int(cooldown_left)}s left)",
+            )
             return
 
         running = self._running_backends(model_name)
@@ -1682,9 +1703,10 @@ class DynamicRouter:
                     return (free_mib + vllm_used) / 1024.0 >= min_free_gib
                 viable = [s for s in free if _slot_has_room(s)]
                 if not viable:
-                    self.log.info(
-                        f"Scale-out for {model_name}: all free slots lack sufficient "
-                        f"GPU memory (need {min_free_gib:.1f} GiB)"
+                    self._log_scale_decline(
+                        model_name,
+                        f"free slot(s) lack VRAM (need {min_free_gib:.1f} GiB; "
+                        f"another process likely holds the GPU)",
                     )
                     return
                 free = viable
@@ -1703,6 +1725,10 @@ class DynamicRouter:
                     and (allowed is None or s.gpu_id in allowed)
                 ]
                 if not evictable:
+                    self._log_scale_decline(
+                        model_name,
+                        "no free slot and no idle foreign model to evict",
+                    )
                     return
 
                 # Pre-eviction memory check: estimate free GPU memory after
@@ -1732,6 +1758,12 @@ class DynamicRouter:
                     evictable = valid_targets
 
                 if not evictable:
+                    self._log_scale_decline(
+                        model_name,
+                        f"idle model(s) found to evict, but GPU would still lack "
+                        f"{min_free_gib:.1f} GiB after eviction (another process on "
+                        f"the GPU)",
+                    )
                     return
 
                 victim_slot = evictable[0]
@@ -1766,8 +1798,9 @@ class DynamicRouter:
             await new_b._ensure_running()
             active_slots = [s.slot_id for s in self.slots if s.current_model == model_name]
             self.log.info(f"Scale-out complete: {model_name} now on slots {active_slots}")
-            # Clear cooldown on success so future scale-outs can proceed promptly.
+            # Clear cooldown + decline-dedup on success so future cycles log fresh.
             self._scale_fail_time.pop(model_name, None)
+            self._scale_decline_log.pop(model_name, None)
         except Exception as exc:
             self.log.warning(
                 f"Scale-out failed for {model_name} on slot {slot.slot_id}: {exc} "
@@ -1834,7 +1867,7 @@ class DynamicRouter:
                             self.log.info(
                                 f"{model_name}: queue={total_waiting} sustained "
                                 f"{int(now - since)}s ≥ {SCALE_OUT_SUSTAIN}s — "
-                                f"scaling out"
+                                f"attempting scale-out"
                             )
                             self._trigger_scale_out(model_name)
                             # Reset so we don't re-fire every 10s while the
