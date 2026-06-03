@@ -8,7 +8,12 @@ Type=simple
 WorkingDirectory=/home/derek/Projects/llm-gateway
 EnvironmentFile=-/home/derek/Projects/llm-gateway/gateway.env
 ExecStart=/home/derek/Projects/llm-gateway/run_model_manager.sh
-KillMode=control-group
+# process (not control-group): on stop/restart, signal ONLY model_manager, not
+# its vLLM children.  model_manager's SIGTERM handler leaves the vLLM backends
+# running and re-adopts them on next start (adopt_existing_backends), so a
+# restart doesn't force a ~90s cold start.  Trade-off: `systemctl stop` leaves
+# vLLM running until the next start adopts it (or you kill it manually).
+KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=120
 Restart=on-failure
