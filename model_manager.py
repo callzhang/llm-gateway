@@ -64,6 +64,18 @@ SCALE_OUT_SUSTAIN    = int(os.environ.get("SCALE_OUT_SUSTAIN", "120"))
 # a borrowed slot is returned to its evicted model promptly (asymmetric scale-in).
 REPLICA_IDLE_TIMEOUT = int(os.environ.get("REPLICA_IDLE_TIMEOUT", "120"))
 
+# ── Self-heal: recycle a ready-but-degraded backend on repeated upstream 5xx ──────
+# A backend can be process-alive yet broken — CUDA error, wedged scheduler, or an
+# EngineCore that crashed but left the API server returning 500s.  The idle/crash
+# watchdog only checks process liveness, so it won't catch this.  When a *ready*
+# backend returns RECYCLE_5XX_THRESHOLD consecutive upstream 5xx, kill it and free
+# the slot so the next request spawns a fresh instance.  EngineCore crashes recycle
+# on the first hit (known fatal).  RECYCLE_COOLDOWN (slot-level, survives respawn)
+# rate-limits recycle→respawn so a request-driven 500 loop can't thrash the GPU
+# (each respawn costs a ~90s cold start).
+RECYCLE_5XX_THRESHOLD = int(os.environ.get("RECYCLE_5XX_THRESHOLD", "3"))
+RECYCLE_COOLDOWN      = int(os.environ.get("RECYCLE_COOLDOWN", "180"))
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR    = os.path.join(SCRIPT_DIR, "logs")
 
@@ -461,6 +473,10 @@ class GpuSlot:
         # Set when a backend claims this slot (even before vLLM is started).
         # None means the slot is free.
         self.backend: "GpuBackend | None" = None
+        # monotonic timestamp of the last self-heal recycle on this slot.
+        # Lives on the slot (not the backend) so it survives the respawn and
+        # rate-limits recycle→respawn thrash across backend generations.
+        self.last_recycle: float = 0.0
 
     @property
     def is_free(self) -> bool:
@@ -517,6 +533,9 @@ class GpuBackend:
         # the spawn once with the reduced length so the model still comes up
         # (at shorter context) instead of failing outright.  None = use default.
         self._max_model_len_override: int | None = None
+        # Consecutive upstream 5xx seen while proxying to this backend; reset on
+        # any non-5xx response.  Drives self-heal recycle (see _forward).
+        self._consecutive_5xx = 0
 
     @property
     def is_running(self) -> bool:
@@ -1124,6 +1143,32 @@ class GpuBackend:
         except Exception as exc:
             self.log.warning(f"GPU zombie cleanup failed: {exc}")
 
+    def _trip_dead(self, reason: str) -> None:
+        """Mark this backend dead, detach its slot, and SIGKILL the process group
+        so the GPU frees and the next request spawns a fresh instance.  Used by
+        the self-heal path (repeated upstream 5xx) and EngineCore crash detection.
+        Records the recycle time on the SLOT so RECYCLE_COOLDOWN survives respawn."""
+        self.log.error(
+            f"Recycling backend on slot {self.slot.slot_id} (GPU={self.gpu_id}): {reason}"
+        )
+        self._ready  = False
+        self._failed = True
+        self.slot.last_recycle = time.monotonic()
+        if self.slot.backend is self:
+            self.slot.backend = None
+        # SIGKILL the whole group — EngineCore ignores SIGTERM and would otherwise
+        # linger holding ~29 GiB of GPU memory.
+        pid = self.process.pid if self.process is not None else self._adopted_pid
+        if pid is not None:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        self.process = None
+        self._adopted_pid = None
+        # Belt-and-suspenders: reap any orphan vLLM procs still on this GPU.
+        asyncio.create_task(self._kill_gpu_zombies())
+
     async def _forward(self, request: web.Request, body: bytes) -> web.StreamResponse:
         target_url  = f"{self.vllm_base}{request.path_qs}"
         fwd_headers = {
@@ -1144,28 +1189,40 @@ class GpuBackend:
                 method=request.method, url=target_url,
                 headers=fwd_headers, data=body,
             ) as upstream:
-                # ── EngineCore crash detection ──────────────────────────────
-                # vLLM returns HTTP 500 with "EngineCore encountered an issue"
-                # when its EngineCore subprocess crashes during inference.
-                # The EngineCore process often survives the API server exit and
-                # holds GPU memory indefinitely.  Detect this early, mark the
-                # backend dead, and kill any lingering GPU processes.
-                if upstream.status == 500:
+                # ── Self-heal: recycle a ready-but-degraded backend on 5xx ───
+                # A 5xx from a *ready* vLLM means the instance is broken, not the
+                # request: EngineCore crash ("EngineCore encountered an issue"),
+                # CUDA error, or a wedged scheduler.  EngineCore subprocesses often
+                # survive the API-server exit and hold ~29 GiB of GPU memory, so we
+                # must kill the group, not just drop the handle.
+                #   • EngineCore crash → recycle on the first hit (known fatal).
+                #   • Other 5xx        → recycle after RECYCLE_5XX_THRESHOLD in a
+                #     row, gated by a slot-level cooldown so a request-driven 500
+                #     loop can't thrash the GPU (each respawn ≈ 90s cold start).
+                if upstream.status >= 500:
                     err_body = await upstream.read()
-                    if b"EngineCore" in err_body:
-                        self.log.error(
-                            f"vLLM EngineCore crash detected on slot {self.slot.slot_id} "
-                            f"(GPU={self.gpu_id}) — marking backend dead"
+                    is_enginecore = b"EngineCore" in err_body
+                    self._consecutive_5xx += 1
+                    cooling = (time.monotonic() - self.slot.last_recycle) < RECYCLE_COOLDOWN
+                    if is_enginecore:
+                        self._trip_dead("vLLM EngineCore crash during inference")
+                    elif self._consecutive_5xx >= RECYCLE_5XX_THRESHOLD and not cooling:
+                        self._trip_dead(
+                            f"{self._consecutive_5xx} consecutive upstream "
+                            f"{upstream.status} responses"
                         )
-                        self._ready = False
-                        self._failed = True
-                        if self.slot.backend is self:
-                            self.slot.backend = None
-                        asyncio.create_task(self._kill_gpu_zombies())
+                    elif self._consecutive_5xx >= RECYCLE_5XX_THRESHOLD:
+                        self.log.warning(
+                            f"slot {self.slot.slot_id}: {self._consecutive_5xx} "
+                            f"consecutive {upstream.status} but within "
+                            f"{RECYCLE_COOLDOWN}s recycle cooldown — not respawning"
+                        )
                     return web.Response(
-                        status=500, content_type="application/json",
+                        status=upstream.status, content_type="application/json",
                         body=err_body,
                     )
+                # Healthy response — clear the consecutive-5xx streak.
+                self._consecutive_5xx = 0
                 # ── Normal streaming path ───────────────────────────────────
                 resp_headers = {
                     k: v for k, v in upstream.headers.items()
