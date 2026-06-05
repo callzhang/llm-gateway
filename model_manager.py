@@ -51,15 +51,41 @@ LISTEN_PORT  = int(os.environ.get("LISTEN_PORT", "8002"))
 # default-deny; 0.0.0.0 still covers 127.0.0.1 so internal loopback is intact).
 LISTEN_HOST  = os.environ.get("LISTEN_HOST", "0.0.0.0")
 
-# ── Scale-out gating (sustained real-queue trigger) ──────────────────────────────
-# Scale a model onto a 2nd GPU only when vLLM's *real* internal queue
-# (num_requests_waiting, summed across the model's running instances) stays above
-# SCALE_OUT_QUEUE for at least SCALE_OUT_SUSTAIN seconds.  In-flight count is a
-# poor signal — continuous batching keeps many concurrent requests fast — so we
-# trigger on what vLLM actually can't fit in its current batch.  The sustain
-# timer avoids thrash-evicting another model on a brief concurrency spike.
-SCALE_OUT_QUEUE      = int(os.environ.get("SCALE_OUT_QUEUE", "4"))
-SCALE_OUT_SUSTAIN    = int(os.environ.get("SCALE_OUT_SUSTAIN", "120"))
+# ── Scale-out gating (weighted backlog accumulator) ──────────────────────────────
+# Scale a model onto a 2nd GPU based on its *real* internal queue
+# (num_requests_waiting, summed across instances).  waiting > 0 already means vLLM
+# can't admit the request into the current batch (max_num_seqs reached or KV full)
+# — the instance is AT CAPACITY — so the depth of the backlog sets the urgency.
+#
+# SCALE_OUT_TIERS maps a sustained waiting depth → seconds-at-that-depth to fire.
+# A per-model progress P accumulates `dt / sustain(waiting)` each sample and fires
+# at P ≥ 1.0.  Deeper backlog accrues faster, and time at a shallower depth counts
+# proportionally toward a deeper threshold (e.g. waiting=2 accrues 1/300 per sec =
+# 0.66× the 1/200 of waiting=3).  Edges:
+#   • waiting == 0  → queue cleared, reset P to 0.
+#   • waiting == 1  → below the lowest tier; HOLD P (no accrual, no reset).
+#   • waiting >= 2  → accrue at the matching tier's rate.
+# P is in-memory only (not persisted) — a model_manager restart resets it.
+# Format: "depth:seconds,..."  (default: 4→100s, 3→200s, 2→300s).
+def _parse_scale_tiers(spec: str) -> "list[tuple[int, float]]":
+    tiers = []
+    for part in spec.split(","):
+        depth, secs = part.split(":")
+        tiers.append((int(depth), float(secs)))
+    return sorted(tiers, key=lambda t: -t[0])   # deepest first
+
+SCALE_OUT_TIERS = _parse_scale_tiers(
+    os.environ.get("SCALE_OUT_TIERS", "4:100,3:200,2:300")
+)
+SCALE_OUT_MIN_DEPTH = SCALE_OUT_TIERS[-1][0]   # lowest tier depth (default 2)
+
+def _scale_sustain_for(waiting: int) -> "float | None":
+    """Seconds-at-this-depth needed to fire, for the deepest tier ≤ waiting.
+    None if waiting is below the lowest tier (no accrual)."""
+    for depth, secs in SCALE_OUT_TIERS:        # descending
+        if waiting >= depth:
+            return secs
+    return None
 # Extra replicas (a model running on >1 slot) idle out faster than the primary so
 # a borrowed slot is returned to its evicted model promptly (asymmetric scale-in).
 REPLICA_IDLE_TIMEOUT = int(os.environ.get("REPLICA_IDLE_TIMEOUT", "120"))
@@ -1378,9 +1404,9 @@ class DynamicRouter:
     """Routes requests to GPU backends with dynamic slot assignment and scale-out."""
 
     # Scale-out is driven by the background saturation monitor
-    # (_saturation_loop), which fires when vLLM's real queue (num_requests_waiting)
-    # stays above SCALE_OUT_QUEUE for SCALE_OUT_SUSTAIN seconds — see the module
-    # constants.  There is no instantaneous in-flight-count trigger any more.
+    # (_saturation_loop), which fires on a weighted backlog accumulator over
+    # vLLM's real queue (num_requests_waiting) per SCALE_OUT_TIERS — see the
+    # module constants.  There is no instantaneous in-flight-count trigger.
 
     # Seconds to wait before re-attempting scale-out after a failure.
     # Prevents a crash-loop when a slot cannot physically start a model
@@ -1402,9 +1428,12 @@ class DynamicRouter:
         # Background admin tasks (start/kill/switch), kept referenced so the
         # event loop doesn't GC them mid-flight.
         self._admin_tasks: set[asyncio.Task] = set()
-        # Per-model monotonic timestamp when the real vLLM queue first crossed
-        # SCALE_OUT_QUEUE; scale-out fires once it stays crossed for SUSTAIN secs.
-        self._saturated_since: dict[str, float] = {}
+        # Per-model scale-out progress P (0..1): accumulates dt/sustain(waiting)
+        # each sample; fires at P≥1 (see _saturation_loop / SCALE_OUT_TIERS).
+        # In-memory only — a restart resets it.
+        self._scale_progress: dict[str, float] = {}
+        # Monotonic time of the previous saturation sample, for the accrual dt.
+        self._sat_last_tick: float = 0.0
         self._sat_task: asyncio.Task | None = None
         # Dedup for scale-out decline logging: (reason, monotonic) per model, so a
         # persistent blocker (e.g. GPU busy) logs once per window, not every cycle.
@@ -1831,21 +1860,34 @@ class DynamicRouter:
             self._sat_task = asyncio.create_task(self._saturation_loop())
 
     async def _saturation_loop(self) -> None:
-        """Sample each model's real vLLM queue every 10s.  When a model running
-        on a single slot keeps num_requests_waiting (summed) above SCALE_OUT_QUEUE
-        for at least SCALE_OUT_SUSTAIN seconds, trigger a scale-out.  Models that
-        are already on >1 slot, or have nothing running, are skipped — that's why
-        the per-request instantaneous trigger was removed: scale-out is decided
-        here, on sustained real load, never on a transient in-flight spike."""
+        """Sample each single-slot model's real vLLM queue (num_requests_waiting,
+        summed) every 10s and drive a weighted backlog accumulator P per model:
+
+            waiting >= 2 → P += dt / sustain(waiting)   # deeper = faster
+            waiting == 1 → hold P                        # below lowest tier
+            waiting == 0 → P = 0                          # queue cleared
+            P >= 1.0     → attempt scale-out, reset P
+
+        Time at a shallow depth counts proportionally toward a deeper threshold
+        (waiting=2's 1/300-per-sec is 0.66× waiting=3's 1/200).  Models already on
+        >1 slot, or with nothing running, are skipped.  Decided here on sustained
+        real backlog, never on a transient in-flight spike."""
+        SAMPLE = 10
         try:
             while True:
-                await asyncio.sleep(10)
+                await asyncio.sleep(SAMPLE)
                 now = time.monotonic()
+                # Real elapsed since last sample (cap against loop stalls so a
+                # hiccup can't over-credit a model toward scale-out).
+                dt = (now - self._sat_last_tick) if self._sat_last_tick else 0.0
+                dt = min(dt, SAMPLE * 3)
+                self._sat_last_tick = now
+
                 for model_name in self.model_configs:
                     running = self._running_backends(model_name)
                     if len(running) != 1:
                         # 0 running → nothing to scale; >1 → already scaled out.
-                        self._saturated_since.pop(model_name, None)
+                        self._scale_progress.pop(model_name, None)
                         continue
                     try:
                         depths = await asyncio.gather(
@@ -1853,31 +1895,36 @@ class DynamicRouter:
                         )
                     except Exception:
                         continue
-                    total_waiting = sum(depths)
-                    if total_waiting > SCALE_OUT_QUEUE:
-                        since = self._saturated_since.get(model_name)
-                        if since is None:
-                            self._saturated_since[model_name] = now
+                    waiting = sum(depths)
+
+                    if waiting == 0:
+                        if self._scale_progress.pop(model_name, None):
                             self.log.info(
-                                f"{model_name}: queue={total_waiting} > "
-                                f"{SCALE_OUT_QUEUE} — sustain timer started "
-                                f"(need {SCALE_OUT_SUSTAIN}s)"
+                                f"{model_name}: queue cleared — scale-out timer reset"
                             )
-                        elif now - since >= SCALE_OUT_SUSTAIN:
-                            self.log.info(
-                                f"{model_name}: queue={total_waiting} sustained "
-                                f"{int(now - since)}s ≥ {SCALE_OUT_SUSTAIN}s — "
-                                f"attempting scale-out"
-                            )
-                            self._trigger_scale_out(model_name)
-                            # Reset so we don't re-fire every 10s while the
-                            # replica is spawning (it'll be len>1 next tick).
-                            self._saturated_since.pop(model_name, None)
+                        continue
+                    if waiting == 1:
+                        continue   # below lowest tier — hold P, no accrual/reset
+
+                    sustain = _scale_sustain_for(waiting)
+                    if sustain is None:        # waiting in (1, min_depth) — shouldn't
+                        continue                # happen with default tiers, but guard
+                    prev = self._scale_progress.get(model_name, 0.0)
+                    P = prev + (dt / sustain if dt > 0 else 0.0)
+                    if prev == 0.0 and P > 0.0:
+                        self.log.info(
+                            f"{model_name}: waiting={waiting} backlog — scale-out "
+                            f"timer started (tier {int(sustain)}s, weighted)"
+                        )
+                    if P >= 1.0:
+                        self.log.info(
+                            f"{model_name}: waiting={waiting} backlog sustained "
+                            f"(weighted P≥1.0) — attempting scale-out"
+                        )
+                        self._trigger_scale_out(model_name)
+                        self._scale_progress.pop(model_name, None)   # reset
                     else:
-                        if self._saturated_since.pop(model_name, None) is not None:
-                            self.log.info(
-                                f"{model_name}: queue drained — sustain timer reset"
-                            )
+                        self._scale_progress[model_name] = P
         except asyncio.CancelledError:
             pass
 
