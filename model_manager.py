@@ -362,10 +362,10 @@ GPU_MEM_UTIL_FLOOR = float(os.environ.get("GPU_MEM_UTIL_FLOOR", "0.78"))
 # min-viable util a tight GPU may not hold the KV cache for this full context;
 # vLLM then exits with "estimated maximum model length is N", and we retry the
 # spawn once with VLLM_MAX_MODEL_LEN ≈ N so the model comes up at shorter context
-# rather than failing.  (35B/heretic 122880, 27B 65536 — see the run scripts.)
+# rather than failing.  (35B/heretic 32768, 27B 65536 — see the run scripts.)
 MODEL_MAX_MODEL_LEN: dict[str, int] = {
-    "qwen3.6-35b-a3b":         122880,
-    "qwen3.6-35b-a3b-heretic": 122880,
+    "qwen3.6-35b-a3b":         32768,
+    "qwen3.6-35b-a3b-heretic": 32768,
     "qwen3.6-27b":             65536,
 }
 # Don't bother reducing below this — a context this short is rarely useful, so we
@@ -978,6 +978,13 @@ class GpuBackend:
                 **os.environ,
                 "VLLM_CUDA_DEVICE": str(self.gpu_id),
                 "VLLM_PORT":        str(self.vllm_port),
+                # Cap ninja parallelism for FlashInfer's JIT.  Unset it runs
+                # `ninja -j $(nproc)` = 32 nvcc/cicc peaking near 50 GiB RSS,
+                # which starves sshd/tailscaled/cloudflared and takes the box to
+                # load 500+.  gateway.env normally sets this, but that file is
+                # gitignored — defaulting here keeps the guard in tracked code so
+                # a fresh deploy can't silently lose it.
+                "MAX_JOBS": os.environ.get("MAX_JOBS", "4"),
             }
             # VRAM-aware gpu_memory_utilization: lower it to fit current free VRAM
             # so a shared GPU can still host the model instead of OOM-ing.
@@ -987,8 +994,14 @@ class GpuBackend:
             # cache didn't fit (the run scripts read VLLM_MAX_MODEL_LEN).
             if self._max_model_len_override is not None:
                 spawn_env["VLLM_MAX_MODEL_LEN"] = str(self._max_model_len_override)
+            # nice/ionice so a spawn can never starve sshd/tailscaled/cloudflared.
+            # The children inherit both, which is the point: on a cold JIT cache
+            # FlashInfer compiles CUTLASS through a swarm of nvcc/cicc (see
+            # MAX_JOBS in gateway.env), and unthrottled that swarm took the box to
+            # load 500+ and dropped the Cloudflare tunnel.  Costs vLLM a little
+            # CPU priority once warm, which is the trade we want under contention.
             self.process = subprocess.Popen(
-                ["bash", self.script],
+                ["nice", "-n", "10", "ionice", "-c2", "-n7", "bash", self.script],
                 stdout=log_fd, stderr=log_fd,
                 env=spawn_env,
                 start_new_session=True,
@@ -1100,8 +1113,9 @@ class GpuBackend:
         # EngineCore ignores SIGTERM and may outlive the APIServer (which dies
         # quickly, causing the poll above to exit early via ProcessLookupError).
         # Always sweep the GPU for orphan processes so the next spawn isn't
-        # blocked by a zombie holding VRAM.
-        await self._kill_gpu_zombies()
+        # blocked by a zombie holding VRAM.  Scoped to our own process group so
+        # we never touch another service sharing this GPU.
+        await self._kill_gpu_zombies(pid)
         self.log.info("vLLM unloaded")
         self.process = None
         self._adopted_pid = None
@@ -1140,8 +1154,37 @@ class GpuBackend:
             self._active_requests -= 1
             self.last_activity = time.monotonic()
 
-    async def _kill_gpu_zombies(self) -> None:
-        """Kill any CUDA processes still holding GPU memory after a crash."""
+    @staticmethod
+    def _pgid_of(pid: int) -> int | None:
+        """Process group of pid, or None if it is gone / unreadable.
+
+        Field 5 of /proc/<pid>/stat.  Field 2 (comm) is parenthesised and may
+        itself contain spaces, so split after the closing paren."""
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                data = fh.read()
+            return int(data[data.rindex(b")") + 2:].split()[2])
+        except (OSError, ValueError, IndexError):
+            return None
+
+    async def _kill_gpu_zombies(self, owner_pgid: int | None) -> None:
+        """Reap leftover CUDA processes belonging to OUR vLLM process group.
+
+        vLLM's EngineCore is a subprocess that ignores SIGTERM and can outlive
+        the APIServer while still holding ~29 GiB of VRAM, so a post-crash sweep
+        is genuinely needed.  But it has to be scoped to processes we started:
+        these GPUs are shared with other services (the embedding provider on
+        :7997, transcription jobs, ad-hoc notebooks), and an unscoped sweep
+        SIGKILLs them.  It previously did exactly that — logging
+        "Killing GPU 1 zombie PID 77589 (post-crash)" while killing an unrelated
+        video-transcribe-service process.
+
+        Ownership test is the process group: _spawn uses start_new_session=True,
+        so our APIServer is a session leader with pgid == pid and every child
+        (EngineCore included) inherits that pgid.  Anything on this GPU with a
+        different pgid is somebody else's and is left alone."""
+        if owner_pgid is None:
+            return
         try:
             result = subprocess.run(
                 [
@@ -1158,14 +1201,21 @@ class GpuBackend:
                 if l.strip().isdigit()
             ]
             for pid in pids:
-                self.log.warning(f"Killing GPU {self.gpu_id} zombie PID {pid} (post-crash)")
+                pgid = self._pgid_of(pid)
+                if pgid != owner_pgid:
+                    self.log.debug(
+                        f"GPU {self.gpu_id} PID {pid} (pgid={pgid}) is not ours "
+                        f"(pgid={owner_pgid}) — leaving it alone"
+                    )
+                    continue
+                self.log.warning(
+                    f"Killing GPU {self.gpu_id} orphan PID {pid} "
+                    f"from our pgid {owner_pgid} (post-crash)"
+                )
                 try:
-                    os.killpg(pid, signal.SIGKILL)
+                    os.kill(pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                    pass
         except Exception as exc:
             self.log.warning(f"GPU zombie cleanup failed: {exc}")
 
@@ -1193,7 +1243,9 @@ class GpuBackend:
         self.process = None
         self._adopted_pid = None
         # Belt-and-suspenders: reap any orphan vLLM procs still on this GPU.
-        asyncio.create_task(self._kill_gpu_zombies())
+        # pid is captured above because self.process is already cleared by the
+        # time this task runs, and without it the sweep has no ownership test.
+        asyncio.create_task(self._kill_gpu_zombies(pid))
 
     async def _forward(self, request: web.Request, body: bytes) -> web.StreamResponse:
         target_url  = f"{self.vllm_base}{request.path_qs}"

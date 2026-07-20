@@ -13,6 +13,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=${VLLM_CUDA_DEVICE:-1}
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
+VLLM_BIN=${VLLM_BIN:-/home/derek/Projects/llm-gateway/.venv/bin/vllm}
 
 HF_TOKEN_FILE=/home/stardust/.cache/huggingface/token
 if [[ -f "$HF_TOKEN_FILE" ]]; then
@@ -21,11 +22,16 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
 fi
 
 GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.93}   # model_manager lowers this to fit free VRAM
-MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-122880}   # model_manager lowers this on a tight GPU to fit KV
+# Matched to stock 35b's 81920.  config.yaml's max_context_window_tokens must
+# agree — trim_hook caps requests against it, so a config claiming more than
+# vLLM loaded makes every over-length request fail at the backend.
+# (Was temporarily 32768 while debugging the FlashInfer JIT cold-start hang,
+# while config.yaml still claimed 122880 — that mismatch was live.)
+MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-81920}   # model_manager lowers this on a tight GPU to fit KV
 
 # served-model-name kept distinct so you can A/B against the stock 35b.
 # To make this a drop-in replacement instead, rename to: qwen3.6-35b-a3b
-exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4 \
+exec "$VLLM_BIN" serve AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
   --api-key local-qwen36 \

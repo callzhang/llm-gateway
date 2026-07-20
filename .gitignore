@@ -11,6 +11,8 @@ prisma/
 .env
 gateway.env
 cloudflared.env
+# Timestamped local backups (config.yaml.bak-YYYYMMDD-HHMM etc.)
+*.bak-*
 .claude/
 open-webui-data/
 .webui_secret_key

@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USER_SYSTEMD="$HOME/.config/systemd/user"
 TARGET=llm-gateway.target
 SERVICES=(
+  llm-jit-warmup.service
   llm-model-manager.service
   llm-litellm.service
   llm-open-webui.service
@@ -45,6 +46,17 @@ echo "Installing user unit files (services + target)..."
 for unit in "${UNITS[@]}"; do
   cp "$SCRIPT_DIR/$unit" "$USER_SYSTEMD/"
   echo "  copied $unit → $USER_SYSTEMD/"
+done
+
+# Drop-in directories (<unit>.service.d/*.conf) carry settings that must not be
+# lost on reinstall — e.g. model_manager's JIT-warmup ordering, without which a
+# cold FlashInfer cache gets compiled on the request path.
+for dropin in "$SCRIPT_DIR"/*.service.d; do
+  [ -d "$dropin" ] || continue
+  name=$(basename "$dropin")
+  mkdir -p "$USER_SYSTEMD/$name"
+  cp "$dropin"/*.conf "$USER_SYSTEMD/$name/"
+  echo "  copied $name/*.conf → $USER_SYSTEMD/$name/"
 done
 
 systemctl --user daemon-reload

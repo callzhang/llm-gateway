@@ -31,7 +31,10 @@ model_list:
       timeout: 600
       stream_timeout: 600
     model_info:
-      max_context_window_tokens: 122880
+      # Must match --max-model-len in run_qwen36_35b_heretic.sh.  This said
+      # 122880 while vLLM was actually loaded with far less, so trim_hook let
+      # over-length requests through and they failed at the backend.
+      max_context_window_tokens: 81920
       supports_vision: true
 
   # ── Qwen3.6-27B Text NVFP4+MTP ──────────────────────────────────────────
@@ -48,27 +51,15 @@ model_list:
     model_info:
       max_context_window_tokens: 65536
 
-  # ── External fallback (disabled — API key invalid) ───────────────────────
-  # - model_name: gpt-5.4-mini
-  #   litellm_params:
-  #     model: openai/gpt-5.4-mini
-  #     api_base: https://api.kksj.org/v1
-  #     api_key: os.environ/OPENAI_API_KEY
-
+  # No external fallback by design — every model is served locally through
+  # model_manager.  The old gpt-5.4-mini / api.kksj.org entry was removed along
+  # with its OPENAI_API_KEY plumbing; the key was invalid (401) and a fallback
+  # to a third party is not wanted here.
 
 router_settings:
   routing_strategy: latency-based-routing   # probes are intercepted by model_manager: cold models → 503 (no spawn), warm models → real latency measured
   num_retries: 0          # cold-starts block in model_manager — retries don't help
   retry_after: 0
-
-  # fallbacks disabled — re-enable when a valid external API key is available
-  # fallbacks:
-  #   - qwen3.6-35b-a3b: ["gpt-5.4-mini"]
-  #   - qwen3.6-27b: ["gpt-5.4-mini"]
-
-  # context_window_fallbacks:
-  #   - qwen3.6-35b-a3b: ["gpt-5.4-mini"]
-  #   - qwen3.6-27b: ["gpt-5.4-mini"]
 
 litellm_settings:
   drop_params: true

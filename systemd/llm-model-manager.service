@@ -1,6 +1,8 @@
 [Unit]
 Description=LLM Gateway — model_manager (spawns/unloads vLLM on demand, :8002)
-After=default.target
+# No After=default.target: llm-gateway.target is WantedBy=default.target, so
+# that line closed an ordering cycle which systemd broke by silently deleting
+# this service's start job — the stack came up without model_manager.
 PartOf=llm-gateway.target
 
 [Service]

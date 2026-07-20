@@ -5,6 +5,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=${VLLM_CUDA_DEVICE:-1}
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
+VLLM_BIN=${VLLM_BIN:-/home/derek/Projects/llm-gateway/.venv/bin/vllm}
 
 HF_TOKEN_FILE=/home/stardust/.cache/huggingface/token
 if [[ -f "$HF_TOKEN_FILE" ]]; then
@@ -18,9 +19,13 @@ fi
 # when embedding is actively loaded (~2.7 GiB) and util=0.93 doesn't fit; mm's
 # scale-out cooldown handles the retry until embedding offloads.
 GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.93}   # model_manager lowers this to fit free VRAM
-MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-122880}   # model_manager lowers this on a tight GPU to fit KV
+# 81920, not the theoretical 122880: that was the largest context whose KV cache
+# actually fits at util=0.93 on a 32 GiB card.  config.yaml's
+# max_context_window_tokens must match — trim_hook caps requests against it.
+# (Was temporarily 32768 while debugging the FlashInfer JIT cold-start hang.)
+MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-81920}   # model_manager lowers this on a tight GPU to fit KV
 
-exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
+exec "$VLLM_BIN" serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
   --api-key local-qwen36 \

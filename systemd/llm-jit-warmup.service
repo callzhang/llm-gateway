@@ -1,0 +1,32 @@
+[Unit]
+Description=LLM Gateway — pre-warm FlashInfer JIT cache before serving
+Documentation=file:///home/derek/Projects/llm-gateway/scripts/warm_jit_cache.sh
+# Must finish before model_manager opens :8002.  That ordering IS the request
+# blocking: while this runs, nothing listens on 8002, so LiteLLM fails fast with
+# a connection error (router_settings has num_retries: 0, so no retry storm)
+# instead of a request triggering a 27-minute compile on the serving path.
+Before=llm-model-manager.service
+# Deliberately no After=default.target — llm-gateway.target is WantedBy
+# default.target, and that pair forms an ordering cycle systemd breaks by
+# silently dropping a job (it bit llm-model-manager.service once already).
+
+[Service]
+Type=oneshot
+# Deliberately NOT RemainAfterExit=yes.  With it the unit stays "active" after
+# the first run, so every later `systemctl start llm-gateway.target` skips the
+# check — which silently defeats the whole point the moment a run script changes
+# and its marker is invalidated.  Re-running costs ~1s when everything is warm.
+WorkingDirectory=/home/derek/Projects/llm-gateway
+EnvironmentFile=-/home/derek/Projects/llm-gateway/gateway.env
+ExecStart=/home/derek/Projects/llm-gateway/scripts/warm_jit_cache.sh
+# A cold cache compiles CUTLASS from source for ~27 min per model, and any
+# timeout here would kill it mid-compile — which is precisely the bug this
+# service exists to prevent.  The script is a ~1s no-op once markers exist.
+TimeoutStartSec=infinity
+# The compile is what wedged the box; keep it behind sshd/tailscaled/cloudflared.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=llm-gateway.target
