@@ -1253,15 +1253,37 @@ class GpuBackend:
             k: v for k, v in request.headers.items()
             if k.lower() not in _HOP_BY_HOP | {"host", "content-length"}
         }
-        # Rewrite routing key → vLLM's own --served-model-name
-        if self.served_name != self.model_name and body:
+        # Normalise the body before it reaches vLLM.  Parsed once, re-serialised
+        # only if something actually changed.
+        if body:
             try:
                 parsed = json.loads(body)
-                if parsed.get("model") == self.model_name:
+            except (json.JSONDecodeError, TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                changed = False
+                # Rewrite routing key → vLLM's own --served-model-name
+                if (self.served_name != self.model_name
+                        and parsed.get("model") == self.model_name):
                     parsed["model"] = self.served_name
+                    changed = True
+                # LiteLLM's Responses API → chat/completions conversion always
+                # emits a `tools` key, so a caller that passed no tools at all
+                # still arrives here as `tools: []`.  vLLM rejects that outright
+                # ("`tools` must not be an empty array. Either provide at least
+                # one tool or omit the field entirely"), which 400s every
+                # tool-less /v1/responses request — that is what breaks Memory
+                # extraction.  Strip it here rather than in LiteLLM: this is the
+                # last hop before vLLM, so Open WebUI and direct callers are
+                # covered by the same fix.
+                if parsed.get("tools") == []:
+                    parsed.pop("tools", None)
+                    # tool_choice without tools is meaningless, and vLLM rejects
+                    # "required" with no tools to choose from.
+                    parsed.pop("tool_choice", None)
+                    changed = True
+                if changed:
                     body = json.dumps(parsed).encode()
-            except (json.JSONDecodeError, TypeError):
-                pass
         try:
             async with self._session.request(
                 method=request.method, url=target_url,
