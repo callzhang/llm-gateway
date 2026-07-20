@@ -31,6 +31,13 @@ MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-81920}   # model_manager lowers this on a ti
 
 # served-model-name kept distinct so you can A/B against the stock 35b.
 # To make this a drop-in replacement instead, rename to: qwen3.6-35b-a3b
+# vLLM needs BOTH --tool-call-parser and --enable-auto-tool-choice: with
+# the parser alone it rejects any request carrying tools, with
+# '"auto" tool choice requires --enable-auto-tool-choice and
+# --tool-call-parser to be set'.  The second flag was missing from every
+# run script since they were written, so tool calling had never worked
+# through the gateway.  Keep comments out of the exec's line
+# continuation below — a '#' line there ends the command early.
 exec "$VLLM_BIN" serve AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
@@ -46,5 +53,6 @@ exec "$VLLM_BIN" serve AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4 \
   --max-num-batched-tokens 4096 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
+  --enable-auto-tool-choice \
   --trust-remote-code \
   --no-disable-hybrid-kv-cache-manager

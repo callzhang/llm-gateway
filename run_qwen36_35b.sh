@@ -25,6 +25,13 @@ GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.93}   # model_manager lowers this to fit fre
 # (Was temporarily 32768 while debugging the FlashInfer JIT cold-start hang.)
 MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-81920}   # model_manager lowers this on a tight GPU to fit KV
 
+# vLLM needs BOTH --tool-call-parser and --enable-auto-tool-choice: with
+# the parser alone it rejects any request carrying tools, with
+# '"auto" tool choice requires --enable-auto-tool-choice and
+# --tool-call-parser to be set'.  The second flag was missing from every
+# run script since they were written, so tool calling had never worked
+# through the gateway.  Keep comments out of the exec's line
+# continuation below — a '#' line there ends the command early.
 exec "$VLLM_BIN" serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
@@ -40,5 +47,6 @@ exec "$VLLM_BIN" serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
   --max-num-batched-tokens 4096 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
+  --enable-auto-tool-choice \
   --trust-remote-code \
   --no-disable-hybrid-kv-cache-manager

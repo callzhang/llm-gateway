@@ -16,6 +16,13 @@ fi
 GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.84}   # model_manager lowers this to fit free VRAM
 MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-65536}   # model_manager lowers this on a tight GPU to fit KV
 
+# vLLM needs BOTH --tool-call-parser and --enable-auto-tool-choice: with
+# the parser alone it rejects any request carrying tools, with
+# '"auto" tool choice requires --enable-auto-tool-choice and
+# --tool-call-parser to be set'.  The second flag was missing from every
+# run script since they were written, so tool calling had never worked
+# through the gateway.  Keep comments out of the exec's line
+# continuation below — a '#' line there ends the command early.
 exec "$VLLM_BIN" serve sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
@@ -30,5 +37,6 @@ exec "$VLLM_BIN" serve sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
+  --enable-auto-tool-choice \
   --language-model-only \
   --trust-remote-code
