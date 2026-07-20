@@ -42,6 +42,14 @@ echo "  linger enabled for $USER"
 mkdir -p "$USER_SYSTEMD"
 mkdir -p "$HOME/Projects/llm-gateway/logs"
 
+# Log rotation.  Root-owned, so it goes in here with the other sudo steps.
+# Without it logs/ grows unbounded — gateway.log.1 once reached 5.1 GB.
+LOGROTATE_SRC="$SCRIPT_DIR/../logrotate/llm-gateway"
+if [ -f "$LOGROTATE_SRC" ]; then
+  sudo cp "$LOGROTATE_SRC" /etc/logrotate.d/llm-gateway
+  echo "  installed /etc/logrotate.d/llm-gateway"
+fi
+
 echo "Installing user unit files (services + target)..."
 for unit in "${UNITS[@]}"; do
   cp "$SCRIPT_DIR/$unit" "$USER_SYSTEMD/"

@@ -1,0 +1,16 @@
+/home/derek/Projects/llm-gateway/logs/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    # No notifempty: it skips rotation entirely for an empty log, which freezes
+    # the whole .1 -> .2 -> ... chain for any service that has stopped writing.
+    # That is how a 5.1 GB gateway.log.1 sat undeleted for seven weeks while
+    # gateway.log itself was 0 bytes.
+    copytruncate
+    maxsize 50M
+    # Backstop independent of the rotation chain: drop rotated files older than
+    # two weeks even if rotation never advances for that log.
+    maxage 14
+}
