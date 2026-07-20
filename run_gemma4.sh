@@ -7,6 +7,7 @@ export VLLM_SERVER_DEV_MODE=1
 export CUDA_VISIBLE_DEVICES=0
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
+VLLM_BIN=${VLLM_BIN:-/home/derek/Projects/llm-gateway/.venv/bin/vllm}
 
 HF_TOKEN_FILE=/home/stardust/.cache/huggingface/token
 if [[ -f "$HF_TOKEN_FILE" ]]; then
@@ -14,7 +15,7 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
 
-exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve cyankiwi/gemma-4-E4B-it-AWQ-INT4 \
+exec "$VLLM_BIN" serve cyankiwi/gemma-4-E4B-it-AWQ-INT4 \
   --host 127.0.0.1 \
   --port 9001 \
   --api-key local-gemma4 \

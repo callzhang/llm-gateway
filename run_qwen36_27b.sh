@@ -5,6 +5,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=${VLLM_CUDA_DEVICE:-1}
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
+VLLM_BIN=${VLLM_BIN:-/home/derek/Projects/llm-gateway/.venv/bin/vllm}
 
 HF_TOKEN_FILE=/home/stardust/.cache/huggingface/token
 if [[ -f "$HF_TOKEN_FILE" ]]; then
@@ -15,7 +16,7 @@ fi
 GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.84}   # model_manager lowers this to fit free VRAM
 MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-65536}   # model_manager lowers this on a tight GPU to fit KV
 
-exec /home/derek/Projects/gemma4-bench/.venv/bin/vllm serve sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
+exec "$VLLM_BIN" serve sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
   --api-key local-qwen36 \
