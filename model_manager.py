@@ -43,7 +43,14 @@ from aiohttp import web
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "300"))
-WAKE_TIMEOUT = int(os.environ.get("WAKE_TIMEOUT", "300"))
+# Not sized for the normal case — warm-cache spawns finish in 40-160s.  This is
+# the self-heal budget for when llm-jit-warmup did not run or its marker was
+# wrong, so a first-time FlashInfer/CUTLASS compile lands on the request path
+# instead.  Those take 750-1890s; anything shorter kills the spawn before the
+# JIT cache is written, so every retry restarts from zero and the model never
+# comes up.  gateway.env normally sets this, but that file is gitignored —
+# defaulting here keeps the guard in tracked code.
+WAKE_TIMEOUT = int(os.environ.get("WAKE_TIMEOUT", "2700"))
 HEALTH_POLL  = float(os.environ.get("HEALTH_POLL", "2.0"))
 LISTEN_PORT  = int(os.environ.get("LISTEN_PORT", "8002"))
 # Bind 0.0.0.0 so tailnet peers can reach it (Tailscale's ts-input iptables

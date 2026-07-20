@@ -72,6 +72,25 @@ mkdir -p "$MARKDIR"
 echo "fingerprint: $FP  ($FP_RAW)"
 echo "markers:     $MARKDIR"
 
+# The markers live outside the caches they vouch for, so wiping a cache without
+# wiping the markers would leave us claiming "already warm" while the compile is
+# actually gone — and that compile would then land on the request path, where
+# WAKE_TIMEOUT still applies.  Cross-check both cache roots and drop every
+# marker if either has been cleared.
+# Test for compiled artefacts, not for the directories: a running vLLM recreates
+# an empty ~/.cache/vllm the moment it is removed, so "the directory exists" and
+# even "it has an entry" both pass against a cache that is actually gone.
+CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}
+has_artefact() {  # <dir> <find-args...>
+  local d=$1; shift
+  [ -n "$(find "$d" "$@" -print -quit 2>/dev/null)" ]
+}
+if ! has_artefact "$CACHE_DIR/flashinfer" -type f -name '*.so' \
+   || ! has_artefact "$CACHE_DIR/vllm/torch_compile_cache" -type f; then
+  echo "  compiled artefacts missing under $CACHE_DIR — discarding markers, re-warming all"
+  rm -f "$MARKDIR"/*.ok 2>/dev/null
+fi
+
 if systemctl --user is-active --quiet llm-model-manager.service; then
   echo "ERROR: llm-model-manager is running — it would fight this script for the GPU."
   echo "       systemctl --user stop llm-model-manager.service, then re-run."
