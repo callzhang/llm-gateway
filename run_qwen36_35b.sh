@@ -32,6 +32,13 @@ MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-81920}   # model_manager lowers this on a ti
 # run script since they were written, so tool calling had never worked
 # through the gateway.  Keep comments out of the exec's line
 # continuation below — a '#' line there ends the command early.
+# max-num-seqs is a ceiling, not an allocation.  The scheduler already
+# admits per request against actual free KV blocks
+# (scheduler.py allocate_slots, with scheduler_reserve_full_isl=True), so
+# long requests throttle concurrency down on their own.  It was 2, sized
+# for every request filling max-model-len; real traffic has a ~6k-token
+# median against 423846 tokens of KV, so that cap sat ~3% of capacity and
+# the dynamic gate never got to act.
 exec "$VLLM_BIN" serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
@@ -40,7 +47,7 @@ exec "$VLLM_BIN" serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
   --quantization compressed-tensors \
   --gpu-memory-utilization ${GPU_MEM_UTIL} \
   --max-model-len ${MAX_MODEL_LEN} \
-  --max-num-seqs 2 \
+  --max-num-seqs 16 \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
   --enable-chunked-prefill \
