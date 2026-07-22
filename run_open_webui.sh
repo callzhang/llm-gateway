@@ -30,8 +30,19 @@ export WEBUI_AUTH=True
 export SIGNUP_ALLOWED_EMAIL_DOMAINS="stardust.ai"
 # New self-signup users become active immediately (no admin approval step).
 export DEFAULT_USER_ROLE=user
-# Keep open signup enabled (the company-domain allowlist above is the gate).
-export ENABLE_SIGNUP=True
+# That allowlist lives in .venv-owui/ — pip-managed and gitignored — so any
+# `pip install -U open-webui` overwrites auths.py and silently reopens public
+# signup on llm.preseen.ai.  Re-assert the patch on every start, and FAIL
+# CLOSED: if it cannot be verified in place, serve with signup off rather than
+# with an unguarded registration form.  Existing users keep working either way.
+if "$SCRIPT_DIR/.venv-owui/bin/python" "$SCRIPT_DIR/scripts/ensure_owui_signup_patch.py"; then
+    export ENABLE_SIGNUP=True
+else
+    echo "[run_open_webui] !! signup domain allowlist could NOT be verified" >&2
+    echo "[run_open_webui] !! disabling signup (fail-closed); existing logins unaffected" >&2
+    echo "[run_open_webui] !! re-derive the anchor in scripts/ensure_owui_signup_patch.py" >&2
+    export ENABLE_SIGNUP=False
+fi
 
 # ── RAG embeddings: Jina embedding service (OpenAI-compatible) ────────────────
 # Open WebUI's RAG embedding uses its OWN OpenAI endpoint (RAG_OPENAI_API_*),
