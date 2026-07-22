@@ -4,7 +4,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── OpenAI-compatible backend: LiteLLM proxy on :8900 ─────────────────────────
 export OPENAI_API_BASE_URL="http://127.0.0.1:8900/v1"
-export OPENAI_API_KEY="${LITELLM_MASTER_KEY:-sk-local-gateway}"
+# Use the scoped "open-webui" virtual key, NOT the admin master key.  This keeps
+# the frontend from being able to reach LiteLLM's /key/* /user/* admin routes.
+# No fallback default — this file is tracked in a public repo.
+: "${OPENWEBUI_LLM_KEY:?set OPENWEBUI_LLM_KEY in gateway.env (scoped virtual key)}"
+export OPENAI_API_KEY="$OPENWEBUI_LLM_KEY"
 
 # ── Disable Ollama probing (no Ollama running) ────────────────────────────────
 export ENABLE_OLLAMA_API=False
