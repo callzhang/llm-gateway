@@ -1553,6 +1553,27 @@ class DynamicRouter:
                 result.append(s)
         return result
 
+    @staticmethod
+    def _by_free_vram(slots: "list[GpuSlot]") -> "list[GpuSlot]":
+        """Slots ordered emptiest-GPU-first, so a spawn lands where it fits.
+
+        Picking slots in declaration order meant always trying GPU 1 first, and
+        GPU 1 shares the card with video-transcribe-service (~1.6 GiB).  That
+        leaves ~27.9 GiB free — enough that the card looks usable, but 0.8 GiB
+        short of the 28.7 GiB a 35B needs at min-viable util, so the spawn was
+        refused with "too tight" while GPU 0 sat completely empty.  That is
+        every one of the 66 such failures in the current log: 66 on GPU 1, none
+        on GPU 0.
+
+        nvidia-smi is queried per slot here; the list is at most a handful of
+        entries and this runs only on the spawn path, not per request.  Slots
+        whose GPU cannot be read sort last rather than blocking selection."""
+        return sorted(
+            slots,
+            key=lambda s: _gpu_free_mib(s.gpu_id) or -1.0,
+            reverse=True,
+        )
+
     def _allowed_gpus(self, model_name: str) -> "set[int] | None":
         """GPU IDs this model may occupy, or None if unconstrained.
 
@@ -1719,7 +1740,7 @@ class DynamicRouter:
                         f"All GPU slots are occupied: {occupied}. "
                         f"Retry after {IDLE_TIMEOUT}s idle."
                     )
-                slot   = compatible[0]
+                slot   = self._by_free_vram(compatible)[0]
                 script, served, _ = self.model_configs[model_name]
                 b      = GpuBackend(model_name, script, served, slot)
                 b.router = self
@@ -1883,7 +1904,7 @@ class DynamicRouter:
                 victim_slot.backend = None      # detach old backend
                 free = [victim_slot]
 
-            slot   = free[0]
+            slot   = self._by_free_vram(free)[0]
             script, served, _ = self.model_configs[model_name]
             new_b  = GpuBackend(model_name, script, served, slot)
             new_b.router = self
