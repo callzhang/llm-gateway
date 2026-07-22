@@ -321,11 +321,18 @@ MODEL_CONFIGS: dict[str, tuple[str, str, "set[int] | None"]] = {
 # Rule of thumb: gpu_memory_utilization × GPU_total_GiB + 1 GiB safety buffer.
 # If a model is not listed here no pre-check is performed (may evict & fail).
 MODEL_MIN_FREE_GIB: dict[str, float] = {
-    "qwen3.6-35b-a3b": 29.0,  # 0.93 × 32 GiB ≈ 29.8 GiB; lowered from 30.5
-                               # GPU 0 shares with embedding-provider (~2.2 GiB),
-                               # leaving only ~29.2 GiB free — actual vLLM usage
-                               # is ~29.1 GiB so 29.0 threshold gives 0.2 GiB margin.
-    "qwen3.6-35b-a3b-heretic": 29.0,  # same util=0.93 as stock 35b
+    # Sized off the min-viable floor (0.84), not the preferred util (0.93):
+    # this gate runs before the VRAM-aware util calculation, so keying it to the
+    # preferred value rejected any card that could still host the model at the
+    # floor.  0.84 × 31.8 GiB = 26.75 GiB, so 27.0 leaves 0.25 GiB of headroom —
+    # deliberately thin, because every extra tenth here is a card this model can
+    # no longer land on, and the util calculation downstream still refuses the
+    # spawn if the floor genuinely does not fit.  A measured 27.29 GiB free (the
+    # real contended-GPU-1 water line) has to pass: at 27.5 it did not.
+    # Keep in step with MODEL_MIN_GPU_MEM_UTIL — if the floor moves and this does
+    # not, the stricter of the two silently wins.
+    "qwen3.6-35b-a3b": 27.0,
+    "qwen3.6-35b-a3b-heretic": 27.0,  # same floor as stock 35b
     "qwen3.6-27b":     27.5,  # 0.84 × 32 GiB ≈ 26.9 + 0.6 GiB buffer
 }
 
@@ -354,11 +361,24 @@ GPU_MEM_UTIL_BUFFER_MIB = float(os.environ.get("GPU_MEM_UTIL_BUFFER_MIB", "768")
 # a narrow safe band.  Below the floor we DON'T spawn: we raise immediately so the
 # failure is fast and legible (mirroring _check_gpu_free) instead of a slow OOM.
 #
-# Floors are empirical: 35B needs ≈0.90 (verified 0.875 fails with zero KV);
-# 27B is dense with a normal KV cache and tolerates more headroom (~0.78).
+# Floors are empirical AND they move with --max-model-len.  The 0.90 here was
+# measured when 35B ran at max-model-len 122880, where KV really did collapse
+# just below it.  At the 81920 the run scripts now use it is far too
+# conservative: 0.84 measured on GPU 1 — the contended card — gives 169182 KV
+# tokens, 2.07x a full-length request and ~10x what max-num-seqs 16 needs at the
+# ~6k-token median.  Verified serving a real completion, not merely starting.
+#
+# The floor doubles as the admission test, so setting it too high costs the whole
+# card.  GPU 1 is shared with video-transcribe-service and an embedding provider
+# (~3-4 GiB between them), leaving ~28 GiB free — just under 0.90's 28.9 GiB, so
+# every spawn there was refused as "too tight" although the model fits fine.
+# 0.84 needs 26.8 GiB and tolerates ~4.8 GiB of neighbours.
+#
+# Re-measure if --max-model-len changes again.  27B is dense with a normal KV
+# cache and tolerates more headroom.
 MODEL_MIN_GPU_MEM_UTIL: dict[str, float] = {
-    "qwen3.6-35b-a3b":         0.90,
-    "qwen3.6-35b-a3b-heretic": 0.90,
+    "qwen3.6-35b-a3b":         0.84,
+    "qwen3.6-35b-a3b-heretic": 0.84,
     "qwen3.6-27b":             0.78,
 }
 # Fallback floor for models not listed above (best-effort attempt, not fail-fast).
