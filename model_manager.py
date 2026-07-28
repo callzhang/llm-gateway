@@ -423,6 +423,17 @@ class GPUBusyError(Exception):
     pass
 
 
+class BackendGoneError(Exception):
+    """The vLLM backend disappeared BEFORE any response bytes were streamed to
+    the client — connection refused/reset or ServerDisconnectedError during a
+    crash-recycle (SIGKILL) or reload.  Raised (not returned) so `handle` can
+    transparently respawn and retry: nothing has reached the client yet, so a
+    retry is safe and turns a would-be 502 into either a 200 or a retryable
+    503.  Mid-stream failures never raise this — they are caught where the
+    response body is already being written."""
+    pass
+
+
 # ── Admin dashboard (served at GET /admin) ─────────────────────────────────────
 ADMIN_HTML = """<!doctype html>
 <html lang="en">
@@ -1365,11 +1376,17 @@ class GpuBackend:
                     self.log.debug(f"Stream interrupted: {exc}")
                 return resp
         except aiohttp.ClientConnectorError as exc:
-            self.log.error(f"Cannot reach vLLM: {exc}")
-            return web.Response(status=503, text="vLLM backend unavailable")
+            # Backend port not accepting connections — killed mid-flight or not
+            # yet bound.  We are still pre-stream here (the streaming body has
+            # its own except above), so let handle() respawn and retry.
+            self.log.warning(f"Cannot reach vLLM (pre-stream): {exc}")
+            raise BackendGoneError(f"connect: {exc}") from exc
         except aiohttp.ClientError as exc:
-            self.log.error(f"Proxy error: {exc}")
-            return web.Response(status=502, text=f"Proxy error: {exc}")
+            # ServerDisconnectedError et al: the backend dropped the connection
+            # before sending a response (typically a crash-recycle SIGKILL).
+            # Previously returned a hard 502; instead signal a retryable gone.
+            self.log.warning(f"Backend disconnected (pre-stream): {exc}")
+            raise BackendGoneError(str(exc)) from exc
 
 
 # ── Task-id affinity (for clients that propagate `x-task-id` header) ───────────
@@ -2146,40 +2163,14 @@ class DynamicRouter:
         except Exception:
             pass
 
-        try:
-            backends = await self._get_or_start(model_name)
-        except GPUBusyError as exc:
-            self.log.warning(str(exc))
-            return web.Response(
-                status=503, content_type="application/json",
-                body=json.dumps({"error": {"message": str(exc), "type": "gpu_busy"}}),
-            )
-        except RuntimeError as exc:
-            self.log.error(str(exc))
-            return web.Response(
-                status=503, content_type="application/json",
-                body=json.dumps({"error": {"message": str(exc), "type": "startup_failed"}}),
-            )
-
-        # Sticky routing: x-task-id header pins all turns of one task to the same
-        # vLLM slot for prefix cache reuse.  Falls back to least-connections.
+        # Sticky routing metadata is backend-independent — parse it once, before
+        # the retry loop below.  x-task-id pins all turns of one task to the same
+        # vLLM slot for prefix cache reuse; falls back to least-connections.
         try:
             parsed_body_for_sticky = json.loads(body) if body else None
         except Exception:
             parsed_body_for_sticky = None
         sticky_slot, sticky_reason = _sticky_slot_for(parsed_body_for_sticky, request.headers)
-        sticky_backend: GpuBackend | None = None
-        if sticky_slot is not None:
-            sticky_backend = next(
-                (b for b in backends if b.slot.slot_id == sticky_slot), None
-            )
-        if sticky_backend is not None:
-            backend = sticky_backend
-        else:
-            backend = self._pick(backends)
-            # Scale-out is decided by the background saturation monitor based on
-            # vLLM's sustained real queue — not triggered per request here.
-        # Record affinity so subsequent turns of the same task pin here.
         task_id = _extract_task_id(parsed_body_for_sticky, request.headers)
         # Approximate prompt size (sum of message-content chars) so the pipeline
         # team can grep-by-task and see whether multi-turn history is growing.
@@ -2189,24 +2180,83 @@ class DynamicRouter:
             else sum(len(p.get("text", "") or "") for p in (m.get("content") or []) if isinstance(p, dict))
             for m in msgs if isinstance(m, dict)
         )
-        if task_id:
-            hit_status = "hit" if sticky_backend is not None else "fresh"
-            self.log.info(
-                f"Sticky chat/completions: task_id={task_id} {hit_status} → slot {backend.slot.slot_id} "
-                f"(msgs={len(msgs)}, chars≈{approx_chars})"
-            )
-            _set_task_affinity(task_id, backend.slot.slot_id)
-        else:
-            hdr_summary = ", ".join(
-                f"{k.lower()}" for k in request.headers
-                if k.lower().startswith(("x-", "anthropic-", "authorization", "user-agent"))
-            )
-            body_keys = sorted(parsed_body_for_sticky.keys()) if parsed_body_for_sticky else []
-            self.log.info(
-                f"chat/completions no task_id (headers: [{hdr_summary}], body keys: {body_keys}, "
-                f"msgs={len(msgs)}, chars≈{approx_chars})"
-            )
-        return await backend.proxy(request, body)
+
+        # A backend can vanish BEFORE it streams a single byte — a crash-recycle
+        # SIGKILL or a reload racing this in-flight request.  That surfaces as
+        # BackendGoneError (raised only pre-stream, never mid-body).  Since
+        # nothing reached the client, respawn and retry ONCE; a would-be 502 thus
+        # becomes a 200, or at worst a retryable 503.  This is what keeps a
+        # reload / cold-start from ever surfacing a 502 at the main address.
+        last_gone: BackendGoneError | None = None
+        for attempt in range(2):
+            try:
+                backends = await self._get_or_start(model_name)
+            except GPUBusyError as exc:
+                self.log.warning(str(exc))
+                return web.Response(
+                    status=503, content_type="application/json",
+                    body=json.dumps({"error": {"message": str(exc), "type": "gpu_busy"}}),
+                )
+            except RuntimeError as exc:
+                self.log.error(str(exc))
+                return web.Response(
+                    status=503, content_type="application/json",
+                    body=json.dumps({"error": {"message": str(exc), "type": "startup_failed"}}),
+                )
+
+            sticky_backend: GpuBackend | None = None
+            if sticky_slot is not None:
+                sticky_backend = next(
+                    (b for b in backends if b.slot.slot_id == sticky_slot), None
+                )
+            if sticky_backend is not None:
+                backend = sticky_backend
+            else:
+                backend = self._pick(backends)
+                # Scale-out is decided by the background saturation monitor based
+                # on vLLM's sustained real queue — not triggered per request here.
+
+            # Record affinity + log routing (only the first attempt for the
+            # no-task path, to avoid duplicate lines on a transparent retry).
+            if task_id:
+                hit_status = "hit" if sticky_backend is not None else "fresh"
+                retry_note = "" if attempt == 0 else f" (retry {attempt})"
+                self.log.info(
+                    f"Sticky chat/completions: task_id={task_id} {hit_status} → slot {backend.slot.slot_id} "
+                    f"(msgs={len(msgs)}, chars≈{approx_chars}){retry_note}"
+                )
+                _set_task_affinity(task_id, backend.slot.slot_id)
+            elif attempt == 0:
+                hdr_summary = ", ".join(
+                    f"{k.lower()}" for k in request.headers
+                    if k.lower().startswith(("x-", "anthropic-", "authorization", "user-agent"))
+                )
+                body_keys = sorted(parsed_body_for_sticky.keys()) if parsed_body_for_sticky else []
+                self.log.info(
+                    f"chat/completions no task_id (headers: [{hdr_summary}], body keys: {body_keys}, "
+                    f"msgs={len(msgs)}, chars≈{approx_chars})"
+                )
+
+            try:
+                return await backend.proxy(request, body)
+            except BackendGoneError as exc:
+                last_gone = exc
+                self.log.warning(
+                    f"Backend on slot {backend.slot.slot_id} gone before response "
+                    f"(attempt {attempt + 1}/2) for {model_name}: {exc} — "
+                    f"{'retrying' if attempt == 0 else 'giving up'}"
+                )
+
+        # Both attempts saw the backend disappear pre-response.  Return a
+        # retryable 503 — never a 502 — since the request produced no output.
+        self.log.error(f"Backend unavailable after retry for {model_name}: {last_gone}")
+        return web.Response(
+            status=503, content_type="application/json",
+            body=json.dumps({"error": {
+                "message": f"Backend for '{model_name}' was momentarily unavailable; please retry.",
+                "type": "service_unavailable",
+            }}),
+        )
 
     @staticmethod
     def _extract_model(body: bytes) -> str | None:
