@@ -2178,6 +2178,14 @@ class DynamicRouter:
         invalid = self._validate_model_request(request, parsed_body, config)
         if invalid is not None:
             return invalid
+        if config.request_kind == "speech":
+            # The public speech contract is deliberately MP3-only.  vLLM-Omni
+            # can encode it natively, and LiteLLM 1.86.2 labels every speech
+            # response as audio/mpeg.  Normalising an omitted/case-varied value
+            # here keeps the bytes, filename convention, and Content-Type in
+            # agreement without adding an ffmpeg transcode layer.
+            parsed_body["response_format"] = "mp3"
+            body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
 
         # Probe / latency-check detection (e.g. LiteLLM latency-based-routing).
         # Rule: only test models that are already loaded.
@@ -2369,6 +2377,15 @@ class DynamicRouter:
             return self._invalid_request(
                 f"'input' exceeds the {config.max_input_chars} character limit",
                 param="input",
+            )
+        response_format = parsed_body.get("response_format")
+        if response_format is not None and (
+            not isinstance(response_format, str)
+            or response_format.lower() != "mp3"
+        ):
+            return self._invalid_request(
+                "Only 'mp3' is supported; WAV/PCM and other response formats are disabled",
+                param="response_format",
             )
         return None
 

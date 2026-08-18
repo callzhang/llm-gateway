@@ -46,7 +46,7 @@ class SpeechRoutingTests(unittest.IsolatedAsyncioTestCase):
             "input": "你好",
             "voice": "Vivian",
             "instructions": "温暖、自然",
-            "response_format": "wav",
+            "response_format": "mp3",
         }
         payload.update(overrides)
         return await self.client.post(path, json=payload)
@@ -70,13 +70,44 @@ class SpeechRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(400, response.status)
         self.router._get_or_start.assert_not_awaited()
 
+    async def test_rejects_uncompressed_or_mismatched_formats_before_gpu_start(self):
+        self.router._get_or_start = AsyncMock()
+
+        for response_format in ("wav", "pcm", "opus", "flac"):
+            with self.subTest(response_format=response_format):
+                response = await self._post(response_format=response_format)
+                self.assertEqual(400, response.status)
+                body = await response.json()
+                self.assertEqual("response_format", body["error"]["param"])
+
+        self.router._get_or_start.assert_not_awaited()
+
+    async def test_missing_response_format_defaults_to_mp3_before_forwarding(self):
+        backend = SimpleNamespace(
+            slot=SimpleNamespace(slot_id=0),
+            _active_requests=0,
+            proxy=AsyncMock(
+                return_value=web.Response(body=b"ID3-test", content_type="audio/mpeg")
+            ),
+        )
+        self.router._get_or_start = AsyncMock(return_value=[backend])
+
+        response = await self.client.post(
+            "/v1/audio/speech",
+            json={"model": MODEL_NAME, "input": "你好", "voice": "Vivian"},
+        )
+
+        self.assertEqual(200, response.status)
+        forwarded_body = json.loads(backend.proxy.await_args.args[1])
+        self.assertEqual("mp3", forwarded_body["response_format"])
+
     async def test_valid_request_reaches_backend_without_logging_text(self):
-        audio = b"RIFF-test-wave"
+        audio = b"ID3-test-mp3"
         slot = SimpleNamespace(slot_id=0)
         backend = SimpleNamespace(
             slot=slot,
             _active_requests=0,
-            proxy=AsyncMock(return_value=web.Response(body=audio, content_type="audio/wav")),
+            proxy=AsyncMock(return_value=web.Response(body=audio, content_type="audio/mpeg")),
         )
         self.router._get_or_start = AsyncMock(return_value=[backend])
 
@@ -86,7 +117,7 @@ class SpeechRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(200, response.status)
         self.assertEqual(audio, body)
-        self.assertEqual("audio/wav", response.headers["Content-Type"])
+        self.assertEqual("audio/mpeg", response.headers["Content-Type"])
         log_text = "\n".join(captured.output)
         self.assertNotIn("你好", log_text)
         self.assertNotIn("温暖、自然", log_text)
@@ -95,10 +126,10 @@ class SpeechRoutingTests(unittest.IsolatedAsyncioTestCase):
 
 class BinaryForwardingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.audio = b"RIFF\x00\x01\xffWAVEbinary"
+        self.audio = b"ID3\x04\x00\x00\xffMP3binary"
 
         async def speech(_request):
-            return web.Response(body=self.audio, content_type="audio/wav")
+            return web.Response(body=self.audio, content_type="audio/mpeg")
 
         upstream_app = web.Application()
         upstream_app.router.add_post("/v1/audio/speech", speech)
@@ -127,14 +158,19 @@ class BinaryForwardingTests(unittest.IsolatedAsyncioTestCase):
         await self.backend._session.close()
         await self.upstream.close()
 
-    async def test_forwards_wav_content_type_and_exact_binary_body(self):
+    async def test_forwards_mp3_content_type_and_exact_binary_body(self):
         response = await self.client.post(
             "/v1/audio/speech",
-            json={"model": MODEL_NAME, "input": "你好", "voice": "Vivian"},
+            json={
+                "model": MODEL_NAME,
+                "input": "你好",
+                "voice": "Vivian",
+                "response_format": "mp3",
+            },
         )
 
         self.assertEqual(200, response.status)
-        self.assertEqual("audio/wav", response.headers["Content-Type"])
+        self.assertEqual("audio/mpeg", response.headers["Content-Type"])
         self.assertEqual(self.audio, await response.read())
 
 

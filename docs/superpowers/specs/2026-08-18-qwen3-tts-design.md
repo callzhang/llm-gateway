@@ -12,7 +12,7 @@ The first release exposes the model as `qwen3-tts-1.7b-customvoice` through:
 POST https://llm-api.preseen.ai/v1/audio/speech
 ```
 
-Supported request fields are `model`, `input`, `voice`, `instructions`, and `response_format`. Preset CustomVoice speakers and instruction-based speaking style are the complete customization requirement for this release: callers choose one of the model's preset voices and use `instructions` to control emotion, pace, tone, and delivery. Creating a new timbre is not required. Voice cloning, uploaded reference audio, VoiceDesign, and Base checkpoints are excluded from scope.
+Supported request fields are `model`, `input`, `voice`, `instructions`, and `response_format`. Output is MP3-only; an omitted format defaults to `mp3`, while WAV, PCM, and other formats are rejected before GPU allocation. Preset CustomVoice speakers and instruction-based speaking style are the complete customization requirement for this release: callers choose one of the model's preset voices and use `instructions` to control emotion, pace, tone, and delivery. Creating a new timbre is not required. Voice cloning, uploaded reference audio, VoiceDesign, and Base checkpoints are excluded from scope.
 
 ## Architecture
 
@@ -48,11 +48,11 @@ The minimum accepted request is:
   "model": "qwen3-tts-1.7b-customvoice",
   "input": "你好，这是语音合成测试。",
   "voice": "Vivian",
-  "response_format": "wav"
+  "response_format": "mp3"
 }
 ```
 
-`instructions` is optional. The gateway must retain the upstream audio content type and stream or copy the binary body without JSON transformation. A configurable input-length limit protects the public endpoint from unbounded synthesis requests. Invalid models and oversized inputs return OpenAI-style JSON errors before backend scheduling. Voice and format validation remains authoritative in vLLM-Omni, and its structured error is forwarded through the gateway.
+`instructions` is optional. The gateway normalizes a missing format to MP3, rejects non-MP3 output, retains the upstream `audio/mpeg` content type, and copies the binary body without JSON transformation. A configurable input-length limit protects the public endpoint from unbounded synthesis requests. Invalid models, formats, and oversized inputs return OpenAI-style JSON errors before backend scheduling. Voice validation remains authoritative in vLLM-Omni, and its structured error is forwarded through the gateway.
 
 ## Failure Handling and Observability
 
@@ -86,7 +86,7 @@ Automated tests must first fail and then pass for:
 GPU4 acceptance requires fresh evidence for:
 
 1. A LiteLLM virtual key can call the public `/v1/audio/speech` endpoint.
-2. The response is a non-empty RIFF/WAV file with a readable sample rate and duration.
+2. The response is a non-empty MPEG audio file with a readable sample rate and duration.
 3. The waveform contains non-silent audio.
 4. GPU memory is allocated to the intended card during synthesis and released after unload.
 5. A chat model can wake and serve a completion after TTS releases the slot.
@@ -108,4 +108,4 @@ Rollback removes the TTS model from LiteLLM and `model_manager`, restores the pr
 
 ## Completion Criteria
 
-The work is complete only when automated tests pass, the public authenticated API produces validated audible WAV output on GPU4, Open WebUI succeeds with the same backend, GPU reclamation is observed, and a post-TTS chat request succeeds. Any missing external, audio-quality, GPU-release, or chat-regression evidence must be reported as incomplete rather than inferred.
+The work is complete only when automated tests pass, the public authenticated API produces validated audible MP3 output on GPU4, Open WebUI succeeds with the same backend, GPU reclamation is observed, and a post-TTS chat request succeeds. Any missing external, audio-quality, GPU-release, or chat-regression evidence must be reported as incomplete rather than inferred.

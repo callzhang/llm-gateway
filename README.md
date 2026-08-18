@@ -263,9 +263,9 @@ curl --fail-with-body https://llm-api.preseen.ai/v1/audio/speech \
     "input": "你好，欢迎使用星尘语音服务。",
     "voice": "Vivian",
     "instructions": "温暖、自然、语速稍慢",
-    "response_format": "wav"
+    "response_format": "mp3"
   }' \
-  --output qwen3-tts.wav
+  --output qwen3-tts.mp3
 ```
 
 Supported preset voices are `Vivian`, `Serena`, `Uncle_Fu`, `Dylan`, `Eric`,
@@ -280,10 +280,10 @@ same LiteLLM endpoint, its existing scoped UI key, and `Vivian` as the default
 voice. The current UI sends its configured voice; use the API when a distinct
 `instructions` value is required for each synthesis request.
 
-LiteLLM 1.86.2 labels speech responses as `audio/mpeg` even when the selected
-backend returns a RIFF/WAV body. The generated file remains a valid 24 kHz WAV;
-the direct model_manager response correctly uses `audio/wav`. This is a response
-header limitation in the pinned LiteLLM proxy, not an audio conversion.
+Speech output is MP3-only. If `response_format` is omitted, model_manager adds
+`mp3`; explicit WAV, PCM, Opus, and FLAC requests are rejected before GPU
+allocation. vLLM-Omni performs the MP3 encoding natively, so no ffmpeg transcode
+layer is required, and LiteLLM's `audio/mpeg` response header matches the bytes.
 
 Operational checks:
 
