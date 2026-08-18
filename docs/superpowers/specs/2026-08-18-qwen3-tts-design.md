@@ -12,7 +12,7 @@ The first release exposes the model as `qwen3-tts-1.7b-customvoice` through:
 POST https://llm-api.preseen.ai/v1/audio/speech
 ```
 
-Supported request fields are `model`, `input`, `voice`, `instructions`, and `response_format`. Preset CustomVoice speakers and instruction-based speaking style are included. Voice cloning, uploaded reference audio, VoiceDesign, and Base checkpoints are excluded because the installed LiteLLM speech route does not reliably preserve Qwen3-TTS extension fields.
+Supported request fields are `model`, `input`, `voice`, `instructions`, and `response_format`. Preset CustomVoice speakers and instruction-based speaking style are the complete customization requirement for this release: callers choose one of the model's preset voices and use `instructions` to control emotion, pace, tone, and delivery. Creating a new timbre is not required. Voice cloning, uploaded reference audio, VoiceDesign, and Base checkpoints are excluded from scope.
 
 ## Architecture
 
