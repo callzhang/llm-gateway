@@ -11,4 +11,4 @@ export TTS_GATEWAY_HOST=127.0.0.1
 export TTS_GATEWAY_PORT=8910
 export TTS_GATEWAY_UPSTREAM_BASE_URL=http://127.0.0.1:8900
 
-exec "$SCRIPT_DIR/.venv/bin/python" -m tts_access_gateway
+exec "$SCRIPT_DIR/.venv-tts-access/bin/python" -m tts_access_gateway
