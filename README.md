@@ -247,7 +247,7 @@ Install the pinned runtime on the GPU host:
 ```bash
 python3.12 -m venv .venv-tts
 .venv-tts/bin/pip install --upgrade pip
-.venv-tts/bin/pip install "vllm-omni==0.26.0"
+.venv-tts/bin/pip install "vllm-omni==0.26.0" "vllm==0.26.0"
 .venv-tts/bin/python -c \
   'import importlib.metadata as m; print("vllm-omni", m.version("vllm-omni")); print("vllm", m.version("vllm"))'
 ```

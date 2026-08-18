@@ -181,7 +181,7 @@ class LauncherContractTests(unittest.TestCase):
             REPO_ROOT / "run_qwen3_tts_1_7b_customvoice.sh"
         ).read_text(encoding="utf-8")
 
-        self.assertIn(".venv-tts/bin/vllm", launcher)
+        self.assertIn(".venv-tts/bin/vllm-omni", launcher)
         self.assertIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", launcher)
         self.assertIn("CUDA_VISIBLE_DEVICES=${VLLM_CUDA_DEVICE:-0}", launcher)
         self.assertIn("--host 127.0.0.1", launcher)

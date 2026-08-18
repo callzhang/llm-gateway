@@ -8,7 +8,7 @@ export CUDA_VISIBLE_DEVICES=${VLLM_CUDA_DEVICE:-0}
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 export PATH="$CUDA_HOME/bin:$PATH"
 
-VLLM_BIN=${VLLM_TTS_BIN:-/home/derek/Projects/llm-gateway/.venv-tts/bin/vllm}
+VLLM_BIN=${VLLM_TTS_BIN:-/home/derek/Projects/llm-gateway/.venv-tts/bin/vllm-omni}
 DEPLOY_CONFIG=/home/derek/Projects/llm-gateway/configs/qwen3_tts.yaml
 
 HF_TOKEN_FILE=/home/stardust/.cache/huggingface/token
