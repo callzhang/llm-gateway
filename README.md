@@ -280,6 +280,11 @@ same LiteLLM endpoint, its existing scoped UI key, and `Vivian` as the default
 voice. The current UI sends its configured voice; use the API when a distinct
 `instructions` value is required for each synthesis request.
 
+LiteLLM 1.86.2 labels speech responses as `audio/mpeg` even when the selected
+backend returns a RIFF/WAV body. The generated file remains a valid 24 kHz WAV;
+the direct model_manager response correctly uses `audio/wav`. This is a response
+header limitation in the pinned LiteLLM proxy, not an audio conversion.
+
 Operational checks:
 
 ```bash
@@ -288,10 +293,19 @@ nvidia-smi
 journalctl --user -u llm-model-manager -u llm-litellm -u llm-open-webui -n 100
 ```
 
-Rollback by returning the repository to the pre-TTS commit and restarting
-model_manager, LiteLLM, and Open WebUI. The dedicated `.venv-tts` and downloaded
-weights can remain on disk: without the model registration and launcher they are
-inert and consume no GPU memory.
+GPU4's pre-TTS deployment commit is `e922645`. A recoverable rollback keeps the
+current branch intact and temporarily runs the services from that detached
+commit:
+
+```bash
+git switch --detach e922645
+systemctl --user restart llm-model-manager llm-litellm llm-open-webui
+```
+
+Return to the deployed branch with `git switch master` and restart the same
+units. The dedicated `.venv-tts` and downloaded weights can remain on disk:
+without the model registration and launcher they are inert and consume no GPU
+memory.
 
 ## Environment variables
 
