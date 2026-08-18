@@ -53,8 +53,8 @@ model_list:
 
   # ── Qwen3-TTS 1.7B CustomVoice (preset voices + instructions) ──────────
   # LiteLLM 1.86.2 was verified to preserve model, voice, instructions, and
-  # response_format for hosted_vllm speech calls. model_manager defaults it to
-  # MP3 and rejects non-MP3 output so LiteLLM's audio/mpeg header always matches.
+  # response_format for hosted_vllm speech calls. model_manager normalizes it to
+  # MP3 so LiteLLM's audio/mpeg header always matches the returned bytes.
   # No LiteLLM upgrade or VoiceDesign/Base route is required for this deployment.
   - model_name: qwen3-tts-1.7b-customvoice
     litellm_params:

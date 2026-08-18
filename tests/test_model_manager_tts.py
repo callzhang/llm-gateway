@@ -70,17 +70,23 @@ class SpeechRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(400, response.status)
         self.router._get_or_start.assert_not_awaited()
 
-    async def test_rejects_uncompressed_or_mismatched_formats_before_gpu_start(self):
-        self.router._get_or_start = AsyncMock()
-
-        for response_format in ("wav", "pcm", "opus", "flac"):
+    async def test_all_requested_formats_are_normalized_to_mp3(self):
+        for response_format in ("wav", "pcm", "opus", "flac", "mp3"):
             with self.subTest(response_format=response_format):
+                backend = SimpleNamespace(
+                    slot=SimpleNamespace(slot_id=0),
+                    _active_requests=0,
+                    proxy=AsyncMock(
+                        return_value=web.Response(
+                            body=b"ID3-test", content_type="audio/mpeg"
+                        )
+                    ),
+                )
+                self.router._get_or_start = AsyncMock(return_value=[backend])
                 response = await self._post(response_format=response_format)
-                self.assertEqual(400, response.status)
-                body = await response.json()
-                self.assertEqual("response_format", body["error"]["param"])
-
-        self.router._get_or_start.assert_not_awaited()
+                self.assertEqual(200, response.status)
+                forwarded_body = json.loads(backend.proxy.await_args.args[1])
+                self.assertEqual("mp3", forwarded_body["response_format"])
 
     async def test_missing_response_format_defaults_to_mp3_before_forwarding(self):
         backend = SimpleNamespace(

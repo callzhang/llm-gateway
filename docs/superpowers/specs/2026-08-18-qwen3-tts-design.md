@@ -12,7 +12,7 @@ The first release exposes the model as `qwen3-tts-1.7b-customvoice` through:
 POST https://llm-api.preseen.ai/v1/audio/speech
 ```
 
-Supported request fields are `model`, `input`, `voice`, `instructions`, and `response_format`. Output is MP3-only; an omitted format defaults to `mp3`, while WAV, PCM, and other formats are rejected before GPU allocation. Preset CustomVoice speakers and instruction-based speaking style are the complete customization requirement for this release: callers choose one of the model's preset voices and use `instructions` to control emotion, pace, tone, and delivery. Creating a new timbre is not required. Voice cloning, uploaded reference audio, VoiceDesign, and Base checkpoints are excluded from scope.
+Supported request fields are `model`, `input`, `voice`, `instructions`, and `response_format`. Output is MP3-only; an omitted or different requested format is normalized to `mp3` for backward compatibility, so the gateway never emits WAV or PCM. Preset CustomVoice speakers and instruction-based speaking style are the complete customization requirement for this release: callers choose one of the model's preset voices and use `instructions` to control emotion, pace, tone, and delivery. Creating a new timbre is not required. Voice cloning, uploaded reference audio, VoiceDesign, and Base checkpoints are excluded from scope.
 
 ## Architecture
 
@@ -52,7 +52,7 @@ The minimum accepted request is:
 }
 ```
 
-`instructions` is optional. The gateway normalizes a missing format to MP3, rejects non-MP3 output, retains the upstream `audio/mpeg` content type, and copies the binary body without JSON transformation. A configurable input-length limit protects the public endpoint from unbounded synthesis requests. Invalid models, formats, and oversized inputs return OpenAI-style JSON errors before backend scheduling. Voice validation remains authoritative in vLLM-Omni, and its structured error is forwarded through the gateway.
+`instructions` is optional. The gateway normalizes every requested format to MP3, retains the upstream `audio/mpeg` content type, and copies the binary body without JSON transformation. A configurable input-length limit protects the public endpoint from unbounded synthesis requests. Invalid models and oversized inputs return OpenAI-style JSON errors before backend scheduling. Voice validation remains authoritative in vLLM-Omni, and its structured error is forwarded through the gateway.
 
 ## Failure Handling and Observability
 

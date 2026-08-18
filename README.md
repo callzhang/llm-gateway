@@ -280,10 +280,11 @@ same LiteLLM endpoint, its existing scoped UI key, and `Vivian` as the default
 voice. The current UI sends its configured voice; use the API when a distinct
 `instructions` value is required for each synthesis request.
 
-Speech output is MP3-only. If `response_format` is omitted, model_manager adds
-`mp3`; explicit WAV, PCM, Opus, and FLAC requests are rejected before GPU
-allocation. vLLM-Omni performs the MP3 encoding natively, so no ffmpeg transcode
-layer is required, and LiteLLM's `audio/mpeg` response header matches the bytes.
+Speech output is MP3-only. model_manager normalizes an omitted or different
+`response_format` to `mp3`, so older clients that still request WAV continue to
+work but receive real MP3 bytes. vLLM-Omni performs the MP3 encoding natively,
+so no ffmpeg transcode layer is required, and LiteLLM's `audio/mpeg` response
+header matches the bytes.
 
 Operational checks:
 

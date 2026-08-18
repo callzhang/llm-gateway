@@ -2378,15 +2378,6 @@ class DynamicRouter:
                 f"'input' exceeds the {config.max_input_chars} character limit",
                 param="input",
             )
-        response_format = parsed_body.get("response_format")
-        if response_format is not None and (
-            not isinstance(response_format, str)
-            or response_format.lower() != "mp3"
-        ):
-            return self._invalid_request(
-                "Only 'mp3' is supported; WAV/PCM and other response formats are disabled",
-                param="response_format",
-            )
         return None
 
     # ── Adoption ───────────────────────────────────────────────────────────────
