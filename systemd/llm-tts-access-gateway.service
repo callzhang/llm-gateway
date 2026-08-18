@@ -1,0 +1,19 @@
+[Unit]
+Description=LLM Gateway — Cloudflare Access TTS identity bridge (127.0.0.1:8910)
+After=llm-litellm.service
+PartOf=llm-gateway.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/derek/Projects/llm-gateway
+EnvironmentFile=-/home/derek/Projects/llm-gateway/gateway.env
+ExecStart=/home/derek/Projects/llm-gateway/run_tts_access_gateway.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=30
+TimeoutStopSec=15
+StandardOutput=append:/home/derek/Projects/llm-gateway/logs/tts_access_gateway.log
+StandardError=append:/home/derek/Projects/llm-gateway/logs/tts_access_gateway.log
+
+[Install]
+WantedBy=llm-gateway.target

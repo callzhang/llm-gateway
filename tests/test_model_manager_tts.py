@@ -288,5 +288,27 @@ class LiteLlmConfigTests(unittest.TestCase):
         self.assertIn("export AUDIO_TTS_VOICE=Vivian", launcher)
 
 
+class AccessServiceContractTests(unittest.TestCase):
+    def test_gateway_target_and_installer_include_access_gateway(self):
+        target = (REPO_ROOT / "systemd/llm-gateway.target").read_text(
+            encoding="utf-8"
+        )
+        installer = (REPO_ROOT / "systemd/install.sh").read_text(encoding="utf-8")
+
+        self.assertIn("llm-tts-access-gateway.service", target)
+        self.assertIn("llm-tts-access-gateway.service", installer)
+
+    def test_open_webui_trusts_only_cloudflare_identity_header(self):
+        launcher = (REPO_ROOT / "run_open_webui.sh").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "WEBUI_AUTH_TRUSTED_EMAIL_HEADER=Cf-Access-Authenticated-User-Email",
+            launcher,
+        )
+        self.assertIn("export ENABLE_SIGNUP=False", launcher)
+        self.assertIn("export ENABLE_LOGIN_FORM=False", launcher)
+        self.assertIn("export ENABLE_PASSWORD_AUTH=False", launcher)
+
+
 if __name__ == "__main__":
     unittest.main()
