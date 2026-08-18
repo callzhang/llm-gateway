@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
+import yaml
 
 import model_manager
 
@@ -202,6 +203,44 @@ class LauncherContractTests(unittest.TestCase):
             deploy_config,
             r"stage_id: 1[\s\S]*?max_num_seqs: 1(?:\D|$)",
         )
+
+
+class LiteLlmConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.config = yaml.safe_load(
+            (REPO_ROOT / "config.yaml").read_text(encoding="utf-8")
+        )
+
+    def test_tts_uses_existing_gateway_and_hosted_vllm_speech_provider(self):
+        matches = [
+            item for item in self.config["model_list"]
+            if item["model_name"] == MODEL_NAME
+        ]
+        self.assertEqual(1, len(matches))
+        params = matches[0]["litellm_params"]
+        self.assertEqual(f"hosted_vllm/{MODEL_NAME}", params["model"])
+        self.assertEqual("http://127.0.0.1:8002/v1", params["api_base"])
+        self.assertEqual("local-qwen36", params["api_key"])
+        self.assertEqual(600, params["timeout"])
+
+    def test_voice_design_and_clone_models_are_not_exposed(self):
+        names = {item["model_name"].lower() for item in self.config["model_list"]}
+        self.assertFalse(any("voicedesign" in name for name in names))
+        self.assertNotIn("qwen3-tts-1.7b-base", names)
+
+    def test_open_webui_tts_uses_litellm_and_scoped_key(self):
+        launcher = (REPO_ROOT / "run_open_webui.sh").read_text(encoding="utf-8")
+
+        self.assertIn("export AUDIO_TTS_ENGINE=openai", launcher)
+        self.assertIn(
+            'export AUDIO_TTS_OPENAI_API_BASE_URL="http://127.0.0.1:8900/v1"',
+            launcher,
+        )
+        self.assertIn(
+            'export AUDIO_TTS_OPENAI_API_KEY="$OPENWEBUI_LLM_KEY"', launcher
+        )
+        self.assertIn(f"export AUDIO_TTS_MODEL={MODEL_NAME}", launcher)
+        self.assertIn("export AUDIO_TTS_VOICE=Vivian", launcher)
 
 
 if __name__ == "__main__":

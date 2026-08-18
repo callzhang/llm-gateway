@@ -10,6 +10,15 @@ export OPENAI_API_BASE_URL="http://127.0.0.1:8900/v1"
 : "${OPENWEBUI_LLM_KEY:?set OPENWEBUI_LLM_KEY in gateway.env (scoped virtual key)}"
 export OPENAI_API_KEY="$OPENWEBUI_LLM_KEY"
 
+# ── Text-to-speech: Qwen3-TTS through the same authenticated LiteLLM ──────────
+# Open WebUI's audio subsystem has a separate OpenAI-compatible connection.
+# Reuse its scoped virtual key; never give the UI LiteLLM's master key.
+export AUDIO_TTS_ENGINE=openai
+export AUDIO_TTS_OPENAI_API_BASE_URL="http://127.0.0.1:8900/v1"
+export AUDIO_TTS_OPENAI_API_KEY="$OPENWEBUI_LLM_KEY"
+export AUDIO_TTS_MODEL=qwen3-tts-1.7b-customvoice
+export AUDIO_TTS_VOICE=Vivian
+
 # ── Disable Ollama probing (no Ollama running) ────────────────────────────────
 export ENABLE_OLLAMA_API=False
 

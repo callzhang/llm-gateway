@@ -51,6 +51,17 @@ model_list:
     model_info:
       max_context_window_tokens: 65536
 
+  # ── Qwen3-TTS 1.7B CustomVoice (preset voices + instructions) ──────────
+  # LiteLLM 1.86.2 was verified to preserve model, voice, instructions, and
+  # response_format for hosted_vllm speech calls.  No LiteLLM upgrade or
+  # VoiceDesign/Base voice-cloning route is required for this deployment.
+  - model_name: qwen3-tts-1.7b-customvoice
+    litellm_params:
+      model: hosted_vllm/qwen3-tts-1.7b-customvoice
+      api_base: http://127.0.0.1:8002/v1
+      api_key: local-qwen36
+      timeout: 600
+
   # No external fallback by design — every model is served locally through
   # model_manager.  The old gpt-5.4-mini / api.kksj.org entry was removed along
   # with its OPENAI_API_KEY plumbing; the key was invalid (401) and a fallback

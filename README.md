@@ -231,9 +231,67 @@ cp systemd/llm-model-manager.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now llm-model-manager
 
-# LiteLLM proxy (reads config.yaml, listens on :8901)
-litellm --config config.yaml --port 8901
+# LiteLLM proxy (reads config.yaml, listens on :8900)
+litellm --config config.yaml --port 8900
 ```
+
+## Qwen3-TTS CustomVoice
+
+The speech endpoint uses `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` through a
+dedicated vLLM-Omni environment. It shares the same GPU slots, cold-start,
+idle-unload, LiteLLM virtual-key authentication, and public gateway as the chat
+models; it does not modify the chat `.venv` or require a LiteLLM upgrade.
+
+Install the pinned runtime on the GPU host:
+
+```bash
+python3.12 -m venv .venv-tts
+.venv-tts/bin/pip install --upgrade pip
+.venv-tts/bin/pip install "vllm-omni==0.26.0"
+.venv-tts/bin/python -c \
+  'import importlib.metadata as m; print("vllm-omni", m.version("vllm-omni")); print("vllm", m.version("vllm"))'
+```
+
+Call the authenticated public API with an existing LiteLLM virtual key:
+
+```bash
+curl --fail-with-body https://llm-api.preseen.ai/v1/audio/speech \
+  -H "Authorization: Bearer $LITELLM_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-tts-1.7b-customvoice",
+    "input": "你好，欢迎使用星尘语音服务。",
+    "voice": "Vivian",
+    "instructions": "温暖、自然、语速稍慢",
+    "response_format": "wav"
+  }' \
+  --output qwen3-tts.wav
+```
+
+Supported preset voices are `Vivian`, `Serena`, `Uncle_Fu`, `Dylan`, `Eric`,
+`Ryan`, `Aiden`, `Ono_Anna`, and `Sohee`. The 1.7B CustomVoice checkpoint
+supports instruction-based control of tone, emotion, and pacing. VoiceDesign,
+reference-audio cloning, uploaded voices, and user-created speakers are not
+enabled. `input` is capped at 3000 characters by default; override with
+`QWEN3_TTS_MAX_INPUT_CHARS` on model_manager.
+
+Open WebUI's read-aloud action is configured in `run_open_webui.sh` to use this
+same LiteLLM endpoint, its existing scoped UI key, and `Vivian` as the default
+voice. The current UI sends its configured voice; use the API when a distinct
+`instructions` value is required for each synthesis request.
+
+Operational checks:
+
+```bash
+curl -sS http://127.0.0.1:8002/admin/status
+nvidia-smi
+journalctl --user -u llm-model-manager -u llm-litellm -u llm-open-webui -n 100
+```
+
+Rollback by returning the repository to the pre-TTS commit and restarting
+model_manager, LiteLLM, and Open WebUI. The dedicated `.venv-tts` and downloaded
+weights can remain on disk: without the model registration and launcher they are
+inert and consume no GPU memory.
 
 ## Environment variables
 
