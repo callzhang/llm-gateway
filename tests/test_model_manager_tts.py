@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -12,6 +13,7 @@ import model_manager
 
 
 MODEL_NAME = "qwen3-tts-1.7b-customvoice"
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class SpeechRoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -170,6 +172,36 @@ class TtsRegistrationTests(unittest.TestCase):
     def test_input_limit_is_configurable(self):
         with patch.dict(os.environ, {"QWEN3_TTS_MAX_INPUT_CHARS": "4321"}):
             self.assertEqual(4321, model_manager._tts_max_input_chars())
+
+
+class LauncherContractTests(unittest.TestCase):
+    def test_launcher_uses_dedicated_pinned_runtime_and_dynamic_slot(self):
+        launcher = (
+            REPO_ROOT / "run_qwen3_tts_1_7b_customvoice.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(".venv-tts/bin/vllm", launcher)
+        self.assertIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", launcher)
+        self.assertIn("CUDA_VISIBLE_DEVICES=${VLLM_CUDA_DEVICE:-0}", launcher)
+        self.assertIn("--host 127.0.0.1", launcher)
+        self.assertIn("--port ${VLLM_PORT:-9000}", launcher)
+        self.assertIn("--served-model-name qwen3-tts-1.7b-customvoice", launcher)
+        self.assertIn("--deploy-config", launcher)
+        self.assertIn("configs/qwen3_tts.yaml", launcher)
+        self.assertIn("--omni", launcher)
+
+    def test_deploy_config_keeps_both_stages_on_remapped_single_gpu(self):
+        deploy_config = (REPO_ROOT / "configs/qwen3_tts.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(2, deploy_config.count("stage_id:"))
+        self.assertEqual(2, deploy_config.count('devices: "0"'))
+        self.assertEqual(2, deploy_config.count("gpu_memory_utilization: 0.3"))
+        self.assertRegex(
+            deploy_config,
+            r"stage_id: 1[\s\S]*?max_num_seqs: 1(?:\D|$)",
+        )
 
 
 if __name__ == "__main__":
