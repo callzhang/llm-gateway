@@ -37,6 +37,8 @@ import signal
 import subprocess
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Literal
 
 import aiohttp
 from aiohttp import web
@@ -261,7 +263,8 @@ def _find_pid_on_port(port: int) -> int | None:
 
 
 def _find_vllm_pid_for_port(port: int) -> int | None:
-    """Find a `vllm serve` process targeting this port, whether the port is
+    """Find a `vllm serve` or `vllm-omni serve` process targeting this port,
+    whether the port is
     bound yet or not.  Lets adoption recognise vLLM instances that are still
     cold-starting (model load takes ~30-60s; the API port is not bound until
     then).  Prefers the listening PID if present, else falls back to pgrep
@@ -270,7 +273,7 @@ def _find_vllm_pid_for_port(port: int) -> int | None:
         return pid
     try:
         result = subprocess.run(
-            ["pgrep", "-f", f"vllm serve.* --port {port}( |$)"],
+            ["pgrep", "-f", f"vllm(-omni)? serve.* --port {port}( |$)"],
             capture_output=True, text=True, timeout=2,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -295,10 +298,25 @@ def _read_served_model_name(pid: int) -> str | None:
             return args[i + 1].decode("utf-8", errors="ignore")
     return None
 
-# Model configs: model_name → (startup_script, served_model_name, allowed_gpu_ids)
-#
-# allowed_gpu_ids: set of GPU IDs this model is permitted to run on.
-#   None  = no restriction (model works on any GPU in the pool).
+@dataclass(frozen=True)
+class ModelConfig:
+    """Runtime and request contract for one dynamically scheduled model."""
+
+    script: str
+    served_name: str
+    allowed_gpu_ids: set[int] | None = None
+    request_kind: Literal["chat", "speech"] = "chat"
+    max_input_chars: int | None = None
+
+
+def _tts_max_input_chars() -> int:
+    value = int(os.environ.get("QWEN3_TTS_MAX_INPUT_CHARS", "3000"))
+    if value <= 0:
+        raise ValueError("QWEN3_TTS_MAX_INPUT_CHARS must be greater than zero")
+    return value
+
+
+# Model configs. allowed_gpu_ids=None means the model may run on any GPU slot.
 #
 # 35B-A3B used to be pinned to GPU 1 because the embedding-provider on GPU 0
 # took ~2.5–3.5 GiB, leaving only ~28.5 GiB free vs the 29.16 GiB needed for
@@ -308,10 +326,22 @@ def _read_served_model_name(pid: int) -> str | None:
 #
 # The startup script receives VLLM_CUDA_DEVICE and VLLM_PORT from model_manager
 # at spawn time.
-MODEL_CONFIGS: dict[str, tuple[str, str, "set[int] | None"]] = {
-    "qwen3.6-35b-a3b":         ("run_qwen36_35b.sh",         "qwen3.6-35b-a3b",         None),
-    "qwen3.6-35b-a3b-heretic": ("run_qwen36_35b_heretic.sh", "qwen3.6-35b-a3b-heretic", None),
-    "qwen3.6-27b":             ("run_qwen36_27b.sh",         "qwen3.6-27b",             None),
+MODEL_CONFIGS: dict[str, ModelConfig] = {
+    "qwen3.6-35b-a3b": ModelConfig(
+        "run_qwen36_35b.sh", "qwen3.6-35b-a3b"
+    ),
+    "qwen3.6-35b-a3b-heretic": ModelConfig(
+        "run_qwen36_35b_heretic.sh", "qwen3.6-35b-a3b-heretic"
+    ),
+    "qwen3.6-27b": ModelConfig(
+        "run_qwen36_27b.sh", "qwen3.6-27b"
+    ),
+    "qwen3-tts-1.7b-customvoice": ModelConfig(
+        "run_qwen3_tts_1_7b_customvoice.sh",
+        "qwen3-tts-1.7b-customvoice",
+        request_kind="speech",
+        max_input_chars=_tts_max_input_chars(),
+    ),
 }
 
 # Minimum free GPU memory (GiB, from nvidia-smi) required to start a model.
@@ -1531,7 +1561,7 @@ class DynamicRouter:
     # (e.g. not enough free VRAM because another process is on that GPU).
     SCALE_OUT_COOLDOWN = 600  # 10 minutes — back off longer after a failed scale-out
 
-    def __init__(self, slots: list[GpuSlot], model_configs: dict[str, tuple[str, str, "set[int] | None"]]):
+    def __init__(self, slots: list[GpuSlot], model_configs: dict[str, ModelConfig]):
         self.slots         = slots
         self.model_configs = model_configs
         self.log           = logging.getLogger("mgr.router")
@@ -1614,11 +1644,10 @@ class DynamicRouter:
     def _allowed_gpus(self, model_name: str) -> "set[int] | None":
         """GPU IDs this model may occupy, or None if unconstrained.
 
-        Derived from the 3rd element of each MODEL_CONFIGS entry.  A None
-        return means the model can run on any GPU in the slot pool.
+        A None return means the model can run on any GPU in the slot pool.
         """
         cfg = self.model_configs.get(model_name)
-        return cfg[2] if cfg is not None else None
+        return cfg.allowed_gpu_ids if cfg is not None else None
 
     # ── Admin / dashboard ──────────────────────────────────────────────────────
 
@@ -1705,8 +1734,8 @@ class DynamicRouter:
                 self._admin_msg[slot_id] = (
                     f"{model_name} not allowed on GPU {slot.gpu_id}")
                 return
-            script, served, _ = self.model_configs[model_name]
-            b = GpuBackend(model_name, script, served, slot)
+            config = self.model_configs[model_name]
+            b = GpuBackend(model_name, config.script, config.served_name, slot)
             b.router = self
             slot.backend = b           # CLAIM
             await b.start()            # init session + watchdog
@@ -1778,8 +1807,10 @@ class DynamicRouter:
                         f"Retry after {IDLE_TIMEOUT}s idle."
                     )
                 slot   = self._by_free_vram(compatible)[0]
-                script, served, _ = self.model_configs[model_name]
-                b      = GpuBackend(model_name, script, served, slot)
+                config = self.model_configs[model_name]
+                b      = GpuBackend(
+                    model_name, config.script, config.served_name, slot
+                )
                 b.router = self
                 slot.backend = b          # CLAIM — blocks other models from this slot
                 await b.start()           # init session + idle watchdog
@@ -1942,8 +1973,10 @@ class DynamicRouter:
                 free = [victim_slot]
 
             slot   = self._by_free_vram(free)[0]
-            script, served, _ = self.model_configs[model_name]
-            new_b  = GpuBackend(model_name, script, served, slot)
+            config = self.model_configs[model_name]
+            new_b  = GpuBackend(
+                model_name, config.script, config.served_name, slot
+            )
             new_b.router = self
             slot.backend = new_b
             await new_b.start()
@@ -2133,6 +2166,15 @@ class DynamicRouter:
                 }}),
             )
 
+        try:
+            parsed_body = json.loads(body)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            parsed_body = None
+        config = self.model_configs[model_name]
+        invalid = self._validate_model_request(request, parsed_body, config)
+        if invalid is not None:
+            return invalid
+
         # Probe / latency-check detection (e.g. LiteLLM latency-based-routing).
         # Rule: only test models that are already loaded.
         #   • Model loaded  → let the request through for real latency measurement.
@@ -2140,9 +2182,10 @@ class DynamicRouter:
         #     LiteLLM treats the 503 as "high latency / unavailable" and avoids
         #     routing to this model until it comes up naturally via a real request.
         try:
-            parsed_body = json.loads(body)
             is_probe = (
-                parsed_body.get("max_tokens", 9999) <= 1
+                config.request_kind == "chat"
+                and isinstance(parsed_body, dict)
+                and parsed_body.get("max_tokens", 9999) <= 1
                 and not parsed_body.get("messages", [{}])[-1].get("content", "").strip()
             )
             if is_probe:
@@ -2166,20 +2209,28 @@ class DynamicRouter:
         # Sticky routing metadata is backend-independent — parse it once, before
         # the retry loop below.  x-task-id pins all turns of one task to the same
         # vLLM slot for prefix cache reuse; falls back to least-connections.
-        try:
-            parsed_body_for_sticky = json.loads(body) if body else None
-        except Exception:
-            parsed_body_for_sticky = None
-        sticky_slot, sticky_reason = _sticky_slot_for(parsed_body_for_sticky, request.headers)
-        task_id = _extract_task_id(parsed_body_for_sticky, request.headers)
-        # Approximate prompt size (sum of message-content chars) so the pipeline
-        # team can grep-by-task and see whether multi-turn history is growing.
-        msgs = (parsed_body_for_sticky or {}).get("messages", []) or []
-        approx_chars = sum(
-            len(m.get("content", "")) if isinstance(m.get("content"), str)
-            else sum(len(p.get("text", "") or "") for p in (m.get("content") or []) if isinstance(p, dict))
-            for m in msgs if isinstance(m, dict)
-        )
+        parsed_body_for_sticky = parsed_body if isinstance(parsed_body, dict) else None
+        if config.request_kind == "speech":
+            sticky_slot = None
+            task_id = None
+            msgs = []
+            approx_chars = len(parsed_body_for_sticky["input"])
+        else:
+            sticky_slot, _sticky_reason = _sticky_slot_for(
+                parsed_body_for_sticky, request.headers
+            )
+            task_id = _extract_task_id(parsed_body_for_sticky, request.headers)
+            # Approximate prompt size (sum of message-content chars) so the
+            # pipeline team can grep-by-task and see whether history is growing.
+            msgs = (parsed_body_for_sticky or {}).get("messages", []) or []
+            approx_chars = sum(
+                len(m.get("content", "")) if isinstance(m.get("content"), str)
+                else sum(
+                    len(p.get("text", "") or "")
+                    for p in (m.get("content") or []) if isinstance(p, dict)
+                )
+                for m in msgs if isinstance(m, dict)
+            )
 
         # A backend can vanish BEFORE it streams a single byte — a crash-recycle
         # SIGKILL or a reload racing this in-flight request.  That surfaces as
@@ -2218,7 +2269,17 @@ class DynamicRouter:
 
             # Record affinity + log routing (only the first attempt for the
             # no-task path, to avoid duplicate lines on a transparent retry).
-            if task_id:
+            if config.request_kind == "speech" and attempt == 0:
+                instructions = parsed_body_for_sticky.get("instructions")
+                instructions_chars = (
+                    len(instructions) if isinstance(instructions, str) else 0
+                )
+                self.log.info(
+                    f"Speech request: model={model_name} → slot "
+                    f"{backend.slot.slot_id} (input_chars={approx_chars}, "
+                    f"instructions_chars={instructions_chars})"
+                )
+            elif task_id:
                 hit_status = "hit" if sticky_backend is not None else "fresh"
                 retry_note = "" if attempt == 0 else f" (retry {attempt})"
                 self.log.info(
@@ -2267,6 +2328,46 @@ class DynamicRouter:
         except (json.JSONDecodeError, AttributeError):
             return None
 
+    @staticmethod
+    def _invalid_request(message: str, param: str | None = None) -> web.Response:
+        error = {"message": message, "type": "invalid_request_error"}
+        if param is not None:
+            error["param"] = param
+        return web.Response(
+            status=400,
+            content_type="application/json",
+            body=json.dumps({"error": error}),
+        )
+
+    def _validate_model_request(
+        self,
+        request: web.Request,
+        parsed_body: object,
+        config: ModelConfig,
+    ) -> web.Response | None:
+        if config.request_kind != "speech":
+            return None
+        if request.method != "POST" or request.path != "/v1/audio/speech":
+            return self._invalid_request(
+                "Speech models are only available through POST /v1/audio/speech"
+            )
+        if not isinstance(parsed_body, dict):
+            return self._invalid_request("Request body must be a JSON object")
+        input_text = parsed_body.get("input")
+        if not isinstance(input_text, str) or not input_text.strip():
+            return self._invalid_request(
+                "'input' must be a non-empty string", param="input"
+            )
+        if (
+            config.max_input_chars is not None
+            and len(input_text) > config.max_input_chars
+        ):
+            return self._invalid_request(
+                f"'input' exceeds the {config.max_input_chars} character limit",
+                param="input",
+            )
+        return None
+
     # ── Adoption ───────────────────────────────────────────────────────────────
 
     ADOPT_BOOT_WAIT = 5     # max seconds to wait for a booting vLLM to expose /v1/models
@@ -2306,8 +2407,8 @@ class DynamicRouter:
             )
             return
         match = next(
-            ((mn, script, served) for mn, (script, served, _allowed)
-             in self.model_configs.items() if served == served_name),
+            ((mn, config) for mn, config in self.model_configs.items()
+             if config.served_name == served_name),
             None,
         )
         if not match:
@@ -2316,7 +2417,7 @@ class DynamicRouter:
                 f"not in MODEL_CONFIGS — skipping"
             )
             return
-        model_name, script, _ = match
+        model_name, config = match
         self.log.info(
             f"Slot {slot.slot_id}: found vLLM pid={pid} serving {served_name}, "
             f"waiting for /health (up to {self.ADOPT_BOOT_WAIT}s)"
@@ -2348,7 +2449,7 @@ class DynamicRouter:
                 f"within {self.ADOPT_BOOT_WAIT}s — skipping"
             )
             return
-        b = GpuBackend(model_name, script, served_name, slot)
+        b = GpuBackend(model_name, config.script, served_name, slot)
         b.router = self
         await b.start()                # init session + idle watchdog
         b._adopted_pid = pid

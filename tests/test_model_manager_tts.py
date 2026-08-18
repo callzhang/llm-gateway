@@ -1,0 +1,176 @@
+import asyncio
+import json
+import os
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from aiohttp import ClientSession, web
+from aiohttp.test_utils import TestClient, TestServer
+
+import model_manager
+
+
+MODEL_NAME = "qwen3-tts-1.7b-customvoice"
+
+
+class SpeechRoutingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.config = model_manager.ModelConfig(
+            script="run_qwen3_tts_1_7b_customvoice.sh",
+            served_name=MODEL_NAME,
+            allowed_gpu_ids=None,
+            request_kind="speech",
+            max_input_chars=12,
+        )
+        self.router = model_manager.DynamicRouter(
+            [model_manager.GpuSlot(0, 0, 9000)],
+            {MODEL_NAME: self.config},
+        )
+
+    async def asyncSetUp(self):
+        self.app = web.Application()
+        self.app.router.add_route("*", "/{path_info:.*}", self.router.handle)
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+
+    async def _post(self, path="/v1/audio/speech", **overrides):
+        payload = {
+            "model": MODEL_NAME,
+            "input": "你好",
+            "voice": "Vivian",
+            "instructions": "温暖、自然",
+            "response_format": "wav",
+        }
+        payload.update(overrides)
+        return await self.client.post(path, json=payload)
+
+    async def test_rejects_missing_blank_and_over_limit_input_before_gpu_start(self):
+        self.router._get_or_start = AsyncMock()
+
+        for value in (None, "", "   ", "十三个字符的输入文本超过限制"):
+            with self.subTest(value=value):
+                response = await self._post(input=value)
+                self.assertEqual(400, response.status)
+                body = await response.json()
+                self.assertEqual("invalid_request_error", body["error"]["type"])
+
+        self.router._get_or_start.assert_not_awaited()
+
+    async def test_rejects_speech_model_on_non_speech_route_before_gpu_start(self):
+        self.router._get_or_start = AsyncMock()
+        response = await self._post(path="/v1/chat/completions")
+
+        self.assertEqual(400, response.status)
+        self.router._get_or_start.assert_not_awaited()
+
+    async def test_valid_request_reaches_backend_without_logging_text(self):
+        audio = b"RIFF-test-wave"
+        slot = SimpleNamespace(slot_id=0)
+        backend = SimpleNamespace(
+            slot=slot,
+            _active_requests=0,
+            proxy=AsyncMock(return_value=web.Response(body=audio, content_type="audio/wav")),
+        )
+        self.router._get_or_start = AsyncMock(return_value=[backend])
+
+        with self.assertLogs("mgr.router", level="INFO") as captured:
+            response = await self._post()
+            body = await response.read()
+
+        self.assertEqual(200, response.status)
+        self.assertEqual(audio, body)
+        self.assertEqual("audio/wav", response.headers["Content-Type"])
+        log_text = "\n".join(captured.output)
+        self.assertNotIn("你好", log_text)
+        self.assertNotIn("温暖、自然", log_text)
+        self.assertIn("input_chars=2", log_text)
+
+
+class BinaryForwardingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.audio = b"RIFF\x00\x01\xffWAVEbinary"
+
+        async def speech(_request):
+            return web.Response(body=self.audio, content_type="audio/wav")
+
+        upstream_app = web.Application()
+        upstream_app.router.add_post("/v1/audio/speech", speech)
+        self.upstream = TestServer(upstream_app)
+        await self.upstream.start_server()
+
+        slot = model_manager.GpuSlot(0, 0, self.upstream.port)
+        self.backend = model_manager.GpuBackend(
+            MODEL_NAME,
+            "run_qwen3_tts_1_7b_customvoice.sh",
+            MODEL_NAME,
+            slot,
+        )
+        self.backend._session = ClientSession()
+
+        async def proxy(request):
+            return await self.backend._forward(request, await request.read())
+
+        proxy_app = web.Application()
+        proxy_app.router.add_post("/v1/audio/speech", proxy)
+        self.client = TestClient(TestServer(proxy_app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        await self.backend._session.close()
+        await self.upstream.close()
+
+    async def test_forwards_wav_content_type_and_exact_binary_body(self):
+        response = await self.client.post(
+            "/v1/audio/speech",
+            json={"model": MODEL_NAME, "input": "你好", "voice": "Vivian"},
+        )
+
+        self.assertEqual(200, response.status)
+        self.assertEqual("audio/wav", response.headers["Content-Type"])
+        self.assertEqual(self.audio, await response.read())
+
+
+class SpeechLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_active_request_is_held_until_stream_finishes(self):
+        backend = model_manager.GpuBackend(
+            MODEL_NAME,
+            "run_qwen3_tts_1_7b_customvoice.sh",
+            MODEL_NAME,
+            model_manager.GpuSlot(0, 0, 9000),
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_forward(_request, _body):
+            entered.set()
+            await release.wait()
+            return web.Response(body=b"done")
+
+        with patch.object(backend, "_forward", side_effect=blocked_forward):
+            task = asyncio.create_task(backend.proxy(None, b""))
+            await entered.wait()
+            self.assertEqual(1, backend._active_requests)
+            release.set()
+            await task
+
+        self.assertEqual(0, backend._active_requests)
+
+
+class TtsRegistrationTests(unittest.TestCase):
+    def test_customvoice_model_is_registered_as_speech(self):
+        config = model_manager.MODEL_CONFIGS[MODEL_NAME]
+        self.assertEqual("speech", config.request_kind)
+        self.assertGreater(config.max_input_chars, 0)
+
+    def test_input_limit_is_configurable(self):
+        with patch.dict(os.environ, {"QWEN3_TTS_MAX_INPUT_CHARS": "4321"}):
+            self.assertEqual(4321, model_manager._tts_max_input_chars())
+
+
+if __name__ == "__main__":
+    unittest.main()
