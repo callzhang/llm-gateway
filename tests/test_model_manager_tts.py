@@ -174,6 +174,9 @@ class TtsRegistrationTests(unittest.TestCase):
         with patch.dict(os.environ, {"QWEN3_TTS_MAX_INPUT_CHARS": "4321"}):
             self.assertEqual(4321, model_manager._tts_max_input_chars())
 
+    def test_tts_requires_measured_free_vram_before_start(self):
+        self.assertEqual(30.3, model_manager.MODEL_MIN_FREE_GIB[MODEL_NAME])
+
 
 class LauncherContractTests(unittest.TestCase):
     def test_launcher_uses_dedicated_pinned_runtime_and_dynamic_slot(self):

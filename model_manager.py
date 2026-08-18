@@ -364,6 +364,10 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
     "qwen3.6-35b-a3b": 27.0,
     "qwen3.6-35b-a3b-heretic": 27.0,  # same floor as stock 35b
     "qwen3.6-27b":     27.5,  # 0.84 × 32 GiB ≈ 26.9 + 0.6 GiB buffer
+    # Measured on an RTX 5090: the two-stage vLLM-Omni process settles at
+    # ~29.3 GiB after Code2Wav CUDA-graph capture.  Require another 1 GiB so a
+    # partially occupied card is rejected before launch instead of failing OOM.
+    "qwen3-tts-1.7b-customvoice": 30.3,
 }
 
 # Per-model preferred (maximum) gpu_memory_utilization — mirrors the run scripts.
