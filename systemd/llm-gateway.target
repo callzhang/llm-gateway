@@ -1,5 +1,5 @@
 [Unit]
-Description=LLM Gateway — full stack (model-manager · litellm · open-webui)
+Description=LLM Gateway — full stack (model-manager · litellm · TTS access · open-webui)
 # Pulls in the whole stack. Each service is PartOf= this target, so
 # start/stop/restart on the target propagates to all of them, while each
 # service keeps its own supervision (Restart=) and its own log file.
@@ -9,8 +9,8 @@ Description=LLM Gateway — full stack (model-manager · litellm · open-webui)
 # every preseen.ai origin — see ~/Projects/preseen-ai-gateway (system service
 # `cloudflared.service`). Open WebUI still only binds 127.0.0.1:8080; the
 # gateway tunnel reaches it over loopback.
-Wants=llm-model-manager.service llm-litellm.service llm-open-webui.service
-After=llm-model-manager.service llm-litellm.service llm-open-webui.service
+Wants=llm-model-manager.service llm-litellm.service llm-tts-access-gateway.service llm-open-webui.service
+After=llm-model-manager.service llm-litellm.service llm-tts-access-gateway.service llm-open-webui.service
 
 [Install]
 WantedBy=default.target

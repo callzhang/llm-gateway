@@ -30,28 +30,16 @@ export DATA_DIR="$SCRIPT_DIR/open-webui-data"
 # Open WebUI uses SQLite by default; unset to prevent it picking up Postgres URL
 unset DATABASE_URL
 
-# ── Auth: require login; disable open signup after first admin registers ──────
+# ── Auth: Cloudflare Access is the only identity boundary ────────────────────
 export WEBUI_AUTH=True
-
-# ── Company-domain allowlist for self-signup (enforced by LOCAL PATCH in ──────
-#    open_webui/routers/auths.py). Only these email domains may register;
-#    the very first user (initial admin) is exempt. Comma-separated.
-export SIGNUP_ALLOWED_EMAIL_DOMAINS="stardust.ai"
-# New self-signup users become active immediately (no admin approval step).
+# The origin is loopback-only. Cloudflare Access authenticates @stardust.ai and
+# injects this header; Open WebUI creates/maps the corresponding local account.
+export WEBUI_AUTH_TRUSTED_EMAIL_HEADER=Cf-Access-Authenticated-User-Email
+export WEBUI_AUTH_TRUSTED_NAME_HEADER=Cf-Access-Authenticated-User-Email
 export DEFAULT_USER_ROLE=user
-# That allowlist lives in .venv-owui/ — pip-managed and gitignored — so any
-# `pip install -U open-webui` overwrites auths.py and silently reopens public
-# signup on llm.preseen.ai.  Re-assert the patch on every start, and FAIL
-# CLOSED: if it cannot be verified in place, serve with signup off rather than
-# with an unguarded registration form.  Existing users keep working either way.
-if "$SCRIPT_DIR/.venv-owui/bin/python" "$SCRIPT_DIR/scripts/ensure_owui_signup_patch.py"; then
-    export ENABLE_SIGNUP=True
-else
-    echo "[run_open_webui] !! signup domain allowlist could NOT be verified" >&2
-    echo "[run_open_webui] !! disabling signup (fail-closed); existing logins unaffected" >&2
-    echo "[run_open_webui] !! re-derive the anchor in scripts/ensure_owui_signup_patch.py" >&2
-    export ENABLE_SIGNUP=False
-fi
+export ENABLE_SIGNUP=False
+export ENABLE_LOGIN_FORM=False
+export ENABLE_PASSWORD_AUTH=False
 
 # ── RAG embeddings: Jina embedding service (OpenAI-compatible) ────────────────
 # Open WebUI's RAG embedding uses its OWN OpenAI endpoint (RAG_OPENAI_API_*),

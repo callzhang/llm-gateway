@@ -10,6 +10,7 @@ SERVICES=(
   llm-jit-warmup.service
   llm-model-manager.service
   llm-litellm.service
+  llm-tts-access-gateway.service
   llm-open-webui.service
 )
 # NOTE: the public Cloudflare tunnel was moved out of this stack into a single
