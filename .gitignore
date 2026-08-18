@@ -14,5 +14,6 @@ cloudflared.env
 # Timestamped local backups (config.yaml.bak-YYYYMMDD-HHMM etc.)
 *.bak-*
 .claude/
+.worktrees/
 open-webui-data/
 .webui_secret_key
