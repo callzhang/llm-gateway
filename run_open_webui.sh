@@ -30,16 +30,30 @@ export DATA_DIR="$SCRIPT_DIR/open-webui-data"
 # Open WebUI uses SQLite by default; unset to prevent it picking up Postgres URL
 unset DATABASE_URL
 
-# ── Auth: Cloudflare Access is the only identity boundary ────────────────────
+# ── Auth: switch to Cloudflare identity only after Access readback succeeds ─
 export WEBUI_AUTH=True
-# The origin is loopback-only. Cloudflare Access authenticates @stardust.ai and
-# injects this header; Open WebUI creates/maps the corresponding local account.
-export WEBUI_AUTH_TRUSTED_EMAIL_HEADER=Cf-Access-Authenticated-User-Email
-export WEBUI_AUTH_TRUSTED_NAME_HEADER=Cf-Access-Authenticated-User-Email
 export DEFAULT_USER_ROLE=user
-export ENABLE_SIGNUP=False
-export ENABLE_LOGIN_FORM=False
-export ENABLE_PASSWORD_AUTH=False
+if [ "${CLOUDFLARE_ACCESS_AUTH_ENABLED:-False}" = "True" ]; then
+    # The origin is loopback-only. Access authenticates @stardust.ai and injects
+    # this header; Open WebUI creates/maps the corresponding local account.
+    export WEBUI_AUTH_TRUSTED_EMAIL_HEADER=Cf-Access-Authenticated-User-Email
+    export WEBUI_AUTH_TRUSTED_NAME_HEADER=Cf-Access-Authenticated-User-Email
+    export ENABLE_SIGNUP=False
+    export ENABLE_LOGIN_FORM=False
+    export ENABLE_PASSWORD_AUTH=False
+else
+    # Safe migration default: retain the existing domain-restricted login until
+    # Access apps and policies have been created and read back successfully.
+    export SIGNUP_ALLOWED_EMAIL_DOMAINS="stardust.ai"
+    if "$SCRIPT_DIR/.venv-owui/bin/python" "$SCRIPT_DIR/scripts/ensure_owui_signup_patch.py"; then
+        export ENABLE_SIGNUP=True
+    else
+        echo "[run_open_webui] signup domain allowlist could not be verified; disabling signup" >&2
+        export ENABLE_SIGNUP=False
+    fi
+    export ENABLE_LOGIN_FORM=True
+    export ENABLE_PASSWORD_AUTH=True
+fi
 
 # ── RAG embeddings: Jina embedding service (OpenAI-compatible) ────────────────
 # Open WebUI's RAG embedding uses its OWN OpenAI endpoint (RAG_OPENAI_API_*),

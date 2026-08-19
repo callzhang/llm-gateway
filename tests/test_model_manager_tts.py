@@ -305,6 +305,7 @@ class AccessServiceContractTests(unittest.TestCase):
             "WEBUI_AUTH_TRUSTED_EMAIL_HEADER=Cf-Access-Authenticated-User-Email",
             launcher,
         )
+        self.assertIn("CLOUDFLARE_ACCESS_AUTH_ENABLED", launcher)
         self.assertIn("export ENABLE_SIGNUP=False", launcher)
         self.assertIn("export ENABLE_LOGIN_FORM=False", launcher)
         self.assertIn("export ENABLE_PASSWORD_AUTH=False", launcher)
