@@ -1,5 +1,6 @@
 .venv/
 .venv-tts/
+.venv-tts-access/
 .venv-owui/
 __pycache__/
 *.pyc
