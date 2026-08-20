@@ -7,7 +7,7 @@ class PayloadTests(unittest.TestCase):
     def test_organization_payload_is_exact(self):
         self.assertEqual(
             {
-                "auth_domain": "stardust.cloudflareaccess.com",
+                "auth_domain": "stardust-ai.cloudflareaccess.com",
                 "name": "Stardust",
                 "auto_redirect_to_identity": True,
                 "session_duration": "24h",
@@ -25,25 +25,22 @@ class PayloadTests(unittest.TestCase):
             provision.employee_policy_payload(),
         )
 
-    def test_tts_app_enables_short_lived_managed_oauth(self):
+    def test_tts_app_has_no_managed_oauth(self):
+        # The Skill authenticates with `cloudflared access login`, so dynamic
+        # loopback client registration would be an open door with no caller.
         payload = provision.application_payload(
-            "Stardust TTS API", "tts-api.preseen.ai", "idp-1", managed_oauth=True
+            "Stardust TTS API", "tts-api.preseen.ai", "idp-1"
         )
         self.assertEqual(
             {
-                "enabled": True,
-                "dynamic_client_registration": {
-                    "enabled": True,
-                    "allow_any_on_localhost": True,
-                    "allow_any_on_loopback": True,
-                    "allowed_uris": [],
-                },
-                "grant": {
-                    "access_token_lifetime": "15m",
-                    "session_duration": "168h",
-                },
+                "name": "Stardust TTS API",
+                "domain": "tts-api.preseen.ai",
+                "type": "self_hosted",
+                "session_duration": "24h",
+                "auto_redirect_to_identity": True,
+                "allowed_idps": ["idp-1"],
             },
-            payload["oauth_configuration"],
+            payload,
         )
 
 
@@ -73,7 +70,7 @@ class ReconcileTests(unittest.TestCase):
             }
         )
         desired = provision.application_payload(
-            "Stardust TTS API", "tts-api.preseen.ai", "idp-1", managed_oauth=True
+            "Stardust TTS API", "tts-api.preseen.ai", "idp-1"
         )
 
         result = provision.reconcile_named(
@@ -98,6 +95,99 @@ class ReconcileTests(unittest.TestCase):
         )
         self.assertEqual("p-1", result["id"])
         self.assertEqual(1, len(client.calls))
+
+
+class ErrorDetailTests(unittest.TestCase):
+    def test_permission_failures_are_readable(self):
+        # The shape Cloudflare actually returns for a token missing a scope.
+        body = {"errors": [{"code": 1010, "error": "auth.forbidden"}]}
+        self.assertEqual("auth.forbidden (code 1010)", provision._error_detail(body))
+
+    def test_message_field_is_preferred_when_present(self):
+        body = {"errors": [{"code": 10000, "message": "Authentication error"}]}
+        self.assertEqual(
+            "Authentication error (code 10000)", provision._error_detail(body)
+        )
+
+    def test_empty_envelope_yields_empty_string(self):
+        self.assertEqual("", provision._error_detail({"errors": []}))
+
+
+class OrganizationDegradeTests(unittest.TestCase):
+    """A token scoped to apps only must still be able to provision an app."""
+
+    class _Client:
+        def __init__(self, error):
+            self.error = error
+            self.calls = []
+
+        def request(self, method, path, payload=None):
+            self.calls.append((method, path, payload))
+            raise self.error
+
+    def test_permission_error_reports_unverified_without_writing(self):
+        client = self._Client(provision.CloudflareError("Authentication error"))
+        result = provision.reconcile_organization(client, apply=True)
+        self.assertEqual("unverified", result["status"])
+        # Never PUT or POST a guessed auth_domain: team domains are a global
+        # namespace, and the wrong one points the gateway at a foreign JWKS.
+        self.assertEqual(["GET"], [call[0] for call in client.calls])
+
+    def test_unrelated_errors_still_propagate(self):
+        client = self._Client(provision.CloudflareError("Rate limited"))
+        with self.assertRaises(provision.CloudflareError):
+            provision.reconcile_organization(client, apply=True)
+
+    def test_unverified_is_not_treated_as_actionable(self):
+        self.assertNotIn("unverified", provision.ACTIONABLE_STATUSES)
+
+
+class SelectorTests(unittest.TestCase):
+    """`--only tts` must never touch the Open WebUI hostname.
+
+    Provisioning both applications would put llm.preseen.ai behind Access as a
+    side effect, locking out every chat user unless run_open_webui.sh flips to
+    trusted-header auth in the same breath.
+    """
+
+    def _client(self):
+        return FakeClient(
+            {
+                ("GET", "/access/organizations"): provision.organization_payload(),
+                ("GET", "/access/identity_providers"): [
+                    {"id": "idp-1", **provision.identity_provider_payload()}
+                ],
+                ("GET", "/access/apps"): [
+                    {
+                        "id": "app-tts",
+                        "domain": "tts-api.preseen.ai",
+                        "aud": "aud-tts",
+                        **provision.application_payload(
+                            "Stardust TTS API", "tts-api.preseen.ai", "idp-1"
+                        ),
+                    }
+                ],
+                ("GET", "/access/apps/app-tts/policies"): [
+                    {"id": "p-1", **provision.employee_policy_payload()}
+                ],
+            }
+        )
+
+    def test_only_tts_skips_the_web_application(self):
+        client = self._client()
+        summaries = provision.provision(client, apply=True, only="tts")
+        kinds = [item["kind"] for item in summaries]
+        self.assertIn("tts", kinds)
+        self.assertNotIn("web", kinds)
+        payloads = [call[2] for call in client.calls if call[2]]
+        self.assertNotIn(
+            "llm.preseen.ai",
+            [payload.get("domain") for payload in payloads],
+        )
+
+    def test_unknown_selector_is_rejected(self):
+        with self.assertRaises(ValueError):
+            provision.provision(self._client(), apply=False, only="nope")
 
 
 if __name__ == "__main__":

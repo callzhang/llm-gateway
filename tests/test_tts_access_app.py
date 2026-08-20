@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import unittest
@@ -177,6 +178,138 @@ class GatewayAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-jwt", audit)
         self.assertNotIn("private-oauth", audit)
         self.assertNotIn("ID3-test-mp3", audit)
+
+
+class _CaptureAudit(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(self.format(record))
+
+
+class _RaisingSession:
+    """Stand-in upstream session whose every call fails the way LiteLLM does."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+    def post(self, *args, **kwargs):
+        raise self.exc
+
+    async def close(self) -> None:
+        return None
+
+
+class UpstreamFailureTests(unittest.IsolatedAsyncioTestCase):
+    """A LiteLLM restart must not break the JSON error contract.
+
+    Before this, an unreachable upstream escaped the middleware and aiohttp
+    answered a public endpoint with its default HTML 500, unaudited.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.config = GatewayConfig(
+            team_domain="https://stardust.cloudflareaccess.com",
+            policy_audience="policy-aud",
+            litellm_api_key="internal-tts-key",
+            allowed_service_ids=frozenset(),
+            litellm_base_url="http://127.0.0.1:9",
+        )
+        self.app = create_app(self.config, verifier=FakeVerifier())
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+        self.handler = _CaptureAudit()
+        self.logger = logging.getLogger("tts_access_gateway.audit")
+        self.logger.addHandler(self.handler)
+        self.logger.setLevel(logging.INFO)
+
+    async def asyncTearDown(self) -> None:
+        self.logger.removeHandler(self.handler)
+        await self.client.close()
+
+    async def _speak(self):
+        return await self.client.post(
+            "/v1/audio/speech",
+            headers={"Cf-Access-Jwt-Assertion": "signed"},
+            json={"model": MODEL, "input": "hello", "voice": "Vivian"},
+        )
+
+    async def test_unreachable_upstream_returns_json_502(self):
+        response = await self._speak()
+        self.assertEqual(502, response.status)
+        self.assertEqual("application/json", response.content_type)
+        body = await response.json()
+        self.assertEqual("access_error", body["error"]["type"])
+        self.assertEqual("upstream unavailable", body["error"]["message"])
+        audit = json.loads(self.handler.records[-1])
+        self.assertEqual(502, audit["status"])
+        self.assertIn("upstream unavailable", audit["reason"])
+
+    async def test_upstream_timeout_returns_json_504(self):
+        self.app["upstream_session"] = _RaisingSession(asyncio.TimeoutError())
+        response = await self._speak()
+        self.assertEqual(504, response.status)
+        body = await response.json()
+        self.assertEqual("upstream timed out", body["error"]["message"])
+        audit = json.loads(self.handler.records[-1])
+        self.assertEqual(504, audit["status"])
+
+
+class DenialAuditTests(unittest.IsolatedAsyncioTestCase):
+    """Every terminal response is audited, denials included.
+
+    The audit logger is the only record — `access_log` is None — so an
+    unaudited 403 means a probe against the public hostname leaves no trace.
+    """
+
+    async def asyncSetUp(self) -> None:
+        config = GatewayConfig(
+            team_domain="https://stardust.cloudflareaccess.com",
+            policy_audience="policy-aud",
+            litellm_api_key="internal-tts-key",
+            allowed_service_ids=frozenset(),
+            litellm_base_url="http://127.0.0.1:9",
+        )
+        self.client = TestClient(
+            TestServer(create_app(config, verifier=FakeVerifier(reject=True)))
+        )
+        await self.client.start_server()
+        self.handler = _CaptureAudit()
+        self.logger = logging.getLogger("tts_access_gateway.audit")
+        self.logger.addHandler(self.handler)
+        self.logger.setLevel(logging.INFO)
+
+    async def asyncTearDown(self) -> None:
+        self.logger.removeHandler(self.handler)
+        await self.client.close()
+
+    async def test_rejected_identity_is_audited_as_unauthenticated(self):
+        response = await self.client.post(
+            "/v1/audio/speech",
+            headers={"Cf-Access-Jwt-Assertion": "forged-jwt"},
+            json={"model": MODEL, "input": "hello", "voice": "Vivian"},
+        )
+        self.assertEqual(403, response.status)
+        audit = json.loads(self.handler.records[-1])
+        self.assertEqual("unauthenticated", audit["actor_kind"])
+        self.assertIsNone(audit["actor"])
+        self.assertEqual(403, audit["status"])
+        self.assertEqual("/v1/audio/speech", audit["route"])
+        self.assertIn("reason", audit)
+        self.assertNotIn("forged-jwt", "\n".join(self.handler.records))
+
+    async def test_disallowed_route_is_audited_with_policy_reason(self):
+        response = await self.client.post(
+            "/v1/chat/completions",
+            headers={"Cf-Access-Jwt-Assertion": "signed"},
+            json={"model": "qwen3.6-27b"},
+        )
+        self.assertEqual(403, response.status)
+        audit = json.loads(self.handler.records[-1])
+        self.assertEqual("route not allowed", audit["reason"])
+        self.assertEqual("unauthenticated", audit["actor_kind"])
 
 
 if __name__ == "__main__":

@@ -2,6 +2,12 @@
 Description=LLM Gateway — Cloudflare Access TTS identity bridge (127.0.0.1:8910)
 After=llm-litellm.service
 PartOf=llm-gateway.target
+# The unit cannot start until the Access application exists, because
+# TTS_ACCESS_POLICY_AUD is only known after provisioning.  Park after five
+# failures so that state shows up as `failed` instead of hiding in a
+# restart loop — it once accumulated 1096 silent restarts.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple

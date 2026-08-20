@@ -252,7 +252,30 @@ python3.12 -m venv .venv-tts
   'import importlib.metadata as m; print("vllm-omni", m.version("vllm-omni")); print("vllm", m.version("vllm"))'
 ```
 
-Call the authenticated public API with an existing LiteLLM virtual key:
+### Employees: the `stardust-tts` skill
+
+Employees do not get a LiteLLM key. They install the `stardust-tts` skill from
+<https://github.com/stardustai/stardust-skills> and sign in once per day in a
+browser with their `@stardust.ai` address:
+
+```bash
+python3 ~/.agents/skills/stardust-tts/scripts/synthesize.py \
+  "你好" --voice Vivian --output hello.mp3
+```
+
+That path is `tts-api.preseen.ai` → Cloudflare Access (`email_domain:
+stardust.ai`) → the `tts-auth-gateway` on `127.0.0.1:8910` → LiteLLM's internal
+TTS-only virtual key. `cloudflared` performs the login and owns the cached
+token; nothing on the employee's machine holds a gateway credential. Design and
+deployment runbook:
+`docs/superpowers/specs/2026-08-19-employee-tts-skill-access.md`.
+
+### Server-to-server: LiteLLM virtual key
+
+`llm-api.preseen.ai` still accepts LiteLLM virtual keys, but a key must be
+scoped to the TTS model to use this route — the general public key
+`public-internet-llm-api-v2` is scoped to the three chat models and cannot
+reach it.
 
 ```bash
 curl --fail-with-body https://llm-api.preseen.ai/v1/audio/speech \
@@ -286,12 +309,19 @@ work but receive real MP3 bytes. vLLM-Omni performs the MP3 encoding natively,
 so no ffmpeg transcode layer is required, and LiteLLM's `audio/mpeg` response
 header matches the bytes.
 
+Cold start is ~56s: TTS shares `IDLE_TIMEOUT` (300s) with the chat models, so
+five idle minutes unload it. Warm latency is ~0.2s for a short phrase and ~20s
+at 2910 characters. Because `/v1/audio/speech` is not streamed, a cold call plus
+a long input runs at ~76s against Cloudflare's ~100s non-streaming response
+budget; the skill retries once on a 524 rather than the model being pinned warm.
+
 Operational checks:
 
 ```bash
 curl -sS http://127.0.0.1:8002/admin/status
 nvidia-smi
 journalctl --user -u llm-model-manager -u llm-litellm -u llm-open-webui -n 100
+systemctl --user status llm-tts-access-gateway
 ```
 
 GPU4's pre-TTS deployment commit is `e922645`. A recoverable rollback keeps the
