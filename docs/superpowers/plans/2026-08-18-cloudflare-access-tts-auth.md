@@ -2,6 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-08-19).** Tasks 1–5 are implemented and committed; their
+> checkboxes are ticked below. Task 6 is **superseded** — the employee client is
+> `skills/stardust-tts/`, authenticating with `cloudflared access login` instead
+> of Managed OAuth + PKCE + Keychain; see
+> `../specs/2026-08-19-employee-tts-skill-access.md` for the reasoning. Tasks 7
+> and 8 (documentation and production deployment) are open, and Task 8 is now
+> the runbook in that spec. Task 8 also narrows: only the TTS application is
+> provisioned, `llm.preseen.ai` stays on its current login.
+
 **Goal:** Replace employee-distributed LiteLLM keys with Cloudflare Access email OTP and Managed OAuth while keeping all LiteLLM credentials on GPU4.
 
 **Architecture:** Cloudflare Access protects Open WebUI and a new TTS-only hostname. A loopback aiohttp gateway validates Cloudflare application JWTs, enforces TTS routes and payloads, and proxies with a server-side LiteLLM virtual key. The public Skill performs Managed OAuth PKCE and stores refresh credentials only in macOS Keychain.
@@ -57,7 +66,7 @@
 - Create: `tts_access_gateway/auth.py`
 - Test: `tests/test_tts_access_auth.py`
 
-- [ ] **Step 1: Write failing configuration and identity tests**
+- [x] **Step 1: Write failing configuration and identity tests**
 
 ```python
 class ConfigTests(unittest.TestCase):
@@ -92,7 +101,7 @@ class PrincipalTests(unittest.TestCase):
             )
 ```
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run:
 
@@ -103,7 +112,7 @@ python3 -m unittest tests.test_tts_access_auth -v
 Expected: import failure because `tts_access_gateway.config` and
 `tts_access_gateway.auth` do not exist.
 
-- [ ] **Step 3: Implement minimal configuration and principal mapping**
+- [x] **Step 3: Implement minimal configuration and principal mapping**
 
 ```python
 @dataclass(frozen=True)
@@ -149,7 +158,7 @@ def principal_from_claims(
     raise AccessDenied("unapproved Access identity")
 ```
 
-- [ ] **Step 4: Add RS256 verification with issuer and audience checks**
+- [x] **Step 4: Add RS256 verification with issuer and audience checks**
 
 Use `jwt.PyJWKClient` with
 `config.team_domain + "/cdn-cgi/access/certs"`, cache the client, and call:
@@ -168,7 +177,7 @@ claims = jwt.decode(
 Convert all PyJWT errors to `AccessDenied("invalid Access JWT")` without
 including the token or claims in the message.
 
-- [ ] **Step 5: Run tests and verify GREEN**
+- [x] **Step 5: Run tests and verify GREEN**
 
 Run:
 
@@ -179,7 +188,7 @@ python3 -m unittest tests.test_tts_access_auth -v
 Expected: all configuration, employee-domain, service-allowlist, signature,
 issuer, audience, and expiry tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add tts_access_gateway tests/test_tts_access_auth.py
@@ -194,7 +203,7 @@ git commit -m "feat(auth): validate Cloudflare Access identities"
 - Create: `tts_access_gateway/policy.py`
 - Test: `tests/test_tts_access_policy.py`
 
-- [ ] **Step 1: Write failing route and payload tests**
+- [x] **Step 1: Write failing route and payload tests**
 
 ```python
 def test_only_tts_routes_are_allowed(self):
@@ -227,7 +236,7 @@ def test_payload_is_tts_model_voice_length_and_mp3_only(self):
             validate_speech_payload(payload)
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run:
 
@@ -237,7 +246,7 @@ python3 -m unittest tests.test_tts_access_policy -v
 
 Expected: import failure because `policy.py` does not exist.
 
-- [ ] **Step 3: Implement the exact policy**
+- [x] **Step 3: Implement the exact policy**
 
 ```python
 MODEL = "qwen3-tts-1.7b-customvoice"
@@ -265,7 +274,7 @@ def validate_speech_payload(payload: Mapping[str, object]) -> None:
         raise PolicyDenied("only MP3 is allowed")
 ```
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run:
 
@@ -290,7 +299,7 @@ git commit -m "feat(auth): enforce TTS-only request policy"
 - Create: `requirements-tts-access.txt`
 - Test: `tests/test_tts_access_app.py`
 
-- [ ] **Step 1: Write failing aiohttp integration tests**
+- [x] **Step 1: Write failing aiohttp integration tests**
 
 Create local fake JWKS/auth and LiteLLM upstream fixtures. Assert:
 
@@ -328,7 +337,7 @@ Also assert missing JWT is 403, invalid JSON is 400, body over 64 KiB is 413,
 chat route is 403, `GET /v1/models` returns only the TTS model, and logs omit
 text, instructions, token, and audio.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 ```bash
 python3 -m unittest tests.test_tts_access_app -v
@@ -336,7 +345,7 @@ python3 -m unittest tests.test_tts_access_app -v
 
 Expected: import failure because `app.py` does not exist.
 
-- [ ] **Step 3: Implement the aiohttp app**
+- [x] **Step 3: Implement the aiohttp app**
 
 ```python
 async def speech(request: web.Request) -> web.StreamResponse:
@@ -377,7 +386,7 @@ Use `client_max_size=64 * 1024`, a 900-second total upstream timeout, a
 bounded connector, and structured JSON audit records containing only actor,
 request ID, route, model, voice, status, latency, and output bytes.
 
-- [ ] **Step 4: Run focused and full tests**
+- [x] **Step 4: Run focused and full tests**
 
 ```bash
 python3 -m unittest tests.test_tts_access_app -v
@@ -386,7 +395,7 @@ python3 -m unittest discover -s tests -v
 
 Expected: proxy tests and all existing gateway tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tts_access_gateway requirements-tts-access.txt tests/test_tts_access_app.py
@@ -405,7 +414,7 @@ git commit -m "feat(auth): proxy authenticated TTS requests"
 - Modify: `run_open_webui.sh`
 - Modify: `tests/test_model_manager_tts.py`
 
-- [ ] **Step 1: Add failing launcher and SSO configuration tests**
+- [x] **Step 1: Add failing launcher and SSO configuration tests**
 
 ```python
 def test_tts_auth_gateway_is_part_of_target(self):
@@ -423,7 +432,7 @@ def test_open_webui_delegates_auth_to_cloudflare(self):
     self.assertIn("export ENABLE_PASSWORD_AUTH=False", launcher)
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 ```bash
 python3 -m unittest tests.test_model_manager_tts -v
@@ -431,7 +440,7 @@ python3 -m unittest tests.test_model_manager_tts -v
 
 Expected: new trusted-header and systemd assertions fail.
 
-- [ ] **Step 3: Implement process and web settings**
+- [x] **Step 3: Implement process and web settings**
 
 `run_tts_access_gateway.sh` must require
 `TTS_ACCESS_TEAM_DOMAIN`, `TTS_ACCESS_POLICY_AUD`, and
@@ -457,7 +466,7 @@ export ENABLE_PASSWORD_AUTH=False
 Keep `WEBUI_AUTH=True`, the loopback bind, existing user data, and the
 server-side LiteLLM key.
 
-- [ ] **Step 4: Run tests and syntax checks**
+- [x] **Step 4: Run tests and syntax checks**
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -466,7 +475,7 @@ bash -n run_tts_access_gateway.sh run_open_webui.sh systemd/install.sh
 
 Expected: all tests and shell syntax checks pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add run_tts_access_gateway.sh run_open_webui.sh systemd tests/test_model_manager_tts.py
@@ -481,7 +490,7 @@ git commit -m "feat(auth): supervise TTS gateway and delegate web login"
 - Create: `scripts/provision_cloudflare_access.py`
 - Create: `tests/test_cloudflare_access_provision.py`
 
-- [ ] **Step 1: Write failing payload and reconciliation tests**
+- [x] **Step 1: Write failing payload and reconciliation tests**
 
 Assert exact payloads for:
 
@@ -507,7 +516,7 @@ registration, a 15-minute access token, and a seven-day session. Reconciliation
 must update matching resources by name/domain, never create duplicates, and
 must print only resource IDs, names, domains, audiences, and status.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 ```bash
 python3 -m unittest tests.test_cloudflare_access_provision -v
@@ -515,7 +524,7 @@ python3 -m unittest tests.test_cloudflare_access_provision -v
 
 Expected: import failure because the provisioning module does not exist.
 
-- [ ] **Step 3: Implement a minimal Cloudflare REST client**
+- [x] **Step 3: Implement a minimal Cloudflare REST client**
 
 Use `urllib.request`, read only `CLOUDFLARE_API_TOKEN` and
 `CLOUDFLARE_ACCOUNT_ID`, and call:
@@ -553,7 +562,7 @@ The TTS app uses:
 Support `--check` and `--apply`; default to `--check`. After apply, GET
 every resource and fail unless all expected values read back.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 python3 -m unittest tests.test_cloudflare_access_provision -v
