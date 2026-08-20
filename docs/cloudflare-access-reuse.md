@@ -140,11 +140,21 @@ in the same breath as flipping `CLOUDFLARE_ACCESS_AUTH_ENABLED` in
 
 ## Clients
 
-**Interactive.** `cloudflared access login --app https://<host>` once per day,
-then `cloudflared access token --app https://<host>` per request. Tokens are
-cached per application in `~/.cloudflared/`; logging into one service does not
-log you into another, though the browser session is shared so the second login
-needs no new PIN.
+**Interactive.** Reuse `access_oauth.py` from the `stardust-tts` skill. It is a
+self-contained RFC 8252 client — dynamic registration, PKCE, loopback redirect —
+and it is already parameterised by service: every entry point takes `base_url`,
+and the refresh token is stored per origin, so one file serves any number of
+Access-protected hostnames. A second skill needs
+`auth_headers("https://<host>/v1")` and nothing else.
+
+Employees install nothing. An earlier revision of this document told you to
+shell out to `cloudflared access login`; that was reversed on 2026-08-20
+because it put a binary install in front of every employee and bought nothing
+in return.
+
+Because the redirect lands on `127.0.0.1`, the browser must run on the same
+machine as the client. Over SSH the sign-in URL is printed rather than opened,
+and the callback still has to reach that machine's loopback.
 
 **Headless.** Create an Access *service token* per workload and send
 `CF-Access-Client-Id` / `CF-Access-Client-Secret`. Each workload gets its own,
@@ -152,11 +162,23 @@ named and individually revocable. Add its `common_name` to the origin's
 allowlist (`TTS_ACCESS_SERVICE_CLIENT_IDS` for TTS). Never let a workload reuse
 an employee token.
 
-**Send a real User-Agent.** Cloudflare's browser-integrity check answers
-`403 error code: 1010` to `Python-urllib/3.x` *before Access is consulted* — the
-same token works from curl. This cost an hour of misdiagnosis on the TTS skill,
-because a 1010 looks exactly like an authentication failure and tempts you to
-re-login forever.
+**Send a real User-Agent — and know that it is not enough.** Cloudflare's
+browser-integrity check answers `403 error code: 1010` to `Python-urllib/3.x`
+*before Access is consulted*. But BIC also weighs client IP reputation: the
+same request, with the same honest User-Agent, passed from a US host and was
+blocked from a CN one. Fixing the User-Agent and declaring victory is exactly
+the trap — it works on the machine you test from.
+
+For an Access-protected API, turn BIC off for that hostname with a
+Configuration Rule; Access already rejects anything without a valid JWT, so BIC
+adds nothing and only breaks legitimate non-browser clients. **Match on the
+hostname**, `http.host eq "<host>"`. A first attempt here matched
+`full_uri contains "<host>"`, which let any URL in the zone disable BIC by
+appending that string to its query string.
+
+A 1010 looks exactly like an authentication failure and tempts you to re-login
+forever; it is not one, and clients should say so rather than suggesting a
+fresh login.
 
 ## Renaming the team domain
 
@@ -207,13 +229,35 @@ it, rather than starting it and coming back later.
 
 Do it before onboarding anyone, or not at all.
 
+## Sharing the client across skills
+
+`install.sh` rsyncs each `skills/*` directory into `~/.agents/skills/`
+independently, so there is no shared library today and a second skill cannot
+simply import the first one's module. Three ways out, in order of preference:
+
+1. **`skills/_shared/access_oauth.py`,** copied by `install.sh` alongside the
+   skills, with each skill adding it to `sys.path`. One change to the installer,
+   one copy of the auth code, no drift. This is the recommended shape.
+2. **Vendor a copy per skill.** Works immediately, needs no installer change,
+   and guarantees the copies diverge — the 1010 User-Agent fix had to be applied
+   twice already, once in `synthesize.py` and once in `access_oauth.py`, inside
+   a single skill.
+3. **A pip-installable internal package.** Correct at scale, heaviest to set up,
+   and adds an install step for employees — the thing this design just removed.
+
+Whichever is chosen, the client itself needs no changes: it is already
+service-agnostic.
+
 ## Limits worth knowing
 
 - **50 seats** on Zero Trust Free. A seat is consumed by a user who
   authenticates, and released by the inactivity policy (currently 未启用 — turn
   it on before approaching the cap).
-- **Cloudflare's ~100s cap** on non-streaming proxied responses applies to every
-  Access-protected hostname. Slow endpoints must stream or expect 524.
+- **There is no ~100s cap** on non-streaming proxied responses, contrary to what
+  this document and the TTS spec both previously asserted. That figure was
+  carried untested from an unrelated note and it shaped design decisions. A cold
+  TTS call measured 104.2s end to end and returned 200. Measure before designing
+  around any edge timeout.
 - **A session outlives a policy edit.** The token issued at login carries the
   matched `policy_id` and its own 24-hour expiry, and the origin verifies only
   signature, issuer, audience, and time. Treat removal from an allow policy as
