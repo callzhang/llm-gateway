@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Run Open WebUI — foreground for systemd
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONNOUSERSITE=1
+OWUI_BIN_DIR="/home/derek/miniforge3/envs/llm-gateway-owui/bin"
 
 # ── OpenAI-compatible backend: LiteLLM proxy on :8900 ─────────────────────────
 export OPENAI_API_BASE_URL="http://127.0.0.1:8900/v1"
@@ -45,7 +47,7 @@ else
     # Safe migration default: retain the existing domain-restricted login until
     # Access apps and policies have been created and read back successfully.
     export SIGNUP_ALLOWED_EMAIL_DOMAINS="stardust.ai"
-    if "$SCRIPT_DIR/.venv-owui/bin/python" "$SCRIPT_DIR/scripts/ensure_owui_signup_patch.py"; then
+    if "$OWUI_BIN_DIR/python" "$SCRIPT_DIR/scripts/ensure_owui_signup_patch.py"; then
         export ENABLE_SIGNUP=True
     else
         echo "[run_open_webui] signup domain allowlist could not be verified; disabling signup" >&2
@@ -76,4 +78,4 @@ export RAG_EMBEDDING_BATCH_SIZE=32
 # Docker container, so Open WebUI runs on :8080.
 # Bind to loopback only — the sole external entrypoint is the Cloudflare tunnel
 # (llm.preseen.ai), which runs on this host and reaches us via 127.0.0.1.
-exec "$SCRIPT_DIR/.venv-owui/bin/open-webui" serve --host 127.0.0.1 --port 8080
+exec "$OWUI_BIN_DIR/open-webui" serve --host 127.0.0.1 --port 8080

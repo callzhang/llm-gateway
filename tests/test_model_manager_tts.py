@@ -226,7 +226,11 @@ class LauncherContractTests(unittest.TestCase):
             REPO_ROOT / "run_qwen3_tts_1_7b_customvoice.sh"
         ).read_text(encoding="utf-8")
 
-        self.assertIn(".venv-tts/bin/vllm-omni", launcher)
+        # Pinned to its own interpreter, separate from the chat runtime.  The
+        # path moved from an in-tree .venv-tts to a miniforge env; assert the
+        # property that matters rather than one hard-coded prefix.
+        self.assertIn("/bin/vllm-omni", launcher)
+        self.assertNotIn("/llm-gateway-vllm/bin/vllm-omni", launcher)
         self.assertIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", launcher)
         self.assertIn("CUDA_VISIBLE_DEVICES=${VLLM_CUDA_DEVICE:-0}", launcher)
         self.assertIn("--host 127.0.0.1", launcher)

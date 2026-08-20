@@ -7,7 +7,8 @@ export VLLM_SERVER_DEV_MODE=1
 export CUDA_VISIBLE_DEVICES=0
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
-VLLM_BIN=${VLLM_BIN:-/home/derek/Projects/llm-gateway/.venv/bin/vllm}
+export PYTHONNOUSERSITE=1
+VLLM_BIN=${VLLM_BIN:-/home/derek/miniforge3/envs/llm-gateway-vllm/bin/vllm}
 
 HF_TOKEN_FILE=/home/stardust/.cache/huggingface/token
 if [[ -f "$HF_TOKEN_FILE" ]]; then
