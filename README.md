@@ -265,9 +265,9 @@ python3 ~/.agents/skills/stardust-tts/scripts/synthesize.py \
 
 That path is `tts-api.preseen.ai` → Cloudflare Access (`email_domain:
 stardust.ai`) → the `tts-auth-gateway` on `127.0.0.1:8910` → LiteLLM's internal
-TTS-only virtual key. `cloudflared` performs the login and owns the cached
-token; nothing on the employee's machine holds a gateway credential. Design and
-deployment runbook:
+TTS-only virtual key. The Skill performs Managed OAuth with PKCE and stores the
+refresh token in the operating system's secure credential store; nothing on the
+employee's machine holds a gateway credential. Design and deployment runbook:
 `docs/superpowers/specs/2026-08-19-employee-tts-skill-access.md`.
 
 ### Server-to-server: LiteLLM virtual key

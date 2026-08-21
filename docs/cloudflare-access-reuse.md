@@ -4,7 +4,8 @@ Short answer: **yes — the team domain is meant to be reused.** One Zero Trust
 organization serves every service you own. What must *not* be reused is the
 application, and that distinction is the whole of this document.
 
-Written 2026-08-19, after putting `tts-api.preseen.ai` behind Access.
+Written 2026-08-19 and updated after putting the TTS, OCR, and video
+transcription APIs behind separate Access applications.
 
 ## What is shared and what is not
 
@@ -77,8 +78,8 @@ just need to know who the user is.
 
 ## Candidates on this host
 
-Every hostname on the `preseen-gateway` tunnel is a candidate; none except
-`tts-api` is behind Access today.
+Every hostname on the `preseen-gateway` tunnel is a candidate. The three
+employee-facing GPU APIs now have separate applications and separate AUDs.
 
 | Hostname | Origin | Today | Natural pattern |
 |---|---|---|---|
@@ -86,9 +87,9 @@ Every hostname on the `preseen-gateway` tunnel is a candidate; none except
 | `llm.preseen.ai` | :8080 Open WebUI | password + domain allowlist | B |
 | `llm-api.preseen.ai` | :8900 LiteLLM | static virtual key | A, or leave for machines |
 | `embed.preseen.ai` | :7997 | key | A |
-| `ocr.preseen.ai` | :7998 | key | A |
+| `ocr.preseen.ai` | :7998 | **Access** | A (done) |
 | `gliner.preseen.ai` | :7999 | key | A |
-| `video-transcribe.preseen.ai` | :8899 | key | A |
+| `video-transcribe.preseen.ai` | :8899 | **Access** | A (done) |
 | `eval-tracking.preseen.ai` | :4319 | — | B |
 | `mc-*-origin.preseen.ai` | :878x | service-to-service | service tokens, not employee login |
 
@@ -99,10 +100,13 @@ in the same breath as flipping `CLOUDFLARE_ACCESS_AUTH_ENABLED` in
 ## Adding a service
 
 1. **Create the application.** Zero Trust → 访问控制 → 应用程序 → 新建 →
-   自托管. Set the hostname, 24h session, and an allow policy
-   (`Emails ending in` → `@stardust.ai`). Leave Managed OAuth off unless a
-   client genuinely needs dynamic registration — `cloudflared access login`
-   does not.
+   自托管. Set the hostname, 24h session, and attach the reusable
+   `Stardust employees` policy (`Emails ending in` → `@stardust.ai`). Enable
+   Managed OAuth only when the client uses dynamic loopback registration. The
+   TTS, OCR, and video-transcription Skills do, so all three API applications
+   enable it; the browser-only Web application does not. Dynamic registration
+   accepts numeric loopback (`127.0.0.1`) callbacks but rejects `localhost`
+   callbacks, matching the shared client's callback boundary.
 
    Or, once the API token carries `Access: Apps and Policies: Edit` and
    `Access: Organizations, Identity Providers, and Groups: Edit`:
@@ -111,7 +115,10 @@ in the same breath as flipping `CLOUDFLARE_ACCESS_AUTH_ENABLED` in
    .venv/bin/python scripts/provision_cloudflare_access.py --only <name> --apply
    ```
 
-   after adding the service to `APPLICATIONS` in that script.
+   The built-in selectors are `web`, `tts`, `ocr`, and `video_transcribe`.
+   `--check` is read-only; `--apply` reconciles the selected application while
+   preserving its hostname identity and attaching the shared employee policy
+   by policy ID.
 
 2. **Record the AUD.** The dashboard shows it on the application's Overview.
    It is also the `kid` query parameter of the login redirect, so it can be read

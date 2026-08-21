@@ -45,12 +45,17 @@ def identity_provider_payload() -> dict[str, Any]:
     return {"name": "One-time PIN login", "type": "onetimepin", "config": {}}
 
 
-# Managed OAuth (dynamic loopback client registration) was dropped on
-# 2026-08-19: the employee Skill authenticates with `cloudflared access login`,
-# which needs no registered client.  Leaving it enabled would keep loopback
-# client registration open on the TTS application for no reason.
-def application_payload(name: str, domain: str, idp_id: str) -> dict[str, Any]:
-    return {
+# Managed OAuth is enabled only for API applications whose Skills use dynamic
+# loopback client registration.  Browser-only applications keep it disabled.
+def application_payload(
+    name: str,
+    domain: str,
+    idp_id: str,
+    *,
+    managed_oauth: bool = False,
+    policy_id: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "name": name,
         "domain": domain,
         "type": "self_hosted",
@@ -58,6 +63,23 @@ def application_payload(name: str, domain: str, idp_id: str) -> dict[str, Any]:
         "auto_redirect_to_identity": True,
         "allowed_idps": [idp_id],
     }
+    if policy_id:
+        payload["policies"] = [{"id": policy_id, "precedence": 1}]
+    if managed_oauth:
+        payload["oauth_configuration"] = {
+            "enabled": True,
+            "dynamic_client_registration": {
+                "enabled": True,
+                "allow_any_on_localhost": False,
+                "allow_any_on_loopback": True,
+                "allowed_uris": [],
+            },
+            "grant": {
+                "access_token_lifetime": "15m",
+                "session_duration": "168h",
+            },
+        }
+    return payload
 
 
 def _error_detail(body: Any) -> str:
@@ -88,6 +110,15 @@ def _contains(actual: Any, desired: Any) -> bool:
         return isinstance(actual, dict) and all(
             key in actual and _contains(actual[key], value)
             for key, value in desired.items()
+        )
+    if isinstance(desired, list):
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(desired)
+            and all(
+                _contains(actual_item, desired_item)
+                for actual_item, desired_item in zip(actual, desired, strict=True)
+            )
         )
     return actual == desired
 
@@ -200,15 +231,19 @@ def _safe_summary(kind: str, resource: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-APPLICATIONS: dict[str, tuple[str, str]] = {
-    "web": ("Stardust LLM Web", "llm.preseen.ai"),
-    "tts": ("Stardust TTS API", "tts-api.preseen.ai"),
+APPLICATIONS: dict[str, tuple[str, str, bool]] = {
+    "web": ("Stardust LLM Web", "llm.preseen.ai", False),
+    "tts": ("Stardust TTS API", "tts-api.preseen.ai", True),
+    "ocr": ("Stardust OCR API", "ocr.preseen.ai", True),
+    "video_transcribe": (
+        "Stardust Video Transcribe API",
+        "video-transcribe.preseen.ai",
+        True,
+    ),
 }
 
 
-def provision(
-    client: Any, *, apply: bool, only: str = "all"
-) -> list[dict[str, Any]]:
+def provision(client: Any, *, apply: bool, only: str = "all") -> list[dict[str, Any]]:
     """Reconcile Access state.  ``only`` selects which applications to touch.
 
     Defaulting to every application would put Open WebUI behind Access as a
@@ -218,7 +253,9 @@ def provision(
     """
     if only not in {"all", *APPLICATIONS}:
         raise ValueError(f"unknown application selector: {only}")
-    output = [_safe_summary("organization", reconcile_organization(client, apply=apply))]
+    output = [
+        _safe_summary("organization", reconcile_organization(client, apply=apply))
+    ]
     idp = reconcile_named(
         client,
         "/access/identity_providers",
@@ -230,25 +267,33 @@ def provision(
     if not idp.get("id"):
         return output
 
+    employee_policy = reconcile_named(
+        client,
+        "/access/policies",
+        employee_policy_payload(),
+        match_key="name",
+        apply=apply,
+    )
+    output.append(_safe_summary("employee_policy", employee_policy))
+    if not employee_policy.get("id"):
+        return output
+
     selected = APPLICATIONS if only == "all" else {only: APPLICATIONS[only]}
-    for kind, (name, domain) in selected.items():
+    for kind, (name, domain, managed_oauth) in selected.items():
         app = reconcile_named(
             client,
             "/access/apps",
-            application_payload(name, domain, idp["id"]),
+            application_payload(
+                name,
+                domain,
+                idp["id"],
+                managed_oauth=managed_oauth,
+                policy_id=employee_policy["id"],
+            ),
             match_key="domain",
             apply=apply,
         )
         output.append(_safe_summary(kind, app))
-        if app.get("id"):
-            policy = reconcile_named(
-                client,
-                f"/access/apps/{app['id']}/policies",
-                employee_policy_payload(),
-                match_key="name",
-                apply=apply,
-            )
-            output.append(_safe_summary(f"{kind}_policy", policy))
     return output
 
 
@@ -280,9 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     for summary in summaries:
         print(json.dumps(summary, sort_keys=True))
     return (
-        1
-        if any(item.get("status") in ACTIONABLE_STATUSES for item in summaries)
-        else 0
+        1 if any(item.get("status") in ACTIONABLE_STATUSES for item in summaries) else 0
     )
 
 
