@@ -34,7 +34,7 @@
 # fingerprint of vllm + flashinfer + driver + GPU so any upgrade invalidates it.
 #
 # Usage:  scripts/warm_jit_cache.sh [--force] [run_script ...]
-#         defaults to every run_qwen36_*.sh
+#         defaults to every run_qwen3[0-9]*_*.sh
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -54,17 +54,60 @@ for arg in "$@"; do
   esac
 done
 if [[ ${#SCRIPTS[@]} -eq 0 ]]; then
-  mapfile -t SCRIPTS < <(ls "$ROOT"/run_qwen36_*.sh)
+  mapfile -t SCRIPTS < <(ls "$ROOT"/run_qwen3[0-9]*_*.sh)
 fi
 
-PY=$ROOT/.venv/bin/python
-pkgver() { "$PY" -c "import importlib.metadata as m; print(m.version('$1'))" 2>/dev/null || echo unknown; }
+# The fingerprint must be computed with the interpreter that ACTUALLY compiles
+# the kernels — the one the run scripts exec via VLLM_BIN — not with
+# $ROOT/.venv, which no longer exists.  When it vanished, pkgver's
+# "|| echo unknown" swallowed the ENOENT and every version silently became
+# "unknown", so the fingerprint stopped tracking vllm/flashinfer entirely: an
+# upgrade to either would no longer invalidate a single marker, which is the one
+# job this fingerprint has.  It also silently re-keyed the whole marker
+# directory, orphaning three warm models (2026-08-27).
+VLLM_BIN=${VLLM_BIN:-/home/derek/miniforge3/envs/llm-gateway-vllm/bin/vllm}
+PY=${WARM_PY:-$(dirname "$VLLM_BIN")/python}
+if [[ ! -x $PY ]]; then
+  echo "ERROR: no usable interpreter at $PY"
+  echo "       The fingerprint would degrade to 'unknown' and stop invalidating"
+  echo "       markers on upgrade.  Set WARM_PY (or VLLM_BIN) and re-run."
+  exit 1
+fi
+
+# Prefer installed distribution metadata; fall back to the module's __version__
+# for packages whose dist-info is not resolvable from this interpreter.
+pkgver() {
+  "$PY" - "$1" <<'PYEOF' 2>/dev/null || echo unknown
+import importlib, importlib.metadata as md, sys
+name = sys.argv[1]
+try:
+    print(md.version(name)); raise SystemExit
+except SystemExit:
+    raise
+except Exception:
+    pass
+mod = {"flashinfer-python": "flashinfer"}.get(name, name)
+try:
+    print(getattr(importlib.import_module(mod), "__version__", "unknown"))
+except Exception:
+    print("unknown")
+PYEOF
+}
 
 # Fingerprint everything whose change forces a recompile.  Bump any of these and
 # the markers stop matching, so the next boot re-warms before serving traffic.
 FP_RAW="vllm=$(pkgver vllm) flashinfer=$(pkgver flashinfer-python)"
 FP_RAW+=" driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
 FP_RAW+=" gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+# Refuse to run on a degraded fingerprint.  Warming under "unknown" writes
+# markers that survive an upgrade they should not survive, and re-keys the
+# marker directory so every already-warm model looks cold.  Fail loudly instead.
+if [[ $FP_RAW == *unknown* ]]; then
+  echo "ERROR: could not resolve a version for the fingerprint: $FP_RAW"
+  echo "       Interpreter used: $PY"
+  echo "       Refusing to warm under a fingerprint that cannot detect upgrades."
+  exit 1
+fi
 FP=$(printf '%s' "$FP_RAW" | sha256sum | cut -c1-16)
 MARKDIR=${XDG_CACHE_HOME:-$HOME/.cache}/llm-gateway/jit_warm/$FP
 mkdir -p "$MARKDIR"
