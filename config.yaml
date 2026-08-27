@@ -37,12 +37,15 @@ model_list:
       max_context_window_tokens: 81920
       supports_vision: true
 
-  # ── Qwen3.6-27B Text NVFP4+MTP ──────────────────────────────────────────
-  # Also routes through model_manager.  27b shares the GPU pool with 35b
-  # — only spawns when requested and another slot is free or idle-unloads.
-  - model_name: qwen3.6-27b
+
+  # ── Qwen3.8-27B NVFP4+MTP (gittensor pure-FP4 build) ────────────────────
+  # Same qwen3_5 arch and same slot tuning as qwen3.6-27b, which it shadows
+  # rather than replaces so both can be A/B'd on real traffic.  No
+  # supports_vision: the run script passes --language-model-only, which makes
+  # get_limit_per_prompt() return 0 — the vision tower loads but rejects input.
+  - model_name: qwen3.8-27b
     litellm_params:
-      model: custom_openai/qwen3.6-27b
+      model: custom_openai/qwen3.8-27b
       api_base: http://127.0.0.1:8002/v1
       api_key: local-qwen36
       max_tokens: 16384

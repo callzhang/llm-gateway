@@ -333,8 +333,17 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
     "qwen3.6-35b-a3b-heretic": ModelConfig(
         "run_qwen36_35b_heretic.sh", "qwen3.6-35b-a3b-heretic"
     ),
-    "qwen3.6-27b": ModelConfig(
-        "run_qwen36_27b.sh", "qwen3.6-27b"
+    # Qwen3.8-27B: same qwen3_5 arch as the 3.6-27B (64 layers / 16 full-attn /
+    # 4 KV heads / head_dim 256), so it shares the 3.6 slot's tuning verbatim.
+    # Registered alongside rather than replacing it: both compete for the same
+    # two slots via idle-unload, which keeps an A/B possible and the rollback
+    # free.  Retire "qwen3.6-27b" once 3.8 has proven itself on real traffic.
+    # qwen3.6-27b retired 2026-08-27: superseded by qwen3.8-27b, which is
+    # lighter (16.74 vs 18.41 GiB) AND holds more KV (8.91 vs 7.25 GiB,
+    # 200,118 vs 162,669 tok).  Removed rather than aliased so the old name
+    # fails loudly and callers migrate explicitly.  Weights kept on disk.
+    "qwen3.8-27b": ModelConfig(
+        "run_qwen38_27b.sh", "qwen3.8-27b"
     ),
     "qwen3-tts-1.7b-customvoice": ModelConfig(
         "run_qwen3_tts_1_7b_customvoice.sh",
@@ -363,7 +372,23 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
     # not, the stricter of the two silently wins.
     "qwen3.6-35b-a3b": 27.0,
     "qwen3.6-35b-a3b-heretic": 27.0,  # same floor as stock 35b
-    "qwen3.6-27b":     27.5,  # 0.84 × 32 GiB ≈ 26.9 + 0.6 GiB buffer
+    # Measured 2026-08-27 on a free GPU 1 at util 0.84 / max-model-len 65536:
+    #   weights 16.74 GiB + KV 6.65 GiB (149,796 tok, 2.29x concurrency)
+    #   = 23.39 GiB of the 26.75 GiB budget; 3.36 GiB is activations+graphs.
+    # MEASURED water line 2026-08-27 (filler tensor on GPU 1, direct vLLM spawn):
+    #   free 24.21 GiB @ util 0.78 -> FAILED
+    #   free 24.99 GiB @ util 0.78 -> FAILED
+    #   free 25.48 GiB @ util 0.79 -> started
+    #   free 26.26 GiB @ util 0.79 -> started
+    # vLLM's own message gives the rule: it needs free >= util x 31.36 GiB (its
+    # view of total) plus ~0.5 GiB already taken by its own CUDA context.  At the
+    # 0.78 floor that is 24.96 GiB.  This gate must sit above what the util
+    # calculation downstream will accept, which is 0.78 x 31.84 + 0.75 buffer =
+    # 25.59 GiB — stricter than vLLM's hard limit, so 25.6 is the binding number
+    # and anything higher only costs placements.  27.5 (copied from 3.6-27b) and
+    # 27.0 (reasoned by analogy to the 35B) both rejected cards this model starts
+    # on fine.  Re-measure if --max-model-len or MODEL_MIN_GPU_MEM_UTIL moves.
+    "qwen3.8-27b":     25.6,
     # Measured on an RTX 5090: the two-stage vLLM-Omni process settles at
     # ~29.3 GiB after Code2Wav CUDA-graph capture.  Require another 1 GiB so a
     # partially occupied card is rejected before launch instead of failing OOM.
@@ -380,7 +405,7 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
 MODEL_GPU_MEM_UTIL: dict[str, float] = {
     "qwen3.6-35b-a3b":         0.93,
     "qwen3.6-35b-a3b-heretic": 0.93,
-    "qwen3.6-27b":             0.84,
+    "qwen3.8-27b":             0.84,
 }
 # Margin (MiB) held back from current free VRAM when computing util — absorbs
 # nvidia-smi jitter and small growth by other GPU processes during vLLM startup.
@@ -413,7 +438,7 @@ GPU_MEM_UTIL_BUFFER_MIB = float(os.environ.get("GPU_MEM_UTIL_BUFFER_MIB", "768")
 MODEL_MIN_GPU_MEM_UTIL: dict[str, float] = {
     "qwen3.6-35b-a3b":         0.84,
     "qwen3.6-35b-a3b-heretic": 0.84,
-    "qwen3.6-27b":             0.78,
+    "qwen3.8-27b":             0.78,
 }
 # Fallback floor for models not listed above (best-effort attempt, not fail-fast).
 GPU_MEM_UTIL_FLOOR = float(os.environ.get("GPU_MEM_UTIL_FLOOR", "0.78"))
@@ -427,7 +452,7 @@ GPU_MEM_UTIL_FLOOR = float(os.environ.get("GPU_MEM_UTIL_FLOOR", "0.78"))
 MODEL_MAX_MODEL_LEN: dict[str, int] = {
     "qwen3.6-35b-a3b":         32768,
     "qwen3.6-35b-a3b-heretic": 32768,
-    "qwen3.6-27b":             65536,
+    "qwen3.8-27b":             65536,
 }
 # Don't bother reducing below this — a context this short is rarely useful, so we
 # fail the spawn instead and let the model run elsewhere / retry when VRAM frees.
