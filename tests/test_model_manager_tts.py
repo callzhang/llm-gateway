@@ -221,6 +221,14 @@ class TtsRegistrationTests(unittest.TestCase):
 
 
 class LauncherContractTests(unittest.TestCase):
+    def test_qwen38_disables_speculative_decoding_for_structured_outputs(self):
+        launcher = (REPO_ROOT / "run_qwen38_27b.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("--speculative-config", launcher)
+        self.assertIn("--enable-auto-tool-choice", launcher)
+
     def test_launcher_uses_dedicated_pinned_runtime_and_dynamic_slot(self):
         launcher = (
             REPO_ROOT / "run_qwen3_tts_1_7b_customvoice.sh"

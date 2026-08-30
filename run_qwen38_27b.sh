@@ -61,6 +61,9 @@ MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-65536}   # 3.8 is native 262144; held at the
 # the parser alone it rejects any request carrying tools.  Keep comments out
 # of the exec's line continuation below — a '#' line there ends the command
 # early.
+# Do not enable MTP speculative decoding here.  In vLLM 0.25.1 it can desync
+# xgrammar under concurrent JSON-schema output, allowing grammar-invalid tokens
+# and causing otherwise valid structured responses to fail downstream parsing.
 exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
@@ -72,7 +75,6 @@ exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
   --enable-chunked-prefill \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --enable-auto-tool-choice \
