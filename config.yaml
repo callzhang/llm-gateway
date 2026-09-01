@@ -1,27 +1,12 @@
 model_list:
 
-  # ── Qwen3.6-35B-A3B NVFP4 (multimodal, coding) ──────────────────────────
+  # ── Qwen3.6-35B-A3B heretic NVFP4 (uncensored, multimodal) ──────────────
   # Routes through model_manager :8002, which handles GPU slot management,
   # scale-out, idle unload, and x-task-id sticky routing for prefix cache
   # reuse.  Responses API → chat/completions conversion done by LiteLLM.
-  - model_name: qwen3.6-35b-a3b
-    litellm_params:
-      model: custom_openai/qwen3.6-35b-a3b
-      api_base: http://127.0.0.1:8002/v1
-      api_key: local-qwen36
-      # trim_hook dynamically caps to ctx_win - input_est - SAFETY at request
-      # time.  vLLM was loaded with --max-model-len 81920 (not theoretical
-      # 122880) so trim_hook and model_info must both reflect the real limit.
-      max_tokens: 32768
-      timeout: 600
-      stream_timeout: 600
-    model_info:
-      max_context_window_tokens: 81920
-      supports_vision: true
-
-  # ── Qwen3.6-35B-A3B heretic NVFP4 (uncensored, multimodal) ──────────────
-  # Same routing path as stock 35b.  run_qwen36_35b_heretic.sh keeps the ViT
-  # vision tower (image understanding); OCR proper is served by rapidocr.
+  # Stock qwen3.6-35b-a3b retired 2026-09-01 — heretic is the only 35B now.
+  # run_qwen36_35b_heretic.sh keeps the ViT vision tower (image
+  # understanding); OCR proper is served by rapidocr.
   - model_name: qwen3.6-35b-a3b-heretic
     litellm_params:
       model: custom_openai/qwen3.6-35b-a3b-heretic
@@ -39,10 +24,12 @@ model_list:
 
 
   # ── Qwen3.8-27B NVFP4+MTP (gittensor pure-FP4 build) ────────────────────
-  # Same qwen3_5 arch and same slot tuning as qwen3.6-27b, which it shadows
-  # rather than replaces so both can be A/B'd on real traffic.  No
-  # supports_vision: the run script passes --language-model-only, which makes
-  # get_limit_per_prompt() return 0 — the vision tower loads but rejects input.
+  # Same qwen3_5 arch and same slot tuning as the retired qwen3.6-27b.
+  # Vision enabled 2026-08-28: --language-model-only dropped from the run
+  # script.  Cost measured at 0.98 GiB of KV (200,118 -> 177,883 tokens,
+  # 3.05x -> 2.71x concurrency at 65536) once image size is capped to
+  # 4 Mpx — see the measurement table in run_qwen38_27b.sh.  Images larger
+  # than ~2048x2048 are downscaled by the preprocessor, not rejected.
   - model_name: qwen3.8-27b
     litellm_params:
       model: custom_openai/qwen3.8-27b
@@ -53,6 +40,7 @@ model_list:
       stream_timeout: 600
     model_info:
       max_context_window_tokens: 65536
+      supports_vision: true
 
   # ── Qwen3-TTS 1.7B CustomVoice (preset voices + instructions) ──────────
   # LiteLLM 1.86.2 was verified to preserve model, voice, instructions, and

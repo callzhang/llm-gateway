@@ -184,8 +184,8 @@ Edit `MODEL_CONFIGS` in `model_manager.py` to register your models:
 
 ```python
 MODEL_CONFIGS: dict[str, tuple[str, str]] = {
-    "qwen3.6-35b-a3b": ("run_qwen36_35b.sh", "qwen3.6-35b-a3b"),
-    "qwen3.6-27b":     ("run_qwen36_27b.sh",  "qwen3.6-27b"),
+    "qwen3.6-35b-a3b-heretic": ("run_qwen36_35b_heretic.sh", "qwen3.6-35b-a3b-heretic"),
+    "qwen3.8-27b":             ("run_qwen38_27b.sh",         "qwen3.8-27b"),
 }
 ```
 

@@ -23,7 +23,7 @@
 # not a thing that can be asked for.  Name at most two.
 #
 # Usage:  ./start_models.sh [model ...]
-#         default: qwen3.8-27b qwen3.6-35b-a3b
+#         default: qwen3.8-27b qwen3.6-35b-a3b-heretic
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,7 +35,6 @@ mkdir -p "$LOG_DIR"
 # launching the wrong checkpoint.
 declare -A RUN_SCRIPT=(
   ["qwen3.8-27b"]="run_qwen38_27b.sh"
-  ["qwen3.6-35b-a3b"]="run_qwen36_35b.sh"
   ["qwen3.6-35b-a3b-heretic"]="run_qwen36_35b_heretic.sh"
 )
 
@@ -46,7 +45,7 @@ MAX_SLOTS=${#SLOT_PORT[@]}
 
 MODELS=("$@")
 if [[ ${#MODELS[@]} -eq 0 ]]; then
-  MODELS=("qwen3.8-27b" "qwen3.6-35b-a3b")
+  MODELS=("qwen3.8-27b" "qwen3.6-35b-a3b-heretic")
 fi
 
 if [[ ${#MODELS[@]} -gt $MAX_SLOTS ]]; then

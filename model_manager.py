@@ -327,9 +327,10 @@ def _tts_max_input_chars() -> int:
 # The startup script receives VLLM_CUDA_DEVICE and VLLM_PORT from model_manager
 # at spawn time.
 MODEL_CONFIGS: dict[str, ModelConfig] = {
-    "qwen3.6-35b-a3b": ModelConfig(
-        "run_qwen36_35b.sh", "qwen3.6-35b-a3b"
-    ),
+    # Stock qwen3.6-35b-a3b retired 2026-09-01: the heretic abliteration serves
+    # the same checkpoint lineage with identical tuning, and nothing needed the
+    # censored variant.  Removed rather than aliased (same policy as the 27b
+    # retirement) so the old name fails loudly.  Weights kept on disk.
     "qwen3.6-35b-a3b-heretic": ModelConfig(
         "run_qwen36_35b_heretic.sh", "qwen3.6-35b-a3b-heretic"
     ),
@@ -370,8 +371,7 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
     # real contended-GPU-1 water line) has to pass: at 27.5 it did not.
     # Keep in step with MODEL_MIN_GPU_MEM_UTIL — if the floor moves and this does
     # not, the stricter of the two silently wins.
-    "qwen3.6-35b-a3b": 27.0,
-    "qwen3.6-35b-a3b-heretic": 27.0,  # same floor as stock 35b
+    "qwen3.6-35b-a3b-heretic": 27.0,
     # Measured 2026-08-27 on a free GPU 1 at util 0.84 / max-model-len 65536:
     #   weights 16.74 GiB + KV 6.65 GiB (149,796 tok, 2.29x concurrency)
     #   = 23.39 GiB of the 26.75 GiB budget; 3.36 GiB is activations+graphs.
@@ -403,7 +403,6 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
 # as a fraction of TOTAL memory and refuses to start when util×total exceeds the
 # memory free at launch — that's the failure this avoids.
 MODEL_GPU_MEM_UTIL: dict[str, float] = {
-    "qwen3.6-35b-a3b":         0.93,
     "qwen3.6-35b-a3b-heretic": 0.93,
     "qwen3.8-27b":             0.84,
 }
@@ -436,7 +435,6 @@ GPU_MEM_UTIL_BUFFER_MIB = float(os.environ.get("GPU_MEM_UTIL_BUFFER_MIB", "768")
 # Re-measure if --max-model-len changes again.  27B is dense with a normal KV
 # cache and tolerates more headroom.
 MODEL_MIN_GPU_MEM_UTIL: dict[str, float] = {
-    "qwen3.6-35b-a3b":         0.84,
     "qwen3.6-35b-a3b-heretic": 0.84,
     "qwen3.8-27b":             0.78,
 }
@@ -450,7 +448,6 @@ GPU_MEM_UTIL_FLOOR = float(os.environ.get("GPU_MEM_UTIL_FLOOR", "0.78"))
 # spawn once with VLLM_MAX_MODEL_LEN ≈ N so the model comes up at shorter context
 # rather than failing.  (35B/heretic 32768, 27B 65536 — see the run scripts.)
 MODEL_MAX_MODEL_LEN: dict[str, int] = {
-    "qwen3.6-35b-a3b":         32768,
     "qwen3.6-35b-a3b-heretic": 32768,
     "qwen3.8-27b":             65536,
 }
