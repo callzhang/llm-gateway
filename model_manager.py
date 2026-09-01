@@ -580,6 +580,68 @@ refresh(); setInterval(refresh, 2000);
 </html>
 """
 
+# Read-only status page — served at /status for the PUBLIC path route
+# (llm.preseen.ai/status → :8002 via the preseen-gateway tunnel).  No controls
+# and no /admin endpoints are reachable through that route: the page fetches
+# /status.json (GET, state only).  Keep it that way — /admin has no auth and
+# must stay LAN/Tailscale-only.
+STATUS_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Gateway — status</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.45 system-ui, sans-serif; margin: 0; padding: 24px;
+         background:#0e1116; color:#e6edf3; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color:#8b949e; margin-bottom: 18px; }
+  .grid { display:flex; flex-wrap:wrap; gap:16px; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:10px;
+          padding:16px; width:340px; }
+  .row { display:flex; justify-content:space-between; margin:3px 0; }
+  .k { color:#8b949e; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:999px;
+           font-size:12px; font-weight:600; }
+  .free    { background:#21262d; color:#8b949e; }
+  .ready   { background:#1a7f37; color:#fff; }
+  .starting{ background:#9e6a03; color:#fff; }
+  .failed  { background:#b62324; color:#fff; }
+  .model { font-size:15px; font-weight:600; margin:2px 0 10px; }
+  .meta { color:#6e7681; font-size:12px; margin-top:14px; }
+</style>
+</head>
+<body>
+<h1>LLM Gateway</h1>
+<div class="sub">GPU slots — read-only</div>
+<div id="grid" class="grid"></div>
+<div id="meta" class="meta"></div>
+<script>
+function card(s) {
+  const idle = s.idle_seconds==null ? '—' : s.idle_seconds + 's';
+  return `<div class="card">
+    <div class="row"><span class="k">slot ${s.slot_id} · GPU ${s.gpu_id}</span>
+      <span class="badge ${s.state}">${s.state}</span></div>
+    <div class="model">${s.model !== null ? s.model : '<i style="color:#6e7681">free</i>'}</div>
+    <div class="row"><span class="k">active requests</span><span>${s.active_requests}</span></div>
+    <div class="row"><span class="k">idle</span><span>${idle}</span></div>
+  </div>`;
+}
+async function refresh() {
+  try {
+    const r = await fetch('/status.json'); const d = await r.json();
+    document.getElementById('grid').innerHTML = d.slots.map(card).join('');
+    document.getElementById('meta').textContent =
+      `models: ${d.models.join(', ')} · idle_timeout ${d.idle_timeout}s`;
+  } catch (e) { document.getElementById('meta').textContent = 'status error: ' + e; }
+}
+refresh(); setInterval(refresh, 3000);
+</script>
+</body>
+</html>
+"""
+
 
 # ── GPU slot (physical resource) ───────────────────────────────────────────────
 
@@ -1704,7 +1766,12 @@ class DynamicRouter:
                     running=b.is_running,
                     failed=b._failed,
                     active_requests=b._active_requests,
-                    idle_seconds=int(now - b.last_activity),
+                    # last_activity is stamped at request start/end, so during
+                    # a long request "now - last_activity" grows while the
+                    # backend is busy.  A busy backend is not idle — report
+                    # None (rendered as "—") whenever requests are in flight.
+                    idle_seconds=(None if b._active_requests > 0
+                                  else int(now - b.last_activity)),
                     adopted=b._adopted_pid is not None,
                     state=("failed" if b._failed else
                            "ready" if (b._ready and b.is_running) else
@@ -2149,6 +2216,12 @@ class DynamicRouter:
         if request.method == "GET" and request.path in ("/admin", "/admin/"):
             return web.Response(text=ADMIN_HTML, content_type="text/html")
         if request.method == "GET" and request.path == "/admin/status":
+            return web.json_response(self.status())
+        # Read-only public status (see STATUS_HTML comment).  GET only; the
+        # tunnel's path route (^/status) can reach nothing but these two.
+        if request.method == "GET" and request.path in ("/status", "/status/"):
+            return web.Response(text=STATUS_HTML, content_type="text/html")
+        if request.method == "GET" and request.path == "/status.json":
             return web.json_response(self.status())
         if request.method == "POST" and request.path in (
             "/admin/kill", "/admin/start", "/admin/switch"
