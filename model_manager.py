@@ -307,6 +307,13 @@ class ModelConfig:
     allowed_gpu_ids: set[int] | None = None
     request_kind: Literal["chat", "speech"] = "chat"
     max_input_chars: int | None = None
+    max_num_seqs: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.request_kind != "chat":
+            return
+        if type(self.max_num_seqs) is not int or self.max_num_seqs <= 0:
+            raise ValueError("chat model max_num_seqs must be a positive integer")
 
 
 def _tts_max_input_chars() -> int:
@@ -332,7 +339,7 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
     # censored variant.  Removed rather than aliased (same policy as the 27b
     # retirement) so the old name fails loudly.  Weights kept on disk.
     "qwen3.6-35b-a3b-heretic": ModelConfig(
-        "run_qwen36_35b_heretic.sh", "qwen3.6-35b-a3b-heretic"
+        "run_qwen36_35b_heretic.sh", "qwen3.6-35b-a3b-heretic", max_num_seqs=16
     ),
     # Qwen3.8-27B: same qwen3_5 arch as the 3.6-27B (64 layers / 16 full-attn /
     # 4 KV heads / head_dim 256), so it shares the 3.6 slot's tuning verbatim.
@@ -344,7 +351,7 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
     # 200,118 vs 162,669 tok).  Removed rather than aliased so the old name
     # fails loudly and callers migrate explicitly.  Weights kept on disk.
     "qwen3.8-27b": ModelConfig(
-        "run_qwen38_27b.sh", "qwen3.8-27b"
+        "run_qwen38_27b.sh", "qwen3.8-27b", max_num_seqs=4
     ),
     "qwen3-tts-1.7b-customvoice": ModelConfig(
         "run_qwen3_tts_1_7b_customvoice.sh",
@@ -678,7 +685,15 @@ class GpuSlot:
 class GpuBackend:
     """Manages one vLLM subprocess: a specific model on a specific GPU slot."""
 
-    def __init__(self, model_name: str, script: str, served_name: str, slot: GpuSlot):
+    def __init__(
+        self,
+        model_name: str,
+        script: str,
+        served_name: str,
+        slot: GpuSlot,
+        *,
+        max_num_seqs: int | None = None,
+    ):
         self.model_name  = model_name
         self.served_name = served_name
         self.slot        = slot
@@ -686,6 +701,7 @@ class GpuBackend:
         self.gpu_id      = slot.gpu_id
         self.vllm_base   = f"http://127.0.0.1:{slot.port}"
         self.script      = os.path.join(SCRIPT_DIR, script)
+        self.max_num_seqs = max_num_seqs
         safe             = model_name.replace(".", "_")
         self.log_path    = os.path.join(LOG_DIR, f"{safe}_slot{slot.slot_id}.log")
         self.log         = logging.getLogger(f"mgr.s{slot.slot_id}.{model_name}")
@@ -1142,6 +1158,8 @@ class GpuBackend:
                 # a fresh deploy can't silently lose it.
                 "MAX_JOBS": os.environ.get("MAX_JOBS", "4"),
             }
+            if self.max_num_seqs is not None:
+                spawn_env["VLLM_MAX_NUM_SEQS"] = str(self.max_num_seqs)
             # VRAM-aware gpu_memory_utilization: lower it to fit current free VRAM
             # so a shared GPU can still host the model instead of OOM-ing.
             if util is not None:
@@ -1781,6 +1799,11 @@ class DynamicRouter:
         return {
             "slots": slots,
             "models": list(self.model_configs),
+            "model_limits": {
+                config.served_name: {"max_num_seqs": config.max_num_seqs}
+                for config in self.model_configs.values()
+                if config.max_num_seqs is not None
+            },
             "idle_timeout": IDLE_TIMEOUT,
             "wake_timeout": WAKE_TIMEOUT,
         }
@@ -1828,7 +1851,13 @@ class DynamicRouter:
                     f"{model_name} not allowed on GPU {slot.gpu_id}")
                 return
             config = self.model_configs[model_name]
-            b = GpuBackend(model_name, config.script, config.served_name, slot)
+            b = GpuBackend(
+                model_name,
+                config.script,
+                config.served_name,
+                slot,
+                max_num_seqs=config.max_num_seqs,
+            )
             b.router = self
             slot.backend = b           # CLAIM
             await b.start()            # init session + watchdog
@@ -1902,7 +1931,11 @@ class DynamicRouter:
                 slot   = self._by_free_vram(compatible)[0]
                 config = self.model_configs[model_name]
                 b      = GpuBackend(
-                    model_name, config.script, config.served_name, slot
+                    model_name,
+                    config.script,
+                    config.served_name,
+                    slot,
+                    max_num_seqs=config.max_num_seqs,
                 )
                 b.router = self
                 slot.backend = b          # CLAIM — blocks other models from this slot
@@ -2068,7 +2101,11 @@ class DynamicRouter:
             slot   = self._by_free_vram(free)[0]
             config = self.model_configs[model_name]
             new_b  = GpuBackend(
-                model_name, config.script, config.served_name, slot
+                model_name,
+                config.script,
+                config.served_name,
+                slot,
+                max_num_seqs=config.max_num_seqs,
             )
             new_b.router = self
             slot.backend = new_b
@@ -2556,7 +2593,13 @@ class DynamicRouter:
                 f"within {self.ADOPT_BOOT_WAIT}s — skipping"
             )
             return
-        b = GpuBackend(model_name, config.script, served_name, slot)
+        b = GpuBackend(
+            model_name,
+            config.script,
+            served_name,
+            slot,
+            max_num_seqs=config.max_num_seqs,
+        )
         b.router = self
         await b.start()                # init session + idle watchdog
         b._adopted_pid = pid

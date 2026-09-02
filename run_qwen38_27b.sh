@@ -80,6 +80,7 @@ MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-65536}   # 3.8 is native 262144; held at the
                                              # value so KV demand per token is unchanged
                                              # and the JIT/torch.compile cache key is
                                              # comparable.  Raising it invalidates warmth.
+MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:?VLLM_MAX_NUM_SEQS is required}
 
 # vLLM needs BOTH --tool-call-parser and --enable-auto-tool-choice: with
 # the parser alone it rejects any request carrying tools.  Keep comments out
@@ -92,7 +93,7 @@ exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --served-model-name qwen3.8-27b \
   --gpu-memory-utilization ${GPU_MEM_UTIL} \
   --max-model-len ${MAX_MODEL_LEN} \
-  --max-num-seqs 4 \
+  --max-num-seqs "$MAX_NUM_SEQS" \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
   --enable-chunked-prefill \

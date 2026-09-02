@@ -29,6 +29,7 @@ GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.93}   # model_manager lowers this to fit fre
 # (Was temporarily 32768 while debugging the FlashInfer JIT cold-start hang,
 # while config.yaml still claimed 122880 — that mismatch was live.)
 MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-81920}   # model_manager lowers this on a tight GPU to fit KV
+MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:?VLLM_MAX_NUM_SEQS is required}
 
 # served-model-name kept distinct so you can A/B against the stock 35b.
 # To make this a drop-in replacement instead, rename to: qwen3.6-35b-a3b
@@ -54,7 +55,7 @@ exec "$VLLM_BIN" serve AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4 \
   --quantization compressed-tensors \
   --gpu-memory-utilization ${GPU_MEM_UTIL} \
   --max-model-len ${MAX_MODEL_LEN} \
-  --max-num-seqs 16 \
+  --max-num-seqs "$MAX_NUM_SEQS" \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
   --enable-chunked-prefill \

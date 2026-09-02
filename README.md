@@ -324,6 +324,12 @@ journalctl --user -u llm-model-manager -u llm-litellm -u llm-open-webui -n 100
 systemctl --user status llm-tts-access-gateway
 ```
 
+The status payload includes each chat model's configured vLLM sequence ceiling at
+`model_limits.<served-model>.max_num_seqs`. The model manager passes the same value
+to the launcher through `VLLM_MAX_NUM_SEQS`; launchers intentionally have no numeric
+fallback, so status and the running vLLM process cannot drift between two manually
+maintained values.
+
 GPU4's pre-TTS deployment commit is `e922645`. A recoverable rollback keeps the
 current branch intact and temporarily runs the services from that detached
 commit:
