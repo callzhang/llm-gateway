@@ -153,6 +153,16 @@ for script in "${SCRIPTS[@]}"; do
     rc=1; continue
   fi
   name=$(basename "$script" .sh)
+  # model_manager injects VLLM_MAX_NUM_SEQS at spawn; a warm run invokes the
+  # run script directly, so it must supply the same value itself or the
+  # script's ":?required" guard kills the warm attempt in seconds (which is
+  # exactly what a marker-invalidated re-warm hit on 2026-09-03).  Keep these
+  # in sync with MODEL_CONFIGS in model_manager.py.
+  case $name in
+    run_qwen38_27b)         export VLLM_MAX_NUM_SEQS=8 ;;
+    run_qwen36_35b_heretic) export VLLM_MAX_NUM_SEQS=16 ;;
+    *)                      unset VLLM_MAX_NUM_SEQS ;;
+  esac
   # The run script's own contents are part of the key.  max_model_len changes
   # the torch.compile cache key (81920 hashes to a different cache dir than
   # 32768), and gpu-memory-utilization / quantization / backend flags matter

@@ -75,11 +75,17 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
 
-GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.84}   # model_manager lowers this to fit free VRAM
-MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-65536}   # 3.8 is native 262144; held at the 3.6-27B
-                                             # value so KV demand per token is unchanged
-                                             # and the JIT/torch.compile cache key is
-                                             # comparable.  Raising it invalidates warmth.
+GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.88}   # model_manager lowers this to fit free VRAM.
+                                          # 0.88 (2026-09-03, was 0.84) is the ceiling
+                                          # that still leaves room for the lazy-loading
+                                          # video-transcribe-service (~1.6 GiB on GPU1).
+MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-131072}   # raised 65536→131072 2026-09-03 (native
+                                             # 262144).  Changing this re-keys the
+                                             # torch.compile cache and invalidates the
+                                             # JIT warm marker — always let
+                                             # llm-jit-warmup re-warm before serving.
+                                             # Measured at 131072/0.88: KV 254,862 tok,
+                                             # 1.94x full-length concurrency.
 MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:?VLLM_MAX_NUM_SEQS is required}
 
 # vLLM needs BOTH --tool-call-parser and --enable-auto-tool-choice: with
