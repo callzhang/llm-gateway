@@ -36,7 +36,7 @@ import re
 import signal
 import subprocess
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Literal
 
@@ -87,6 +87,16 @@ SCALE_OUT_TIERS = _parse_scale_tiers(
     os.environ.get("SCALE_OUT_TIERS", "4:100,3:200,2:300")
 )
 SCALE_OUT_MIN_DEPTH = SCALE_OUT_TIERS[-1][0]   # lowest tier depth (default 2)
+
+# Sliding window for the accumulator: P is the sum of per-sample accruals from
+# the last SCALE_WINDOW seconds; older samples fall out on their own.  This
+# replaces the old waiting==0 hard reset — an oscillating backlog (queue
+# repeatedly forming and draining while the batch stays pinned at max_num_seqs)
+# now accumulates across episodes instead of starting over each time, while
+# evidence older than the window can never contribute to a fire.  Must exceed
+# the largest tier sustain (default 300s) or that tier can never fire; 2-3×
+# is the useful range.
+SCALE_WINDOW = float(os.environ.get("SCALE_WINDOW", "900"))
 
 def _scale_sustain_for(waiting: int) -> "float | None":
     """Seconds-at-this-depth needed to fire, for the deepest tier ≤ waiting.
@@ -350,8 +360,12 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
     # lighter (16.74 vs 18.41 GiB) AND holds more KV (8.91 vs 7.25 GiB,
     # 200,118 vs 162,669 tok).  Removed rather than aliased so the old name
     # fails loudly and callers migrate explicitly.  Weights kept on disk.
+    # max_num_seqs 4→8 (2026-09-02): daytime saturation showed running pinned
+    # at 4 with the KV pool barely half used — the bottleneck was batch slots,
+    # not memory.  240k KV tokens / 8 seqs = 30k per seq, well above the
+    # typical 8-10k-token request.
     "qwen3.8-27b": ModelConfig(
-        "run_qwen38_27b.sh", "qwen3.8-27b", max_num_seqs=4
+        "run_qwen38_27b.sh", "qwen3.8-27b", max_num_seqs=8
     ),
     "qwen3-tts-1.7b-customvoice": ModelConfig(
         "run_qwen3_tts_1_7b_customvoice.sh",
@@ -876,14 +890,30 @@ class GpuBackend:
                 # the borrowed slot returns to its evicted model promptly.  The
                 # lowest-slot instance is the primary and keeps the full timeout.
                 timeout = IDLE_TIMEOUT
+                is_replica = False
                 if self.router is not None:
                     siblings = self.router._running_backends(self.model_name)
                     if len(siblings) > 1 and \
                        self is not min(siblings, key=lambda b: b.slot.slot_id):
                         timeout = REPLICA_IDLE_TIMEOUT
+                        is_replica = True
                 idle = time.monotonic() - self.last_activity
                 if idle < timeout:
                     continue
+                if is_replica:
+                    # Don't reclaim a replica while a sibling still has a real
+                    # backlog: requests already proxied into the sibling's vLLM
+                    # queue can't be rebalanced here, but the very next arrival
+                    # will need this instance — killing it now just thrashes
+                    # (scale-out refires ~100s later and pays another cold start).
+                    try:
+                        depths = await asyncio.gather(
+                            *(b.queue_depth() for b in siblings if b is not self)
+                        )
+                        if sum(depths) > 0:
+                            continue
+                    except Exception:
+                        pass   # can't read siblings — fall through to reclaim
                 async with self._lock:
                     if not self.is_running or self._active_requests > 0:
                         continue
@@ -1233,6 +1263,10 @@ class GpuBackend:
                             f"(slot {self.slot.slot_id} GPU={self.gpu_id})"
                         )
                         self._ready = True
+                        # Idle counts from readiness, not from claim/spawn —
+                        # otherwise a ~60s cold start eats half a replica's
+                        # 120s idle allowance before it can serve anything.
+                        self.last_activity = time.monotonic()
                         return True
                     else:
                         self.log.warning(
@@ -1682,10 +1716,10 @@ class DynamicRouter:
         # Background admin tasks (start/kill/switch), kept referenced so the
         # event loop doesn't GC them mid-flight.
         self._admin_tasks: set[asyncio.Task] = set()
-        # Per-model scale-out progress P (0..1): accumulates dt/sustain(waiting)
-        # each sample; fires at P≥1 (see _saturation_loop / SCALE_OUT_TIERS).
-        # In-memory only — a restart resets it.
-        self._scale_progress: dict[str, float] = {}
+        # Per-model scale-out accrual samples: deque of (monotonic_ts, increment).
+        # P is the sum of increments newer than SCALE_WINDOW; fires at P≥1 (see
+        # _saturation_loop / SCALE_OUT_TIERS).  In-memory only — a restart resets it.
+        self._scale_accrual: dict[str, deque[tuple[float, float]]] = {}
         # Monotonic time of the previous saturation sample, for the accrual dt.
         self._sat_last_tick: float = 0.0
         self._sat_task: asyncio.Task | None = None
@@ -2163,15 +2197,17 @@ class DynamicRouter:
 
     async def _saturation_loop(self) -> None:
         """Sample each single-slot model's real vLLM queue (num_requests_waiting,
-        summed) every 10s and drive a weighted backlog accumulator P per model:
+        summed) every 10s and drive a sliding-window backlog accumulator P per
+        model — the sum of per-sample accruals from the last SCALE_WINDOW seconds:
 
-            waiting >= 2 → P += dt / sustain(waiting)   # deeper = faster
-            waiting == 1 → hold P                        # below lowest tier
-            waiting == 0 → P = 0                          # queue cleared
-            P >= 1.0     → attempt scale-out, reset P
+            waiting >= 2 → record (now, dt / sustain(waiting))   # deeper = faster
+            waiting <= 1 → record nothing (old samples age out on their own)
+            P >= 1.0     → attempt scale-out, clear the window
 
         Time at a shallow depth counts proportionally toward a deeper threshold
-        (waiting=2's 1/300-per-sec is 0.66× waiting=3's 1/200).  Models already on
+        (waiting=2's 1/300-per-sec is 0.66× waiting=3's 1/200), and an oscillating
+        backlog accumulates across drain/refill episodes inside the window instead
+        of resetting each time the queue momentarily empties.  Models already on
         >1 slot, or with nothing running, are skipped.  Decided here on sustained
         real backlog, never on a transient in-flight spike."""
         SAMPLE = 10
@@ -2189,7 +2225,7 @@ class DynamicRouter:
                     running = self._running_backends(model_name)
                     if len(running) != 1:
                         # 0 running → nothing to scale; >1 → already scaled out.
-                        self._scale_progress.pop(model_name, None)
+                        self._scale_accrual.pop(model_name, None)
                         continue
                     try:
                         depths = await asyncio.gather(
@@ -2199,34 +2235,41 @@ class DynamicRouter:
                         continue
                     waiting = sum(depths)
 
-                    if waiting == 0:
-                        if self._scale_progress.pop(model_name, None):
-                            self.log.info(
-                                f"{model_name}: queue cleared — scale-out timer reset"
-                            )
-                        continue
-                    if waiting == 1:
-                        continue   # below lowest tier — hold P, no accrual/reset
+                    window = self._scale_accrual.get(model_name)
+                    had_progress = bool(window)
+                    if window:
+                        cutoff = now - SCALE_WINDOW
+                        while window and window[0][0] < cutoff:
+                            window.popleft()
 
                     sustain = _scale_sustain_for(waiting)
-                    if sustain is None:        # waiting in (1, min_depth) — shouldn't
-                        continue                # happen with default tiers, but guard
-                    prev = self._scale_progress.get(model_name, 0.0)
-                    P = prev + (dt / sustain if dt > 0 else 0.0)
-                    if prev == 0.0 and P > 0.0:
+                    if sustain is not None and dt > 0:
+                        if window is None:
+                            window = self._scale_accrual[model_name] = deque()
+                        window.append((now, dt / sustain))
+                        if not had_progress:
+                            self.log.info(
+                                f"{model_name}: waiting={waiting} backlog — scale-out "
+                                f"accrual started (tier {int(sustain)}s, "
+                                f"window {int(SCALE_WINDOW)}s)"
+                            )
+                    elif had_progress and not window:
+                        # Last accrual aged past the window with no new backlog.
+                        self._scale_accrual.pop(model_name, None)
                         self.log.info(
-                            f"{model_name}: waiting={waiting} backlog — scale-out "
-                            f"timer started (tier {int(sustain)}s, weighted)"
+                            f"{model_name}: backlog window drained — accumulator empty"
                         )
+                        continue
+
+                    P = sum(inc for _, inc in window) if window else 0.0
                     if P >= 1.0:
                         self.log.info(
                             f"{model_name}: waiting={waiting} backlog sustained "
-                            f"(weighted P≥1.0) — attempting scale-out"
+                            f"(windowed P≥1.0 over {int(SCALE_WINDOW)}s) — "
+                            f"attempting scale-out"
                         )
                         self._trigger_scale_out(model_name)
-                        self._scale_progress.pop(model_name, None)   # reset
-                    else:
-                        self._scale_progress[model_name] = P
+                        self._scale_accrual.pop(model_name, None)   # start fresh
         except asyncio.CancelledError:
             pass
 
