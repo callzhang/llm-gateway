@@ -153,16 +153,35 @@ for script in "${SCRIPTS[@]}"; do
     rc=1; continue
   fi
   name=$(basename "$script" .sh)
-  # model_manager injects VLLM_MAX_NUM_SEQS at spawn; a warm run invokes the
-  # run script directly, so it must supply the same value itself or the
-  # script's ":?required" guard kills the warm attempt in seconds (which is
-  # exactly what a marker-invalidated re-warm hit on 2026-09-03).  Keep these
-  # in sync with MODEL_CONFIGS in model_manager.py.
-  case $name in
-    run_qwen38_27b)         export VLLM_MAX_NUM_SEQS=8 ;;
-    run_qwen36_35b_heretic) export VLLM_MAX_NUM_SEQS=16 ;;
-    *)                      unset VLLM_MAX_NUM_SEQS ;;
-  esac
+  # model_manager injects VLLM_MAX_NUM_SEQS / VLLM_GPU_MEM_UTIL at spawn; a
+  # warm run invokes the run script directly, so it must supply the same
+  # values itself or the scripts' ":?required" guards kill the warm attempt
+  # in seconds (a marker-invalidated re-warm hit exactly that on 2026-09-03).
+  # Derive them from model_manager.py at runtime — a hand-copied table here
+  # would be a second owner that drifts (the same bug class this replaces).
+  spawn_env=$("$PY" - "$name" <<'PYEOF'
+import sys
+sys.path.insert(0, ".")
+import model_manager as mm
+name = sys.argv[1] + ".sh"
+lines = []
+for model, cfg in mm.MODEL_CONFIGS.items():
+    if cfg.script == name:
+        if cfg.max_num_seqs:
+            lines.append(f"export VLLM_MAX_NUM_SEQS={cfg.max_num_seqs}")
+        util = mm.MODEL_GPU_MEM_UTIL.get(model)
+        if util is not None:
+            lines.append(f"export VLLM_GPU_MEM_UTIL={util}")
+        break
+# Anything not exported must be unset so one loop iteration cannot leak its
+# values into the next model's warm run.
+for var in ("VLLM_MAX_NUM_SEQS", "VLLM_GPU_MEM_UTIL"):
+    if not any(var in l for l in lines):
+        lines.append(f"unset {var}")
+print("\n".join(lines))
+PYEOF
+) || { echo "    FAILED to derive spawn env from model_manager.py — skipping"; rc=1; continue; }
+  eval "$spawn_env"
   # The run script's own contents are part of the key.  max_model_len changes
   # the torch.compile cache key (81920 hashes to a different cache dir than
   # 32768), and gpu-memory-utilization / quantization / backend flags matter

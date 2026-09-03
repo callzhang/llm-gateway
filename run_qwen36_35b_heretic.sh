@@ -22,7 +22,9 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
 
-GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.93}   # model_manager lowers this to fit free VRAM
+# No default on purpose — model_manager owns this value (MODEL_GPU_MEM_UTIL);
+# see the note in run_qwen38_27b.sh.  warm_jit_cache.sh derives it at runtime.
+GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:?VLLM_GPU_MEM_UTIL is required}
 # Matched to stock 35b's 81920.  config.yaml's max_context_window_tokens must
 # agree — trim_hook caps requests against it, so a config claiming more than
 # vLLM loaded makes every over-length request fail at the backend.

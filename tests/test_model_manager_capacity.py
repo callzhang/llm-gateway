@@ -83,21 +83,36 @@ class ModelSequenceLimitRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ModelSequenceLimitLauncherTests(unittest.TestCase):
-    def test_qwen38_warm_cache_limit_matches_registered_limit(self) -> None:
+    def test_warm_cache_derives_spawn_env_instead_of_hardcoding(self) -> None:
+        # The warm script must pull VLLM_MAX_NUM_SEQS / VLLM_GPU_MEM_UTIL out
+        # of model_manager.py at runtime.  A literal value here would be a
+        # second owner that drifts from MODEL_CONFIGS — the bug class that
+        # produced the dead 0.88 on 2026-09-03.
         warm_script = (
             Path(model_manager.SCRIPT_DIR) / "scripts" / "warm_jit_cache.sh"
         ).read_text(encoding="utf-8")
-        match = re.search(
-            r"run_qwen38_27b\)\s+export VLLM_MAX_NUM_SEQS=(\d+)",
-            warm_script,
-        )
 
-        self.assertIsNotNone(match)
-        assert match is not None
-        self.assertEqual(
-            model_manager.MODEL_CONFIGS["qwen3.8-27b"].max_num_seqs,
-            int(match.group(1)),
+        self.assertIsNone(
+            re.search(r"export VLLM_MAX_NUM_SEQS=\d", warm_script),
+            "warm_jit_cache.sh hardcodes VLLM_MAX_NUM_SEQS",
         )
+        self.assertIsNone(
+            re.search(r"export VLLM_GPU_MEM_UTIL=[\d.]", warm_script),
+            "warm_jit_cache.sh hardcodes VLLM_GPU_MEM_UTIL",
+        )
+        self.assertIn("import model_manager", warm_script)
+        self.assertIn("MODEL_GPU_MEM_UTIL", warm_script)
+
+    def test_chat_launchers_require_model_manager_gpu_mem_util(self) -> None:
+        # No :-default fallback allowed: the manager (MODEL_GPU_MEM_UTIL) is
+        # the only owner of this value, so a bare-run script must fail loudly.
+        for launcher_name in ("run_qwen38_27b.sh", "run_qwen36_35b_heretic.sh"):
+            with self.subTest(launcher=launcher_name):
+                launcher = (
+                    Path(model_manager.SCRIPT_DIR) / launcher_name
+                ).read_text(encoding="utf-8")
+                self.assertRegex(launcher, r"\$\{VLLM_GPU_MEM_UTIL:\?")
+                self.assertNotRegex(launcher, r"\$\{VLLM_GPU_MEM_UTIL:-")
 
     def test_chat_launchers_require_model_manager_sequence_limit(self) -> None:
         for launcher_name in ("run_qwen38_27b.sh", "run_qwen36_35b_heretic.sh"):

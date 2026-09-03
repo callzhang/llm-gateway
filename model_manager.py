@@ -1006,8 +1006,11 @@ class GpuBackend:
     def _gpu_mem_util_for_spawn(self) -> float | None:
         """Compute a gpu_memory_utilization that fits this GPU's *current* free VRAM.
 
-        Returns a value in [min_viable, default] to pass as VLLM_GPU_MEM_UTIL, or
-        None if VRAM can't be read (the script then uses its own baked-in default).
+        Returns a value in [min_viable, default] to pass as VLLM_GPU_MEM_UTIL,
+        falling back to the tuned default when VRAM can't be read.  Returns None
+        only for models with no MODEL_GPU_MEM_UTIL entry (their run scripts do
+        not read the variable).  The run scripts carry no default of their own —
+        the manager is the single owner of this value.
 
         util is capped at the model's tuned default and only ever lowered to fit
         the GPU's current free VRAM, so a model can still start on a GPU shared
@@ -1031,9 +1034,9 @@ class GpuBackend:
         if not total or free is None:
             self.log.info(
                 f"VRAM-aware util: could not read GPU {self.gpu_id} memory — "
-                f"using script default util ({default})"
+                f"using tuned default util ({default})"
             )
-            return None
+            return default
 
         min_viable = MODEL_MIN_GPU_MEM_UTIL.get(self.model_name, GPU_MEM_UTIL_FLOOR)
         fit  = (free - GPU_MEM_UTIL_BUFFER_MIB) / total

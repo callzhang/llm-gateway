@@ -75,10 +75,12 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
 
-GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.88}   # model_manager lowers this to fit free VRAM.
-                                          # 0.88 (2026-09-03, was 0.84) is the ceiling
-                                          # that still leaves room for the lazy-loading
-                                          # video-transcribe-service (~1.6 GiB on GPU1).
+# No default on purpose: model_manager owns this value (MODEL_GPU_MEM_UTIL, with
+# a spawn-time clamp to actual free VRAM) and always injects it.  A default here
+# would be a second owner that silently wins whenever the script is run outside
+# the manager — exactly how a stale 0.88 masqueraded as live config on 2026-09-03.
+# warm_jit_cache.sh derives the value from model_manager.py at runtime.
+GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:?VLLM_GPU_MEM_UTIL is required}
 MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-131072}   # raised 65536→131072 2026-09-03 (native
                                              # 262144).  Changing this re-keys the
                                              # torch.compile cache and invalidates the

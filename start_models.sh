@@ -30,6 +30,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
+# Interpreter for deriving per-model spawn env from model_manager.py — the run
+# scripts require VLLM_MAX_NUM_SEQS / VLLM_GPU_MEM_UTIL and carry no defaults
+# (the registry is the single owner; see run_qwen38_27b.sh).
+PY=${WARM_PY:-$(dirname "${VLLM_BIN:-/home/derek/miniforge3/envs/llm-gateway-vllm/bin/vllm}")/python}
+
 # Must track MODEL_CONFIGS in model_manager.py.  Kept as an explicit table
 # rather than parsed out of the Python so a typo fails here, loudly, instead of
 # launching the wrong checkpoint.
@@ -102,6 +107,28 @@ for i in "${!MODELS[@]}"; do
     rc=1
     continue
   fi
+
+  # Same derivation warm_jit_cache.sh uses: pull the registry's values so a
+  # manual start cannot drift from what model_manager would spawn.
+  spawn_env=$(cd "$SCRIPT_DIR" && "$PY" - "$m" <<'PYEOF'
+import sys
+sys.path.insert(0, ".")
+import model_manager as mm
+cfg = mm.MODEL_CONFIGS.get(sys.argv[1])
+lines = []
+if cfg is not None:
+    if cfg.max_num_seqs:
+        lines.append(f"export VLLM_MAX_NUM_SEQS={cfg.max_num_seqs}")
+    util = mm.MODEL_GPU_MEM_UTIL.get(sys.argv[1])
+    if util is not None:
+        lines.append(f"export VLLM_GPU_MEM_UTIL={util}")
+for var in ("VLLM_MAX_NUM_SEQS", "VLLM_GPU_MEM_UTIL"):
+    if not any(var in l for l in lines):
+        lines.append(f"unset {var}")
+print("\n".join(lines))
+PYEOF
+) || { echo "[models] FAILED to derive spawn env for $m from model_manager.py"; rc=1; continue; }
+  eval "$spawn_env"
 
   echo "[models] Starting $m on GPU $gpu (:$port) ..."
   VLLM_CUDA_DEVICE=$gpu VLLM_PORT=$port \
