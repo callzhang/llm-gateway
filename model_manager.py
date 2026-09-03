@@ -432,7 +432,12 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
 # memory free at launch — that's the failure this avoids.
 MODEL_GPU_MEM_UTIL: dict[str, float] = {
     "qwen3.6-35b-a3b-heretic": 0.93,
-    "qwen3.8-27b":             0.84,
+    # 0.84→0.90 (2026-09-03): ~29.7 GiB actual usage, ~+55k KV tokens (mostly
+    # extra prefix-cache retention for the memory pipeline's repeated long
+    # prompts).  Leaves ~2.9 GiB for neighbours — covers gliner (0.5) plus a
+    # late-loading video-transcribe (1.6) with ~0.8 spare; 0.92 would not.
+    # The spawn-time clamp below still lowers this to fit whatever is free.
+    "qwen3.8-27b":             0.90,
 }
 # Margin (MiB) held back from current free VRAM when computing util — absorbs
 # nvidia-smi jitter and small growth by other GPU processes during vLLM startup.
