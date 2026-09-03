@@ -360,12 +360,19 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
     # lighter (16.74 vs 18.41 GiB) AND holds more KV (8.91 vs 7.25 GiB,
     # 200,118 vs 162,669 tok).  Removed rather than aliased so the old name
     # fails loudly and callers migrate explicitly.  Weights kept on disk.
-    # Keep max_num_seqs at the full-eval-validated GPU4 capacity of 4. Raising
-    # this ceiling requires a comparable, single-variable runtime experiment;
-    # spare KV capacity alone does not prove end-to-end stability for the
-    # Responses API and background processing chain.
+    # max_num_seqs=8, validated by the single-variable A/B of 2026-09-03 (same
+    # day, same traffic source, only the seq limit changed):
+    #   seq=8 09:05-09:55: 491 reqs, lambda=10.1/min, E[S]=54s, offered load
+    #     rho=9.0 concurrent; both instances ran 7+7 with waiting=0 throughout.
+    #   seq=4 windows (09-02 all day + 09-03 10:05+): rho=9 > 2x4 capacity, so
+    #     the queue is mathematically unstable at peak (observed waiting up to
+    #     16) and the replica churns through cold starts.
+    #   Decode throughput curve (1121 pure-decode samples): aggregate scales
+    #     near-linearly 96->568 tok/s from 1->8 running; per-request speed is
+    #     flat, 72.0 (batch 4) vs 71.0 (batch 8) tok/s, a 1.4% drop.  KV at 8:
+    #     254,862/8 = 31.8k tokens per seq vs ~9k p50 requests.
     "qwen3.8-27b": ModelConfig(
-        "run_qwen38_27b.sh", "qwen3.8-27b", max_num_seqs=4
+        "run_qwen38_27b.sh", "qwen3.8-27b", max_num_seqs=8
     ),
     "qwen3-tts-1.7b-customvoice": ModelConfig(
         "run_qwen3_tts_1_7b_customvoice.sh",

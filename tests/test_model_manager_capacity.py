@@ -12,7 +12,9 @@ import model_manager
 
 class ModelSequenceLimitConfigTests(unittest.TestCase):
     def test_qwen38_registered_limit_matches_validated_gpu4_capacity(self) -> None:
-        self.assertEqual(4, model_manager.MODEL_CONFIGS["qwen3.8-27b"].max_num_seqs)
+        # 8 validated by the 2026-09-03 A/B: rho=9.0 peak demand, per-request
+        # decode -1.4% at batch 8, KV 31.8k tokens/seq.  See MODEL_CONFIGS.
+        self.assertEqual(8, model_manager.MODEL_CONFIGS["qwen3.8-27b"].max_num_seqs)
 
     def test_chat_model_accepts_positive_max_num_seqs(self) -> None:
         config = model_manager.ModelConfig(
@@ -92,7 +94,6 @@ class ModelSequenceLimitLauncherTests(unittest.TestCase):
 
         self.assertIsNotNone(match)
         assert match is not None
-        self.assertEqual(4, int(match.group(1)))
         self.assertEqual(
             model_manager.MODEL_CONFIGS["qwen3.8-27b"].max_num_seqs,
             int(match.group(1)),
