@@ -159,7 +159,7 @@ for script in "${SCRIPTS[@]}"; do
   # exactly what a marker-invalidated re-warm hit on 2026-09-03).  Keep these
   # in sync with MODEL_CONFIGS in model_manager.py.
   case $name in
-    run_qwen38_27b)         export VLLM_MAX_NUM_SEQS=8 ;;
+    run_qwen38_27b)         export VLLM_MAX_NUM_SEQS=4 ;;
     run_qwen36_35b_heretic) export VLLM_MAX_NUM_SEQS=16 ;;
     *)                      unset VLLM_MAX_NUM_SEQS ;;
   esac

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,9 @@ import model_manager
 
 
 class ModelSequenceLimitConfigTests(unittest.TestCase):
+    def test_qwen38_registered_limit_matches_validated_gpu4_capacity(self) -> None:
+        self.assertEqual(4, model_manager.MODEL_CONFIGS["qwen3.8-27b"].max_num_seqs)
+
     def test_chat_model_accepts_positive_max_num_seqs(self) -> None:
         config = model_manager.ModelConfig(
             script="run_qwen38_27b.sh",
@@ -77,6 +81,23 @@ class ModelSequenceLimitRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ModelSequenceLimitLauncherTests(unittest.TestCase):
+    def test_qwen38_warm_cache_limit_matches_registered_limit(self) -> None:
+        warm_script = (
+            Path(model_manager.SCRIPT_DIR) / "scripts" / "warm_jit_cache.sh"
+        ).read_text(encoding="utf-8")
+        match = re.search(
+            r"run_qwen38_27b\)\s+export VLLM_MAX_NUM_SEQS=(\d+)",
+            warm_script,
+        )
+
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(4, int(match.group(1)))
+        self.assertEqual(
+            model_manager.MODEL_CONFIGS["qwen3.8-27b"].max_num_seqs,
+            int(match.group(1)),
+        )
+
     def test_chat_launchers_require_model_manager_sequence_limit(self) -> None:
         for launcher_name in ("run_qwen38_27b.sh", "run_qwen36_35b_heretic.sh"):
             with self.subTest(launcher=launcher_name):

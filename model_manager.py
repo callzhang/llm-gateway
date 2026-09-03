@@ -360,12 +360,12 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
     # lighter (16.74 vs 18.41 GiB) AND holds more KV (8.91 vs 7.25 GiB,
     # 200,118 vs 162,669 tok).  Removed rather than aliased so the old name
     # fails loudly and callers migrate explicitly.  Weights kept on disk.
-    # max_num_seqs 4→8 (2026-09-02): daytime saturation showed running pinned
-    # at 4 with the KV pool barely half used — the bottleneck was batch slots,
-    # not memory.  240k KV tokens / 8 seqs = 30k per seq, well above the
-    # typical 8-10k-token request.
+    # Keep max_num_seqs at the full-eval-validated GPU4 capacity of 4. Raising
+    # this ceiling requires a comparable, single-variable runtime experiment;
+    # spare KV capacity alone does not prove end-to-end stability for the
+    # Responses API and background processing chain.
     "qwen3.8-27b": ModelConfig(
-        "run_qwen38_27b.sh", "qwen3.8-27b", max_num_seqs=8
+        "run_qwen38_27b.sh", "qwen3.8-27b", max_num_seqs=4
     ),
     "qwen3-tts-1.7b-customvoice": ModelConfig(
         "run_qwen3_tts_1_7b_customvoice.sh",
