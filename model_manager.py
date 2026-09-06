@@ -22,7 +22,7 @@ Scripts receive VLLM_CUDA_DEVICE and VLLM_PORT env vars at launch so the same
 script can run on any slot.  Scripts must honour these variables.
 
 Environment overrides:
-  IDLE_TIMEOUT   idle seconds before unload   (default: 300)
+  IDLE_TIMEOUT   idle seconds before unload   (default: 1200)
   WAKE_TIMEOUT   max seconds for cold start   (default: 300)
   HEALTH_POLL    poll interval while waking   (default: 2.0)
 """
@@ -44,7 +44,15 @@ import aiohttp
 from aiohttp import web
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "300"))
+# 300→1200 (2026-09-04): real traffic for both chat models arrives in bursts
+# 10-90 min apart, so 300s kept unloading models whose next burst almost always
+# came back — a dozen+ pointless unload→cold-start (~110s) cycles a day,
+# including an unload beaten by the next request within 2 minutes (11:44→11:46).
+# 20 min keeps the daytime cadence warm while still releasing the cards across
+# the long overnight gaps.  A service-wide knob on purpose: idle policy is
+# resource management, not a property of any one model.  Replicas still shed
+# early via REPLICA_IDLE_TIMEOUT.
+IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "1200"))
 # Not sized for the normal case — warm-cache spawns finish in 40-160s.  This is
 # the self-heal budget for when llm-jit-warmup did not run or its marker was
 # wrong, so a first-time FlashInfer/CUTLASS compile lands on the request path
