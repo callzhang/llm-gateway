@@ -127,5 +127,24 @@ class ModelSequenceLimitLauncherTests(unittest.TestCase):
                 self.assertIn('--max-num-seqs "$MAX_NUM_SEQS"', launcher)
 
 
+class ScaleInQuietWindowTests(unittest.TestCase):
+    def test_quiet_window_outlasts_scale_out_reaction(self) -> None:
+        # A replica must stay quiet longer than it would take scale-out to
+        # decide it is needed again; otherwise reclaim/re-spawn can cycle.
+        fastest_tier = min(secs for _, secs in model_manager.SCALE_OUT_TIERS)
+        self.assertGreater(
+            model_manager.REPLICA_QUIET_BEFORE_RECLAIM, fastest_tier
+        )
+        self.assertGreaterEqual(
+            model_manager.REPLICA_QUIET_BEFORE_RECLAIM,
+            model_manager.REPLICA_IDLE_TIMEOUT,
+        )
+
+    def test_primary_idle_timeout_outlasts_replica_shedding(self) -> None:
+        self.assertGreater(
+            model_manager.IDLE_TIMEOUT, model_manager.REPLICA_IDLE_TIMEOUT
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

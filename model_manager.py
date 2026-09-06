@@ -116,6 +116,17 @@ def _scale_sustain_for(waiting: int) -> "float | None":
 # Extra replicas (a model running on >1 slot) idle out faster than the primary so
 # a borrowed slot is returned to its evicted model promptly (asymmetric scale-in).
 REPLICA_IDLE_TIMEOUT = int(os.environ.get("REPLICA_IDLE_TIMEOUT", "120"))
+# A replica also has to see the model QUIET — no queued request on any instance
+# — for this long before it is reclaimed.  Its own idleness is not enough:
+# least-connections gives the replica the lighter share, so it can fall idle
+# while the primary is still saturated, and the instantaneous "is anything
+# queued right now" check passes during any brief trough.  Observed 2026-09-04:
+# replica reclaimed at 23:26:54 during a trough, backlog returned 50s later,
+# scale-out re-fired at 23:29:14 — a wasted ~110s cold start with 5-6 requests
+# queued behind it.  Must exceed the scale-out tiers' reaction time.
+REPLICA_QUIET_BEFORE_RECLAIM = int(
+    os.environ.get("REPLICA_QUIET_BEFORE_RECLAIM", "300")
+)
 
 # ── Self-heal: recycle a ready-but-degraded backend on repeated upstream 5xx ──────
 # A backend can be process-alive yet broken — CUDA error, wedged scheduler, or an
@@ -921,11 +932,25 @@ class GpuBackend:
                 if idle < timeout:
                     continue
                 if is_replica:
-                    # Don't reclaim a replica while a sibling still has a real
-                    # backlog: requests already proxied into the sibling's vLLM
-                    # queue can't be rebalanced here, but the very next arrival
-                    # will need this instance — killing it now just thrashes
-                    # (scale-out refires ~100s later and pays another cold start).
+                    # Don't reclaim a replica while the model has been busy
+                    # recently.  Two separate guards, both needed:
+                    #
+                    #  1. Sustained quiet: the saturation sampler stamps every
+                    #     sample that saw a queued request anywhere on this
+                    #     model.  Reclaiming during a trough between bursts is
+                    #     what caused the 23:26→23:29 churn on 2026-09-04, and
+                    #     an instantaneous check cannot see it.
+                    #  2. Instantaneous: a sibling queue that is non-empty right
+                    #     now.  Those requests are already proxied into that
+                    #     vLLM and cannot be rebalanced here.
+                    last_busy = (
+                        self.router._last_backlog_at.get(self.model_name)
+                        if self.router is not None else None
+                    )
+                    if last_busy is not None:
+                        quiet_for = time.monotonic() - last_busy
+                        if quiet_for < REPLICA_QUIET_BEFORE_RECLAIM:
+                            continue
                     try:
                         depths = await asyncio.gather(
                             *(b.queue_depth() for b in siblings if b is not self)
@@ -1743,6 +1768,10 @@ class DynamicRouter:
         # P is the sum of increments newer than SCALE_WINDOW; fires at P≥1 (see
         # _saturation_loop / SCALE_OUT_TIERS).  In-memory only — a restart resets it.
         self._scale_accrual: dict[str, deque[tuple[float, float]]] = {}
+        # Monotonic time of the last sample where a model had ANY queued
+        # request across all its instances.  Scale-in reads this so a replica
+        # is not reclaimed during a lull between bursts (see _idle_loop).
+        self._last_backlog_at: dict[str, float] = {}
         # Monotonic time of the previous saturation sample, for the accrual dt.
         self._sat_last_tick: float = 0.0
         self._sat_task: asyncio.Task | None = None
@@ -2246,9 +2275,9 @@ class DynamicRouter:
 
                 for model_name in self.model_configs:
                     running = self._running_backends(model_name)
-                    if len(running) != 1:
-                        # 0 running → nothing to scale; >1 → already scaled out.
+                    if not running:
                         self._scale_accrual.pop(model_name, None)
+                        self._last_backlog_at.pop(model_name, None)
                         continue
                     try:
                         depths = await asyncio.gather(
@@ -2257,6 +2286,17 @@ class DynamicRouter:
                     except Exception:
                         continue
                     waiting = sum(depths)
+                    # Stamp model-wide backlog on EVERY sample, including while
+                    # scaled out — scale-in reads this to avoid reclaiming a
+                    # replica during a lull between bursts.
+                    if waiting > 0:
+                        self._last_backlog_at[model_name] = now
+
+                    if len(running) != 1:
+                        # Already scaled out: no accrual (the backlog stamp
+                        # above is still what scale-in needs).
+                        self._scale_accrual.pop(model_name, None)
+                        continue
 
                     window = self._scale_accrual.get(model_name)
                     had_progress = bool(window)
