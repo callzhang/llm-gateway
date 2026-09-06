@@ -1892,6 +1892,16 @@ class DynamicRouter:
             },
             "idle_timeout": IDLE_TIMEOUT,
             "wake_timeout": WAKE_TIMEOUT,
+            # Seconds since this model last had a queued request on ANY of its
+            # instances (null = none seen since start).  This is the signal the
+            # replica scale-in guard reads, so surfacing it here is what makes
+            # a "should that replica have been reclaimed?" question answerable
+            # after the fact instead of a guess.
+            "quiet_for": {
+                model_name: round(now - stamp, 1)
+                for model_name, stamp in self._last_backlog_at.items()
+            },
+            "replica_quiet_before_reclaim": REPLICA_QUIET_BEFORE_RECLAIM,
         }
 
     def _track_admin(self, coro) -> None:
