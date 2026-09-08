@@ -124,8 +124,18 @@ REPLICA_IDLE_TIMEOUT = int(os.environ.get("REPLICA_IDLE_TIMEOUT", "120"))
 # replica reclaimed at 23:26:54 during a trough, backlog returned 50s later,
 # scale-out re-fired at 23:29:14 — a wasted ~110s cold start with 5-6 requests
 # queued behind it.  Must exceed the scale-out tiers' reaction time.
+# Calibrated against the real gap distribution rather than picked: over a full
+# day (3243 requests, 58 gaps >60s) the idle gaps are strongly bimodal —
+# p50=123s and p75=202s are pauses *within* a burst, and only the p90=829s tail
+# is traffic actually ending.  Coverage of the within-burst gaps by threshold:
+# 300s→81.0%, 600s→89.7%, 900s→91.4%; the extra GPU held when traffic really
+# has ended is 55 / 60 / 75 min-per-day respectively.  600s buys ~9 points of
+# coverage (≈5 avoided cold starts a day, each ~110s with requests queued
+# behind it) for 5 extra minutes of held GPU — the knee is here, and 900s is
+# past it.  Re-measure if the traffic shape changes; a same-day sample of only
+# 37 gaps put the knee at 300s, which is how this was first set.
 REPLICA_QUIET_BEFORE_RECLAIM = int(
-    os.environ.get("REPLICA_QUIET_BEFORE_RECLAIM", "300")
+    os.environ.get("REPLICA_QUIET_BEFORE_RECLAIM", "600")
 )
 
 # ── Self-heal: recycle a ready-but-degraded backend on repeated upstream 5xx ──────
