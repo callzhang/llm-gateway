@@ -124,18 +124,28 @@ REPLICA_IDLE_TIMEOUT = int(os.environ.get("REPLICA_IDLE_TIMEOUT", "120"))
 # replica reclaimed at 23:26:54 during a trough, backlog returned 50s later,
 # scale-out re-fired at 23:29:14 — a wasted ~110s cold start with 5-6 requests
 # queued behind it.  Must exceed the scale-out tiers' reaction time.
-# Calibrated against the real gap distribution rather than picked: over a full
-# day (3243 requests, 58 gaps >60s) the idle gaps are strongly bimodal —
-# p50=123s and p75=202s are pauses *within* a burst, and only the p90=829s tail
-# is traffic actually ending.  Coverage of the within-burst gaps by threshold:
-# 300s→81.0%, 600s→89.7%, 900s→91.4%; the extra GPU held when traffic really
-# has ended is 55 / 60 / 75 min-per-day respectively.  600s buys ~9 points of
-# coverage (≈5 avoided cold starts a day, each ~110s with requests queued
-# behind it) for 5 extra minutes of held GPU — the knee is here, and 900s is
-# past it.  Re-measure if the traffic shape changes; a same-day sample of only
-# 37 gaps put the knee at 300s, which is how this was first set.
+# Calibrated against measured gap distributions, not picked.  Over three days of
+# request arrivals, bucketed per model by which one was serving at the time:
+#
+#   qwen3.8-27b   6040 reqs, 136 gaps >60s: p50=118s p75=252s p90=783s
+#     coverage 300s→76.5%  600s→87.5%  900s→92.6%  1200s→93.4%
+#     GPU held  160 min     170 min     150 min     180 min
+#   heretic       1976 reqs,  14 gaps >60s: p50=133s p75=591s p90=941s
+#     coverage 300s→71.4%  600s→78.6%  900s→85.7%  1200s→85.7%
+#
+# Held-GPU cost is (gaps ≥ threshold) × threshold, and it does NOT rise
+# monotonically: raising the bar past a cluster of within-burst pauses removes
+# more gaps than the longer hold adds, so 900s actually holds *less* GPU than
+# 600s while covering 5 points more.  1200s is past the knee (+0.8 points,
+# +30 min).  Both models agree on 900s, which is why this stays a service-wide
+# knob rather than a per-model table.
+#
+# Measure from request ARRIVALS (aiohttp access log), never from a vLLM
+# instance's own log: an instance is unloaded after IDLE_TIMEOUT, so its log
+# cannot contain a gap longer than that and the tail gets silently censored —
+# which made an earlier attempt at this read "1200s covers 100%".
 REPLICA_QUIET_BEFORE_RECLAIM = int(
-    os.environ.get("REPLICA_QUIET_BEFORE_RECLAIM", "600")
+    os.environ.get("REPLICA_QUIET_BEFORE_RECLAIM", "900")
 )
 
 # ── Self-heal: recycle a ready-but-degraded backend on repeated upstream 5xx ──────
