@@ -38,11 +38,20 @@ model_list:
       max_tokens: 32768
       timeout: 600
       stream_timeout: 600
+      # drop_params would otherwise drop reasoning_effort for custom_openai, and
+      # every request ran at the template default (xhigh) whatever it asked for.
+      allowed_openai_params: ["reasoning_effort"]
     model_info:
       # Must match --max-model-len in run_qwen38_27b.sh (raised 65536→131072
       # on 2026-09-02; model native is 262144).  trim_hook reads this value.
       max_context_window_tokens: 131072
       supports_vision: true
+      # The chat template raises on anything outside these levels (xhigh is its
+      # default); reasoning_effort_hook maps OpenAI-style aliases onto them and
+      # drops unknown values so they fall back to the default instead of a 400.
+      reasoning_effort:
+        levels: [xhigh, medium, low]
+        aliases: {high: xhigh, minimal: low}
 
   # ── Qwen3-TTS 1.7B CustomVoice (preset voices + instructions) ──────────
   # LiteLLM 1.86.2 was verified to preserve model, voice, instructions, and
@@ -74,6 +83,8 @@ litellm_settings:
   # trim_hook.py is in the same directory as this config file.
   callbacks:
     - trim_hook.context_trim_hook
+    # Map reasoning_effort onto what each model's chat template accepts.
+    - reasoning_effort_hook.reasoning_effort_hook
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
