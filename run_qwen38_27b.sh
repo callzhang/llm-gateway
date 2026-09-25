@@ -94,6 +94,9 @@ MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:?VLLM_MAX_NUM_SEQS is required}
 # the parser alone it rejects any request carrying tools.  Keep comments out
 # of the exec's line continuation below — a '#' line there ends the command
 # early.
+# Compact JSON for structured outputs: pretty-printing was ~37% of the answer
+# tokens of memory extraction.  disable_any_whitespace needs an explicit
+# xgrammar/guidance backend (vLLM rejects it with backend=auto).
 exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
@@ -105,6 +108,7 @@ exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
   --enable-chunked-prefill \
+  --structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}' \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --enable-auto-tool-choice \
