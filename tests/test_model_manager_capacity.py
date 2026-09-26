@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -227,3 +229,22 @@ class ScaleInQuietWindowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EvalLockShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shutdown_waits_until_eval_lock_is_released(self) -> None:
+        with tempfile.NamedTemporaryFile() as lock_file:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            task = asyncio.create_task(
+                model_manager._wait_for_eval_lock_release(
+                    model_manager.logging.getLogger("test"),
+                    lock_path=lock_file.name,
+                    poll_seconds=0.001,
+                )
+            )
+            await asyncio.sleep(0.01)
+            self.assertFalse(task.done())
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            await asyncio.wait_for(task, timeout=1.0)

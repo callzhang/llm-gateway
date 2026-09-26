@@ -28,6 +28,7 @@ Environment overrides:
 """
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -71,6 +72,10 @@ LISTEN_PORT  = int(os.environ.get("LISTEN_PORT", "8002"))
 # chain ACCEPTs tailscale0 traffic before ufw; LAN stays blocked by ufw
 # default-deny; 0.0.0.0 still covers 127.0.0.1 so internal loopback is intact).
 LISTEN_HOST  = os.environ.get("LISTEN_HOST", "0.0.0.0")
+EVAL_LOCK_FILE = os.environ.get(
+    "MEMORY_CI_EVAL_LOCK_FILE",
+    "/home/stardust/services/memory-ci-controller/memory-required-evals.lock",
+)
 
 # ── Scale-out gating (weighted backlog accumulator) ──────────────────────────────
 # Scale a model onto a 2nd GPU based on its *real* internal queue
@@ -473,6 +478,40 @@ async def _terminate_adopted_vllm(pid: int) -> None:
             os.kill(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         pass
+
+
+async def _wait_for_eval_lock_release(
+    log: logging.Logger,
+    *,
+    lock_path: str = EVAL_LOCK_FILE,
+    poll_seconds: float = 1.0,
+) -> None:
+    """Keep the gateway serving while a serialized eval owns the host lock."""
+    try:
+        lock_file = open(lock_path, "r", encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log.warning(f"Cannot inspect eval lock {lock_path}: {exc}")
+        return
+
+    with lock_file:
+        waiting_logged = False
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if not waiting_logged:
+                    log.warning(
+                        f"Eval lock {lock_path} is held; delaying model_manager shutdown"
+                    )
+                    waiting_logged = True
+                await asyncio.sleep(poll_seconds)
+                continue
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            if waiting_logged:
+                log.info("Eval lock released; continuing model_manager shutdown")
+            return
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -3256,6 +3295,7 @@ async def main() -> None:
     try:
         await stop_event.wait()
     finally:
+        await _wait_for_eval_lock_release(log)
         # Stop the listener FIRST so no new requests can arrive and trigger a
         # spawn during shutdown (which previously orphaned a vLLM that we then
         # could not adopt).  Then tear down idle watchdogs and sessions.  vLLM

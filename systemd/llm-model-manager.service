@@ -17,7 +17,10 @@ ExecStart=/home/derek/Projects/llm-gateway/run_model_manager.sh
 # vLLM running until the next start adopts it (or you kill it manually).
 KillMode=process
 KillSignal=SIGTERM
-TimeoutStopSec=120
+# A serialized full eval can hold the shared host lock for longer than two
+# minutes. model_manager waits for that lock before stopping so a deployment
+# cannot take the gateway out from under an active eval.
+TimeoutStopSec=7200
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=30
