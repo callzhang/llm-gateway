@@ -98,7 +98,7 @@ class BudgetPlacementTests(unittest.IsolatedAsyncioTestCase):
         self.router = _router()
         self.floor_mib = (
             model_manager.MODEL_MIN_GPU_MEM_UTIL.get(ASR, model_manager.GPU_MEM_UTIL_FLOOR)
-            * TOTAL_MIB + model_manager.HARD_MARGIN_MIB
+            * TOTAL_MIB + model_manager.CORESIDENT_OVERHEAD_MIB
         )
 
     def _pick(self, free, model=ASR):
@@ -150,7 +150,7 @@ class BudgetPlacementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("GPU 0", message)
         self.assertIn("GPU 1", message)
 
-    def test_boundary_needs_the_min_viable_footprint_plus_margin(self):
+    def test_boundary_needs_the_min_viable_footprint_plus_cuda_context(self):
         self.assertEqual(0, self._pick({0: self.floor_mib, 1: 0.0}))
         with self.assertRaises(GPUBusyError):
             self._pick({0: self.floor_mib - 1, 1: 0.0})
@@ -163,7 +163,7 @@ class BudgetPlacementTests(unittest.IsolatedAsyncioTestCase):
         reserved = model_manager.MODEL_GPU_MEM_UTIL[ASR] * TOTAL_MIB
         need_b = (
             model_manager.MODEL_MIN_GPU_MEM_UTIL.get(SMALL_B, model_manager.GPU_MEM_UTIL_FLOOR)
-            * TOTAL_MIB + model_manager.HARD_MARGIN_MIB
+            * TOTAL_MIB + model_manager.CORESIDENT_OVERHEAD_MIB
         )
         router = _router([GpuSlot(0, 0, 9000)])
         lane = router._lane_slot(ASR, 0)
@@ -255,6 +255,32 @@ class RouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.router._maybe_scale_out(ASR)
         spawn.assert_not_awaited()
         self.assertEqual(1, len(self.router._running_backends(ASR)))
+
+
+class SpawnUtilTests(unittest.TestCase):
+    """A co-resident vLLM must leave room for its own CUDA context (measured ~0.5 GiB):
+    vLLM refuses to start if free VRAM *after* the context is below util*total."""
+
+    def _util(self, model, free, coresident):
+        router = _router()
+        b = router._make_backend(model, router._lane_slot(model, 1) if coresident else router.slots[1])
+        with patch.object(model_manager, "_gpu_free_mib", return_value=free), \
+                patch.object(model_manager, "_gpu_total_mib", return_value=TOTAL_MIB):
+            return b._gpu_mem_util_for_spawn()
+
+    def test_coresident_never_clamps_up_into_the_context_overhead(self):
+        floor = model_manager.MODEL_MIN_GPU_MEM_UTIL[ASR] * TOTAL_MIB
+        # enough for the floor plus the old 256 MiB margin, but not for the context
+        with self.assertRaisesRegex(RuntimeError, "too tight"):
+            self._util(ASR, floor + model_manager.HARD_MARGIN_MIB + 10, True)
+        # with the context overhead available, the floor is granted
+        self.assertEqual(
+            model_manager.MODEL_MIN_GPU_MEM_UTIL[ASR],
+            self._util(ASR, floor + model_manager.CORESIDENT_OVERHEAD_MIB, True),
+        )
+
+    def test_coresident_gets_its_preferred_util_when_there_is_plenty_of_room(self):
+        self.assertEqual(model_manager.MODEL_GPU_MEM_UTIL[ASR], self._util(ASR, 30000.0, True))
 
 
 class PrimaryYieldsTests(unittest.IsolatedAsyncioTestCase):

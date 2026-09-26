@@ -533,10 +533,10 @@ MODEL_GPU_MEM_UTIL: dict[str, float] = {
     # late-loading video-transcribe (1.6) with ~0.8 spare; 0.92 would not.
     # The spawn-time clamp below still lowers this to fit whatever is free.
     "qwen3.8-27b":             0.90,
-    # PROVISIONAL (0.6B FP8, --enforce-eager, --max-model-len 2048): weights ~1.1
-    # GiB + ~0.5 GiB CUDA context + activations/KV.  Not yet measured on a GPU
-    # with room; the 1.7B measurement it replaces was 0.22 (weights 3.16 GiB).
-    # Refine after the first real spawn (see the log's "Available KV cache").
+    # Measured on an RTX 5090 (2026-09-26, vLLM 0.29 fp8, --enforce-eager,
+    # --max-model-len 1536): at 0.10 the weights take 1.44 GiB, the process
+    # settles at ~2.7 GiB with the CUDA context, and vLLM reports 0.37 GiB of KV
+    # (3,424 tokens, 2.2x concurrency at 1536).  The 1.7B this replaces was 0.22.
     "qwen3-asr-0.6b":          0.10,
 }
 # Margin (MiB) held back from current free VRAM when computing util — absorbs
@@ -545,6 +545,11 @@ GPU_MEM_UTIL_BUFFER_MIB = float(os.environ.get("GPU_MEM_UTIL_BUFFER_MIB", "768")
 # Slack insisted on between a model's min-viable reservation and free VRAM, so
 # nvidia-smi jitter cannot turn a fitting spawn into a startup OOM.
 HARD_MARGIN_MIB = 256.0
+# A vLLM process's own CUDA context (~0.5 GiB, measured 2026-09-26: 1968 MiB free
+# shrank to 1.43 GiB at startup) is taken before vLLM checks that free VRAM covers
+# util*total.  Co-resident models run on whatever is left, so admission and spawn
+# must leave this on top of the budget; primaries have it inside their buffer.
+CORESIDENT_OVERHEAD_MIB = 640.0
 # Co-resident models get their own port lanes, far above the slot ports (a vLLM
 # EngineCore binds api_port+2): lane port = base + gpu*100 + model_index*10.
 CORESIDENT_PORT_BASE = int(os.environ.get("GPU_CORESIDENT_PORT_BASE", "9100"))
@@ -576,10 +581,11 @@ CORESIDENT_PORT_BASE = int(os.environ.get("GPU_CORESIDENT_PORT_BASE", "9100"))
 MODEL_MIN_GPU_MEM_UTIL: dict[str, float] = {
     "qwen3.6-35b-a3b-heretic": 0.84,
     "qwen3.8-27b":             0.78,
-    # PROVISIONAL: a 2 GiB budget failed at startup on GPU0 (1.43 GiB usable
-    # after the CUDA context), so the floor is above that.  Also the co-resident
-    # admission floor (see _pick_coresident_gpu).
-    "qwen3-asr-0.6b":          0.08,
+    # KV at 0.10 is 0.37 GiB and one 1536-token request needs ~0.17 GiB, so the
+    # budget can shrink by ~0.15 GiB (0.005 of 32 GiB) before it starves: 0.095.
+    # 2 GiB (0.06) failed at startup.  Also the co-resident admission floor
+    # (see _pick_coresident_gpu).
+    "qwen3-asr-0.6b":          0.095,
 }
 # Fallback floor for models not listed above (best-effort attempt, not fail-fast).
 GPU_MEM_UTIL_FLOOR = float(os.environ.get("GPU_MEM_UTIL_FLOOR", "0.78"))
@@ -1161,7 +1167,8 @@ class GpuBackend:
             # HARD_MARGIN is the minimum slack we insist on between the floor's raw
             # reservation and free VRAM, so a tiny nvidia-smi jitter doesn't OOM us.
             floor_needs_mib = min_viable * total
-            if free >= floor_needs_mib + HARD_MARGIN_MIB:
+            margin_mib = CORESIDENT_OVERHEAD_MIB if self.coresident else HARD_MARGIN_MIB
+            if free >= floor_needs_mib + margin_mib:
                 self.log.warning(
                     f"VRAM-aware util for {self.model_name}: GPU {self.gpu_id} "
                     f"free={free/1024:.1f} GiB / total={total/1024:.1f} GiB → buffered "
@@ -1170,7 +1177,7 @@ class GpuBackend:
                     f"margin ≤ free) — clamping up to {min_viable} (tight, best effort)"
                 )
                 return min_viable
-            needed_mib = floor_needs_mib + HARD_MARGIN_MIB
+            needed_mib = floor_needs_mib + margin_mib
             msg = (
                 f"GPU {self.gpu_id} only {free/1024:.1f} GiB free — too tight for "
                 f"{self.model_name}: even min-viable util {min_viable} "
@@ -1921,8 +1928,8 @@ class DynamicRouter:
 
         The budget is the GPU's *current* free VRAM (nvidia-smi) minus what
         co-resident models still starting there will take, against the model's
-        min-viable util plus HARD_MARGIN_MIB — the same test the backend applies
-        at spawn.  A GPU without a primary wins over one with more free VRAM, so
+        min-viable util plus CORESIDENT_OVERHEAD_MIB (its CUDA context) — the same
+        test the backend applies at spawn.  A GPU without a primary wins over one with more free VRAM, so
         a primary's replica keeps its room.  Raises GPUBusyError if none fits."""
         config = self.model_configs[model_name]
         allowed = config.allowed_gpu_ids
@@ -1946,7 +1953,7 @@ class DynamicRouter:
                 for b in self._coresident_backends_on(gpu) if not b._ready
             )
             avail = free - reserved
-            need = min_util * total + HARD_MARGIN_MIB
+            need = min_util * total + CORESIDENT_OVERHEAD_MIB
             need_gib = need / 1024.0
             report.append(f"GPU {gpu}: {avail / 1024.0:.1f} GiB free")
             if avail >= need:

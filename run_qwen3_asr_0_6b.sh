@@ -18,7 +18,7 @@ VLLM_BIN=${VLLM_ASR_BIN:-/home/derek/miniforge3/envs/llm-gateway-vllm-029/bin/vl
 # --quantization fp8: weights are converted from the official BF16 checkpoint at
 # load (no calibration, dynamic activation scales).  gpu-memory-utilization
 # comes from model_manager (VLLM_GPU_MEM_UTIL): preferred 0.10, lowered to fit the
-# GPU's current free VRAM, floor 0.08.  --enforce-eager skips CUDA-graph capture,
+# GPU's current free VRAM, floor 0.095.  --enforce-eager skips CUDA-graph capture,
 # which costs memory a shared GPU does not have and buys nothing for <=60 s clips.
 exec "$VLLM_BIN" serve Qwen/Qwen3-ASR-0.6B \
   --host 127.0.0.1 \
@@ -27,6 +27,6 @@ exec "$VLLM_BIN" serve Qwen/Qwen3-ASR-0.6B \
   --served-model-name qwen3-asr-0.6b \
   --quantization fp8 \
   --gpu-memory-utilization ${VLLM_GPU_MEM_UTIL:-0.10} \
-  --max-model-len ${VLLM_MAX_MODEL_LEN:-2048} \
+  --max-model-len ${VLLM_MAX_MODEL_LEN:-1536} \
   --max-num-seqs ${VLLM_MAX_NUM_SEQS:-4} \
   --enforce-eager
