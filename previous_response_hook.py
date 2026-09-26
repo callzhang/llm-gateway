@@ -5,7 +5,7 @@ LiteLLM_SpendLogs (proxy_server_request + response).  When that lookup comes
 back empty — prompt storage off, id not decodable, row past
 maximum_spend_logs_retention_period — LiteLLM silently treats the request as a
 fresh one, so the caller believes it has continuity and does not.  This hook
-turns that silent no-op into a 400.
+turns that silent no-op into a 410 (Gone) so clients can key on the status instead of the message text.
 
 It reuses LiteLLM's own reconstruction, so "history exists" here means exactly
 what the bridge will later see.
@@ -13,7 +13,7 @@ what the bridge will later see.
 Spend-log rows are written in batches, so the previous response becomes visible
 7-12 s after it was returned (measured on LiteLLM 1.99.0).  A follow-up sent
 inside that window would silently lose its history, so the hook waits up to
-PREVIOUS_RESPONSE_WAIT_SECONDS for the row before answering 400.
+PREVIOUS_RESPONSE_WAIT_SECONDS for the row before answering 410.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ class PreviousResponseHistoryHook(CustomLogger):
             await asyncio.sleep(_POLL_SECONDS)
         if not session.get("messages"):
             raise HTTPException(
-                status_code=400,
+                status_code=410,
                 detail=(
                     "previous_response_id has no stored history: the response is unknown, "
                     "expired, or store_prompts_in_spend_logs is off. Send a request "

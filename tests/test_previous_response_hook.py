@@ -41,4 +41,4 @@ def test_rejects_when_history_never_appears(monkeypatch):
     with patch(_HANDLER, new=AsyncMock(return_value={"messages": []})):
         with pytest.raises(HTTPException) as exc:
             _run({"previous_response_id": "resp_x"})
-    assert exc.value.status_code == 400
+    assert exc.value.status_code == 410
