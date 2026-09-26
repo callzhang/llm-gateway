@@ -8,6 +8,8 @@ primary spawn would otherwise be too tight.
 
 import asyncio
 import unittest
+
+import numpy as np
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,6 +17,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 import model_manager
+from asr_adapter.cpu_pool import CpuWorkerError
+from asr_adapter.engine import EngineError
 from model_manager import (
     DynamicRouter,
     GPUBusyError,
@@ -392,8 +396,12 @@ class IdleTimeoutTests(unittest.TestCase):
 class MultipartRoutingTests(unittest.IsolatedAsyncioTestCase):
     BOUNDARY = "xyzBOUNDARYxyz"
 
-    def _multipart(self, *, model=ASR, audio=b"ID3\x00\x01audio-bytes", model_first=True):
+    def _multipart(self, *, model=ASR, audio=b"ID3\x00\x01audio-bytes", model_first=True, extra=None):
         b = self.BOUNDARY.encode()
+        extra_parts = b"".join(
+            b"--" + b + f'\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+            for k, v in (extra or {}).items()
+        )
         model_part = (
             b"--" + b + b'\r\nContent-Disposition: form-data; name="model"\r\n\r\n'
             + model.encode() + b"\r\n"
@@ -404,7 +412,7 @@ class MultipartRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         tail = b"--" + b + b"--\r\n"
         parts = model_part + file_part if model_first else file_part + model_part
-        return parts + tail
+        return extra_parts + parts + tail
 
     def test_extracts_the_model_from_a_multipart_body_in_either_order(self):
         ctype = f"multipart/form-data; boundary={self.BOUNDARY}"
@@ -445,21 +453,73 @@ class MultipartRoutingTests(unittest.IsolatedAsyncioTestCase):
             headers={"Content-Type": f"multipart/form-data; boundary={self.BOUNDARY}"},
         )
 
-    async def test_forwards_the_upload_byte_for_byte_with_its_content_type(self):
-        seen = {}
+    @staticmethod
+    def _speech(seconds=70):
+        t = np.arange(int(seconds * 16000)) / 16000
+        return (0.2 * np.sin(2 * np.pi * 300 * t)).astype(np.float32)
 
-        async def proxy(request, body):
-            seen["body"], seen["ctype"] = body, request.headers["Content-Type"]
-            return web.json_response({"text": "ok"})
-
-        backend = SimpleNamespace(slot=SimpleNamespace(slot_id=101), _active_requests=0, proxy=proxy)
+    def _lane(self, text="你好"):
+        backend = SimpleNamespace(
+            slot=SimpleNamespace(slot_id=101), _active_requests=0,
+            transcribe_chunk=AsyncMock(return_value=text),
+        )
         self.router._get_or_start = AsyncMock(return_value=[backend])
-        sent = self._multipart()
-        response = await self._post(body=sent)
+        return backend
+
+    async def test_upload_is_chunked_and_every_chunk_goes_to_the_gpu_lane(self):
+        backend = self._lane()
+        with patch.object(model_manager.asr_service, "decode_audio", AsyncMock(return_value=self._speech())):
+            response = await self._post(body=self._multipart(extra={"response_format": "verbose_json", "language": "zh"}))
         self.assertEqual(200, response.status)
-        self.assertEqual(sent, seen["body"])
-        self.assertIn(self.BOUNDARY, seen["ctype"])
-        self.router._get_or_start.assert_awaited_once_with(ASR)
+        body = await response.json()
+        self.assertEqual("gpu", body["engine"])
+        self.assertEqual(3, len(body["segments"]))                     # 70 s -> three ~30 s chunks
+        self.assertEqual(3, backend.transcribe_chunk.await_count)
+        wav, language = backend.transcribe_chunk.await_args.args
+        self.assertEqual(b"RIFF", wav[:4])
+        self.assertEqual("zh", language)
+
+    async def test_a_busy_gpu_finishes_the_whole_request_on_the_cpu_worker(self):
+        self.router._get_or_start = AsyncMock(side_effect=GPUBusyError("no room: need 3.7 GiB"))
+        cpu = SimpleNamespace(transcribe=AsyncMock(return_value="甲乙丙"))
+        with patch.object(self.router, "_asr_cpu", return_value=cpu), \
+                patch.object(model_manager.asr_service, "decode_audio", AsyncMock(return_value=self._speech())):
+            response = await self._post(body=self._multipart(extra={"response_format": "verbose_json"}))
+        self.assertEqual(200, response.status)
+        body = await response.json()
+        self.assertEqual("cpu", body["engine"])
+        self.assertEqual(3, cpu.transcribe.await_count)
+        self.router._get_or_start.assert_awaited_once_with(ASR)        # the GPU is not retried per chunk
+
+    async def test_gpu_failure_mid_request_falls_back_for_the_rest(self):
+        backend = self._lane()
+        backend.transcribe_chunk = AsyncMock(side_effect=["一", EngineError("HTTP 500")])
+        cpu = SimpleNamespace(transcribe=AsyncMock(return_value="二"))
+        with patch.object(self.router, "_asr_cpu", return_value=cpu), \
+                patch.object(model_manager.asr_service, "decode_audio", AsyncMock(return_value=self._speech())):
+            response = await self._post(body=self._multipart(extra={"response_format": "verbose_json"}))
+        body = await response.json()
+        self.assertEqual("gpu+cpu", body["engine"])
+        self.assertEqual("一二二", body["text"])
+
+    async def test_cpu_worker_failure_is_a_503(self):
+        self.router._get_or_start = AsyncMock(side_effect=GPUBusyError("no room"))
+        cpu = SimpleNamespace(transcribe=AsyncMock(side_effect=CpuWorkerError("CPU worker did not start")))
+        with patch.object(self.router, "_asr_cpu", return_value=cpu), \
+                patch.object(model_manager.asr_service, "decode_audio", AsyncMock(return_value=self._speech(10))):
+            response = await self._post()
+        self.assertEqual(503, response.status)
+        self.assertEqual("service_unavailable", (await response.json())["error"]["type"])
+
+    async def test_bad_uploads_are_client_errors_and_never_start_a_gpu(self):
+        self.router._get_or_start = AsyncMock()
+        bad_format = await self._post(body=self._multipart(extra={"response_format": "srt"}))
+        self.assertEqual(400, bad_format.status)
+        with patch.object(model_manager.asr_service, "decode_audio",
+                          AsyncMock(side_effect=model_manager.asr_service.UploadError("audio could not be decoded"))):
+            undecodable = await self._post()
+        self.assertEqual(400, undecodable.status)
+        self.router._get_or_start.assert_not_awaited()
 
     async def test_transcription_model_on_other_routes_is_rejected_before_gpu_start(self):
         self.router._get_or_start = AsyncMock()
@@ -469,19 +529,56 @@ class MultipartRoutingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(400, response.status)
         self.router._get_or_start.assert_not_awaited()
 
-    async def test_gpu_busy_is_a_503_with_the_reason(self):
-        self.router._get_or_start = AsyncMock(side_effect=GPUBusyError("no room: need 6.3 GiB"))
-        response = await self._post()
-        self.assertEqual(503, response.status)
-        body = await response.json()
-        self.assertEqual("gpu_busy", body["error"]["type"])
-        self.assertIn("6.3 GiB", body["error"]["message"])
-
     async def test_unknown_model_in_a_multipart_upload_is_404(self):
         self.router._get_or_start = AsyncMock()
         response = await self._post(body=self._multipart(model="nope"))
         self.assertEqual(404, response.status)
         self.router._get_or_start.assert_not_awaited()
+
+
+class BackendTranscribeChunkTests(unittest.IsolatedAsyncioTestCase):
+    """GpuBackend.transcribe_chunk: one chunk through vLLM, EngineError on any failure."""
+
+    async def _serve(self, handler):
+        app = web.Application()
+        app.router.add_post("/v1/audio/transcriptions", handler)
+        server = TestServer(app)
+        await server.start_server()
+        self.addAsyncCleanup(server.close)
+        backend = _router()._make_backend(ASR, GpuSlot(101, 0, server.port))
+        self.addAsyncCleanup(backend._close_session)
+        return backend
+
+    async def test_posts_a_wav_with_the_served_name_and_key_and_returns_the_text(self):
+        seen = {}
+
+        async def handler(request):
+            form = await request.post()
+            seen["auth"] = request.headers.get("Authorization")
+            seen["model"], seen["lang"] = form["model"], form.get("language")
+            seen["file"] = form["file"].file.read()
+            return web.json_response({"text": "你好"})
+
+        backend = await self._serve(handler)
+        self.assertEqual("你好", await backend.transcribe_chunk(b"RIFFwav", "zh"))
+        self.assertEqual(f"Bearer {model_manager.ASR_GPU_API_KEY}", seen["auth"])
+        self.assertEqual((backend.served_name, "zh", b"RIFFwav"), (seen["model"], seen["lang"], seen["file"]))
+        self.assertEqual(0, backend._active_requests)
+
+    async def test_http_errors_become_engine_errors(self):
+        async def handler(request):
+            return web.json_response({"error": "overloaded"}, status=503)
+
+        backend = await self._serve(handler)
+        with self.assertRaises(EngineError):
+            await backend.transcribe_chunk(b"x", None)
+        self.assertEqual(0, backend._active_requests)
+
+    async def test_an_unreachable_backend_is_an_engine_error(self):
+        backend = _router()._make_backend(ASR, GpuSlot(101, 0, 1))      # nothing listens on port 1
+        self.addAsyncCleanup(backend._close_session)
+        with self.assertRaises(EngineError):
+            await backend.transcribe_chunk(b"x", None)
 
 
 class AdoptionTests(unittest.IsolatedAsyncioTestCase):

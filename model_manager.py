@@ -43,6 +43,10 @@ from typing import Literal
 import aiohttp
 from aiohttp import web
 
+from asr_adapter import service as asr_service
+from asr_adapter.cpu_pool import CpuAsrWorker, CpuWorkerError
+from asr_adapter.engine import EngineError, pcm16_wav
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 # 300→1200 (2026-09-04): real traffic for both chat models arrives in bursts
 # 10-90 min apart, so 300s kept unloading models whose next burst almost always
@@ -553,6 +557,18 @@ CORESIDENT_OVERHEAD_MIB = 640.0
 # Co-resident models get their own port lanes, far above the slot ports (a vLLM
 # EngineCore binds api_port+2): lane port = base + gpu*100 + model_index*10.
 CORESIDENT_PORT_BASE = int(os.environ.get("GPU_CORESIDENT_PORT_BASE", "9100"))
+
+# ── ASR adapter (asr_adapter/) ─────────────────────────────────────────────────
+# POST /v1/audio/transcriptions is chunked here (<=30 s, silence trimmed, loops
+# dropped) and each chunk goes to the co-resident GPU lane, or — when no GPU has
+# room — to a CPU worker process (same model, transformers bf16, ~6x realtime).
+ASR_GPU_API_KEY = os.environ.get("ASR_GPU_API_KEY", "local-qwen36")   # run_qwen3_asr_0_6b.sh --api-key
+ASR_GPU_CHUNK_TIMEOUT = float(os.environ.get("ASR_GPU_CHUNK_TIMEOUT", "120"))
+ASR_CPU_PYTHON = os.environ.get("ASR_CPU_PYTHON", "/home/derek/miniforge3/bin/python")
+ASR_CPU_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asr_adapter", "cpu_worker.py")
+ASR_CPU_THREADS = os.environ.get("ASR_CPU_THREADS", "8")
+ASR_CPU_IDLE_SECONDS = float(os.environ.get("ASR_CPU_IDLE_SECONDS", "900"))
+ASR_HF_HOME = os.environ.get("ASR_HF_HOME", "/home/derek/services/asr-provider/runtime-cache/qwen3-asr")
 
 # Per-model MINIMUM viable gpu_memory_utilization.  vLLM allocates: weights +
 # activations first, then *all remaining* budget (util×total − used) becomes the
@@ -1489,6 +1505,33 @@ class GpuBackend:
             self._active_requests -= 1
             self.last_activity = time.monotonic()
 
+    async def transcribe_chunk(self, wav: bytes, language: str | None) -> str:
+        """One already-chunked clip through this vLLM, for the ASR adapter.  Any
+        failure is an EngineError so the adapter can finish the request on CPU."""
+        self._active_requests += 1
+        self.last_activity = time.monotonic()
+        try:
+            self._ensure_session()
+            form = aiohttp.FormData()
+            form.add_field("model", self.served_name)
+            form.add_field("response_format", "json")
+            if language:
+                form.add_field("language", language)
+            form.add_field("file", wav, filename="chunk.wav", content_type="audio/wav")
+            async with self._session.post(
+                f"{self.vllm_base}/v1/audio/transcriptions", data=form,
+                headers={"Authorization": f"Bearer {ASR_GPU_API_KEY}"},
+                timeout=aiohttp.ClientTimeout(total=ASR_GPU_CHUNK_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    raise EngineError(f"HTTP {resp.status}: {(await resp.text())[:160]}")
+                return str((await resp.json()).get("text") or "")
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            raise EngineError(f"{type(exc).__name__}: {exc}") from exc
+        finally:
+            self._active_requests -= 1
+            self.last_activity = time.monotonic()
+
     @staticmethod
     def _pgid_of(pid: int) -> int | None:
         """Process group of pid, or None if it is gone / unreadable.
@@ -1854,6 +1897,7 @@ class DynamicRouter:
         # Monotonic time of the previous saturation sample, for the accrual dt.
         self._sat_last_tick: float = 0.0
         self._sat_task: asyncio.Task | None = None
+        self._asr_cpu_worker: CpuAsrWorker | None = None    # created on first CPU fallback
         # Dedup for scale-out decline logging: (reason, monotonic) per model, so a
         # persistent blocker (e.g. GPU busy) logs once per window, not every cycle.
         self._scale_decline_log: dict[str, tuple[str, float]] = {}
@@ -2668,6 +2712,8 @@ class DynamicRouter:
         invalid = self._validate_model_request(request, parsed_body, config)
         if invalid is not None:
             return invalid
+        if config.request_kind == "transcription":
+            return await self._handle_transcription(request, body, model_name)
         if config.request_kind == "speech":
             # The public speech contract is deliberately MP3-only.  vLLM-Omni
             # can encode it natively, and LiteLLM 1.86.2 labels every speech
@@ -2712,12 +2758,7 @@ class DynamicRouter:
         # the retry loop below.  x-task-id pins all turns of one task to the same
         # vLLM slot for prefix cache reuse; falls back to least-connections.
         parsed_body_for_sticky = parsed_body if isinstance(parsed_body, dict) else None
-        if config.request_kind == "transcription":
-            sticky_slot = None
-            task_id = None
-            msgs = []
-            approx_chars = len(body)      # upload size, for the routing log
-        elif config.request_kind == "speech":
+        if config.request_kind == "speech":
             sticky_slot = None
             task_id = None
             msgs = []
@@ -2786,12 +2827,6 @@ class DynamicRouter:
                     f"{backend.slot.slot_id} (input_chars={approx_chars}, "
                     f"instructions_chars={instructions_chars})"
                 )
-            elif config.request_kind == "transcription" and attempt == 0:
-                self.log.info(
-                    f"Transcription request: model={model_name} → lane slot "
-                    f"{backend.slot.slot_id} (GPU {getattr(backend, 'gpu_id', '?')}, "
-                    f"upload_bytes={approx_chars})"
-                )
             elif task_id:
                 hit_status = "hit" if sticky_backend is not None else "fresh"
                 retry_note = "" if attempt == 0 else f" (retry {attempt})"
@@ -2831,6 +2866,62 @@ class DynamicRouter:
                 "type": "service_unavailable",
             }}),
         )
+
+    def _asr_cpu(self) -> CpuAsrWorker:
+        if self._asr_cpu_worker is None:
+            self._asr_cpu_worker = CpuAsrWorker(
+                [ASR_CPU_PYTHON, ASR_CPU_WORKER],
+                env={"PYTHONNOUSERSITE": "1", "HF_HOME": ASR_HF_HOME, "HF_HUB_OFFLINE": "1",
+                     "ASR_CPU_THREADS": ASR_CPU_THREADS},
+                idle_seconds=ASR_CPU_IDLE_SECONDS,
+            )
+        return self._asr_cpu_worker
+
+    @staticmethod
+    def _error_response(status: int, message: str, kind: str) -> web.Response:
+        return web.Response(
+            status=status, content_type="application/json",
+            body=json.dumps({"error": {"message": message, "type": kind}}),
+        )
+
+    async def _handle_transcription(
+        self, request: web.Request, body: bytes, model_name: str,
+    ) -> web.Response:
+        """Chunk the upload and transcribe each chunk on the GPU lane, falling back
+        to the CPU worker for the rest of the request when no GPU can take it."""
+        try:
+            upload = asr_service.parse_upload(body, request.headers.get("Content-Type", ""))
+        except asr_service.UploadError as exc:
+            return self._error_response(exc.status, str(exc), "invalid_request_error")
+
+        async def gpu(chunk) -> str:
+            try:
+                backends = await self._get_or_start(model_name)
+            except (GPUBusyError, RuntimeError) as exc:
+                raise EngineError(str(exc)) from exc
+            return await self._pick(backends).transcribe_chunk(
+                pcm16_wav(chunk.samples), upload.language)
+
+        async def cpu(chunk) -> str:
+            return await self._asr_cpu().transcribe(chunk, upload.language)
+
+        started = time.monotonic()
+        try:
+            duration, result = await asr_service.transcribe_upload(upload, gpu=gpu, cpu=cpu)
+        except asr_service.UploadError as exc:
+            return self._error_response(exc.status, str(exc), "invalid_request_error")
+        except CpuWorkerError as exc:
+            self.log.error(f"Transcription failed on CPU: {exc}")
+            return self._error_response(503, str(exc), "service_unavailable")
+        self.log.info(
+            f"Transcription: model={model_name} audio={duration:.1f}s "
+            f"engine={result.engine} segments={len(result.segments)} "
+            f"dropped={len(result.dropped)} took={time.monotonic() - started:.1f}s"
+        )
+        kind, payload = asr_service.render(upload, duration, result)
+        if kind == "text":
+            return web.Response(text=payload)
+        return web.json_response(payload)
 
     @staticmethod
     def _extract_model(body: bytes, content_type: str = "") -> str | None:

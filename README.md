@@ -73,6 +73,29 @@ today `qwen3-asr-0.6b`, ~3 GiB) instead shares a GPU with whatever primary owns 
 - Requests: `POST /v1/audio/transcriptions` (multipart; `model` is read from the form field
   without copying the upload).  Status: `coresident` list in `/admin/status`.
 
+#### ASR adapter (`asr_adapter/`)
+
+The transcription route is not a raw proxy.  `model_manager` decodes the upload with ffmpeg and
+runs the whole pipeline itself, so every client of `qwen3-asr` gets the same protections:
+
+1. **Chunking** — ~30 s pieces (`ASR_CHUNK_SECONDS`), each cut at the quietest frame near the
+   target so words are not sliced.  <=60 s fits the lane's `--max-model-len 1536`; longer needs a
+   larger max-model-len (and fewer `--max-num-seqs` to stay inside the VRAM budget).  Measured on
+   CPU, longer chunks are slightly slower and no more accurate, so 30 s stays the default.
+2. **Silence** — each chunk is trimmed to its voiced span and silent chunks are skipped (the model
+   loops on mostly-silent input).
+3. **Loop guard** — a chunk whose text is dominated by a repeating phrase is dropped and listed in
+   `dropped_segments`.
+4. **Engines, per request** — the GPU lane first (`GpuBackend.transcribe_chunk`); when it declines
+   (no room, cold-start failure, error) the rest of the request runs on the **CPU worker**
+   (`asr_adapter/cpu_worker.py`, transformers bf16 in a child process spawned on demand, stopped
+   after `ASR_CPU_IDLE_SECONDS`, one inference at a time, `nice 10`).  The response's `engine`
+   field says `gpu`, `cpu` or `gpu+cpu`.  If the CPU worker itself fails the answer is 503.
+
+Formats: `json`, `verbose_json` (segments with start/end), `text`.  Settings: `ASR_CHUNK_SECONDS`,
+`ASR_CPU_PYTHON` (needs transformers >= 5.13: the miniforge base), `ASR_CPU_THREADS`,
+`ASR_CPU_IDLE_SECONDS`, `ASR_HF_HOME`, `ASR_GPU_API_KEY`.
+
 ### Scale-out threshold
 
 Scale-out only fires when **total concurrent active requests ≥ 2**. A single background health-check from LiteLLM is not enough to trigger a second GPU spawn. This prevents runaway GPU usage for low-load scenarios.

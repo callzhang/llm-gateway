@@ -66,27 +66,17 @@ model_list:
       timeout: 600
 
   # ── Qwen3-ASR 0.6B: the unified speech-to-text service ─────────────────
-  # `qwen3-asr` (POST /v1/audio/transcriptions) is FP8 on a GPU, scheduled by
-  # model_manager as a co-resident model (VRAM budget, no GPU slot; unloaded after
-  # 5 idle minutes; ~1 min cold start, then a 60x-realtime-class service).  When
-  # no GPU has ~3.7 GiB free model_manager answers 503 gpu_busy and LiteLLM falls
-  # back (router_settings.fallbacks) to `qwen3-asr-cpu`, the asr-provider service
-  # (~7x realtime on CPU, always available, never touches the GPUs).  Both serve
-  # the same model, so callers only ever name `qwen3-asr`.
+  # `qwen3-asr` (POST /v1/audio/transcriptions).  model_manager owns the whole
+  # pipeline (asr_adapter/): it cuts the upload into <=30 s chunks at quiet points,
+  # skips silence, drops looping output, and sends each chunk to the FP8 GPU lane
+  # (co-resident, VRAM budget, ~1 min cold start, then ~60x realtime) or — when no
+  # GPU has ~3.7 GiB free — to a CPU worker process running the same model (~6x
+  # realtime).  So LiteLLM needs one entry and no fallback.
   - model_name: qwen3-asr
     litellm_params:
       model: openai/qwen3-asr-0.6b
       api_base: http://127.0.0.1:8002/v1
       api_key: local-qwen36
-      timeout: 900
-    model_info:
-      mode: audio_transcription
-
-  - model_name: qwen3-asr-cpu
-    litellm_params:
-      model: openai/qwen3-asr-0.6b
-      api_base: http://127.0.0.1:7996/v1
-      api_key: local-asr          # loopback-only service; LiteLLM is the auth boundary
       timeout: 1800
     model_info:
       mode: audio_transcription
@@ -97,9 +87,6 @@ model_list:
   # to a third party is not wanted here.
 
 router_settings:
-  # GPU ASR -> CPU ASR when model_manager has no GPU room (503 gpu_busy) or the GPU
-  # instance fails; the only fallback here, and both ends are local.
-  fallbacks: [{"qwen3-asr": ["qwen3-asr-cpu"]}]
   routing_strategy: latency-based-routing   # probes are intercepted by model_manager: cold models → 503 (no spawn), warm models → real latency measured
   num_retries: 0          # cold-starts block in model_manager — retries don't help
   retry_after: 0
