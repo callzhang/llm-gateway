@@ -422,7 +422,7 @@ def _tts_max_input_chars() -> int:
 #
 # 35B-A3B used to be pinned to GPU 1 because the embedding-provider on GPU 0
 # took ~2.5–3.5 GiB, leaving only ~28.5 GiB free vs the 29.16 GiB needed for
-# gpu_memory_utilization=0.93 × 32 GiB.  Relaxing to None now: _check_gpu_free
+# gpu_memory_utilization=0.93 (now 0.88) × 32 GiB.  Relaxing to None now: _check_gpu_free
 # guards against actually-too-tight cases at spawn time, and most of the time
 # GPU 0 has enough headroom to host a scale-out 35B replica.
 #
@@ -488,7 +488,7 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
 # Rule of thumb: gpu_memory_utilization × GPU_total_GiB + 1 GiB safety buffer.
 # If a model is not listed here no pre-check is performed (may evict & fail).
 MODEL_MIN_FREE_GIB: dict[str, float] = {
-    # Sized off the min-viable floor (0.84), not the preferred util (0.93):
+    # Sized off the min-viable floor (0.84), not the preferred util (0.88):
     # this gate runs before the VRAM-aware util calculation, so keying it to the
     # preferred value rejected any card that could still host the model at the
     # floor.  0.84 × 31.8 GiB = 26.75 GiB, so 27.0 leaves 0.25 GiB of headroom —
@@ -529,14 +529,23 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
 # never raised above these tuned defaults.  vLLM treats --gpu-memory-utilization
 # as a fraction of TOTAL memory and refuses to start when util×total exceeds the
 # memory free at launch — that's the failure this avoids.
+#
+# Chat models are capped so a card keeps NEIGHBOUR_RESERVE_MIB free for the small
+# services that live beside them (OCR, gliner, ASR, TTS, ...).  Measured
+# 2026-09-26 on the 27B: process footprint = util × total + ~762 MiB (CUDA
+# context + non-torch memory), 30108 MiB at 0.90.  Keeping 3072 MiB free of the
+# 32607 MiB card allows util <= (32607 - 3072 - 762) / 32607 = 0.882 -> 0.88
+# (footprint ~29.4 GiB, ~3.1 GiB free).  Both chat models share the cap.
+NEIGHBOUR_RESERVE_MIB = 3072.0
 MODEL_GPU_MEM_UTIL: dict[str, float] = {
-    "qwen3.6-35b-a3b-heretic": 0.93,
-    # 0.84→0.90 (2026-09-03): ~29.7 GiB actual usage, ~+55k KV tokens (mostly
-    # extra prefix-cache retention for the memory pipeline's repeated long
-    # prompts).  Leaves ~2.9 GiB for neighbours — covers gliner (0.5) plus a
-    # late-loading video-transcribe (1.6) with ~0.8 spare; 0.92 would not.
-    # The spawn-time clamp below still lowers this to fit whatever is free.
-    "qwen3.8-27b":             0.90,
+    # 0.93→0.88 (2026-09-26): 0.93 left ~1.5 GiB.  Still above the 0.84 floor.
+    "qwen3.6-35b-a3b-heretic": 0.88,
+    # 0.90→0.88 (2026-09-26): frees ~0.6 GiB, ~3.1 GiB total, for neighbours.
+    # (0.84→0.90 on 2026-09-03 bought ~+55k KV tokens, mostly extra prefix-cache
+    # retention for the memory pipeline's repeated long prompts; 0.88 gives back
+    # ~0.6 GiB of that.)  The spawn-time clamp below still lowers this to fit
+    # whatever is free.
+    "qwen3.8-27b":             0.88,
     # Measured on an RTX 5090 (2026-09-26, vLLM 0.29 fp8, --enforce-eager,
     # --max-model-len 1536): at 0.10 the weights take 1.44 GiB, the process
     # settles at ~2.7 GiB with the CUDA context, and vLLM reports 0.37 GiB of KV

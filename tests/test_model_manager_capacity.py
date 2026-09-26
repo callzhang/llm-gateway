@@ -82,6 +82,37 @@ class ModelSequenceLimitRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ChatModelNeighbourReserveTests(unittest.TestCase):
+    # RTX 5090 total and the util-independent footprint (CUDA context +
+    # non-torch memory) measured 2026-09-26: 30108 MiB used at util 0.90.
+    TOTAL_MIB = 32607.0
+    OVERHEAD_MIB = 30108.0 - 0.90 * TOTAL_MIB
+
+    def test_chat_models_leave_neighbour_reserve_free(self) -> None:
+        for name, config in model_manager.MODEL_CONFIGS.items():
+            if config.request_kind != "chat":
+                continue
+            with self.subTest(model=name):
+                util = model_manager.MODEL_GPU_MEM_UTIL[name]
+                footprint = util * self.TOTAL_MIB + self.OVERHEAD_MIB
+                free = self.TOTAL_MIB - footprint
+                self.assertGreaterEqual(
+                    free,
+                    model_manager.NEIGHBOUR_RESERVE_MIB,
+                    f"{name} at util {util} leaves only {free:.0f} MiB free",
+                )
+
+    def test_chat_model_util_stays_above_min_viable_floor(self) -> None:
+        for name, config in model_manager.MODEL_CONFIGS.items():
+            if config.request_kind != "chat":
+                continue
+            with self.subTest(model=name):
+                self.assertGreaterEqual(
+                    model_manager.MODEL_GPU_MEM_UTIL[name],
+                    model_manager.MODEL_MIN_GPU_MEM_UTIL[name],
+                )
+
+
 class ModelSequenceLimitLauncherTests(unittest.TestCase):
     def test_warm_cache_derives_spawn_env_instead_of_hardcoding(self) -> None:
         # The warm script must pull VLLM_MAX_NUM_SEQS / VLLM_GPU_MEM_UTIL out
