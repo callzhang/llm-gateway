@@ -85,9 +85,19 @@ litellm_settings:
     - trim_hook.context_trim_hook
     # Map reasoning_effort onto what each model's chat template accepts.
     - reasoning_effort_hook.reasoning_effort_hook
+    # Reject previous_response_id with no stored history instead of letting
+    # LiteLLM silently run the request without it.
+    - previous_response_hook.previous_response_history_hook
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   port: 8900
   proxy_base_url: "http://stardust-gpu4:8900"
   health_check_interval: 0   # disable background probes — they hit vLLM and reset idle timer
+  # Responses API previous_response_id: LiteLLM rebuilds history from
+  # LiteLLM_SpendLogs.proxy_server_request/response, which stay empty unless
+  # prompts are stored.  Without this, previous_response_id is a silent no-op
+  # (memory-connector extraction threads ran fresh, 2026-09-20..26).
+  # Rows hold raw prompt/response text, so cap retention.
+  store_prompts_in_spend_logs: true
+  maximum_spend_logs_retention_period: "7d"
