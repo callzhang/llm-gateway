@@ -297,6 +297,37 @@ def _gpu_vllm_used_mib(gpu_id: int) -> float:
         return 0.0
 
 
+def _gpu_vllm_pids(gpu_id: int) -> "list[tuple[int, str]]":
+    """[(pid, "<n> MiB")] for every vLLM process on the GPU (cmdline contains
+    'vllm').  Unreadable / vanished processes and non-vLLM GPU users (embedding
+    servers, notebooks) are skipped; nvidia-smi errors yield []."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory",
+             "--format=csv,noheader", f"--id={gpu_id}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except FileNotFoundError:
+        return []
+    if result.returncode != 0:
+        return []
+    found: list[tuple[int, str]] = []
+    for line in result.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if not parts or not parts[0].isdigit():
+            continue
+        pid = int(parts[0])
+        mem = parts[1] if len(parts) > 1 else "? MiB"
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+        except (FileNotFoundError, PermissionError):
+            continue
+        if "vllm" in cmdline.lower():
+            found.append((pid, mem))
+    return found
+
+
 def _find_pid_on_port(port: int) -> int | None:
     """Return PID of the process listening on TCP port, or None."""
     try:
@@ -354,11 +385,22 @@ class ModelConfig:
     script: str
     served_name: str
     allowed_gpu_ids: set[int] | None = None
-    request_kind: Literal["chat", "speech"] = "chat"
+    request_kind: Literal["chat", "speech", "transcription"] = "chat"
     max_input_chars: int | None = None
     max_num_seqs: int | None = None
+    # Scheduled by VRAM budget instead of taking a GPU slot: a small model that
+    # shares a GPU with whichever primary model owns the slot.  It is admitted
+    # only where the GPU's current free VRAM covers its min-viable footprint,
+    # and it yields to primaries (see DynamicRouter.reclaim_coresident_for).
+    coresident: bool = False
+    # Seconds idle before unload; None keeps the global IDLE_TIMEOUT.
+    idle_timeout: int | None = None
 
     def __post_init__(self) -> None:
+        if self.idle_timeout is not None and (
+            type(self.idle_timeout) is not int or self.idle_timeout <= 0
+        ):
+            raise ValueError("idle_timeout must be a positive integer")
         if self.request_kind != "chat":
             return
         if type(self.max_num_seqs) is not int or self.max_num_seqs <= 0:
@@ -419,6 +461,17 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
         request_kind="speech",
         max_input_chars=_tts_max_input_chars(),
     ),
+    # Speech-to-text (POST /v1/audio/transcriptions), FP8 online-quantized.
+    # Co-resident: ~7 GiB, so it shares a GPU with a primary instead of taking
+    # a slot, and unloads after 5 idle minutes (uploads are rare and a cold
+    # start is ~1.5 min, so a short residency costs little and frees the card).
+    "qwen3-asr-1.7b": ModelConfig(
+        "run_qwen3_asr_1_7b.sh",
+        "qwen3-asr-1.7b",
+        request_kind="transcription",
+        coresident=True,
+        idle_timeout=300,
+    ),
 }
 
 # Minimum free GPU memory (GiB, from nvidia-smi) required to start a model.
@@ -477,10 +530,22 @@ MODEL_GPU_MEM_UTIL: dict[str, float] = {
     # late-loading video-transcribe (1.6) with ~0.8 spare; 0.92 would not.
     # The spawn-time clamp below still lowers this to fit whatever is free.
     "qwen3.8-27b":             0.90,
+    # Measured on an RTX 5090 (2026-09-26, vLLM 0.29 --quantization fp8,
+    # --max-model-len 4096): weights 3.16 GiB, 0.22 -> 1.96 GiB KV / 18,336 tokens
+    # (4.5x concurrency at 4096); 0.14 left a negative KV budget and died at
+    # startup.  BF16 needs 0.30.  Audio is cut to <=30 s chunks upstream, so
+    # this KV is ample.
+    "qwen3-asr-1.7b":          0.22,
 }
 # Margin (MiB) held back from current free VRAM when computing util — absorbs
 # nvidia-smi jitter and small growth by other GPU processes during vLLM startup.
 GPU_MEM_UTIL_BUFFER_MIB = float(os.environ.get("GPU_MEM_UTIL_BUFFER_MIB", "768"))
+# Slack insisted on between a model's min-viable reservation and free VRAM, so
+# nvidia-smi jitter cannot turn a fitting spawn into a startup OOM.
+HARD_MARGIN_MIB = 256.0
+# Co-resident models get their own port lanes, far above the slot ports (a vLLM
+# EngineCore binds api_port+2): lane port = base + gpu*100 + model_index*10.
+CORESIDENT_PORT_BASE = int(os.environ.get("GPU_CORESIDENT_PORT_BASE", "9100"))
 
 # Per-model MINIMUM viable gpu_memory_utilization.  vLLM allocates: weights +
 # activations first, then *all remaining* budget (util×total − used) becomes the
@@ -509,6 +574,9 @@ GPU_MEM_UTIL_BUFFER_MIB = float(os.environ.get("GPU_MEM_UTIL_BUFFER_MIB", "768")
 MODEL_MIN_GPU_MEM_UTIL: dict[str, float] = {
     "qwen3.6-35b-a3b-heretic": 0.84,
     "qwen3.8-27b":             0.78,
+    # 0.14 is dead (negative KV); 0.19 leaves ~0.7 GiB of KV, still >2x a
+    # 30 s chunk.  Also the co-resident admission floor (see _pick_coresident_gpu).
+    "qwen3-asr-1.7b":          0.19,
 }
 # Fallback floor for models not listed above (best-effort attempt, not fail-fast).
 GPU_MEM_UTIL_FLOOR = float(os.environ.get("GPU_MEM_UTIL_FLOOR", "0.78"))
@@ -758,6 +826,8 @@ class GpuBackend:
         slot: GpuSlot,
         *,
         max_num_seqs: int | None = None,
+        idle_timeout: int | None = None,
+        coresident: bool = False,
     ):
         self.model_name  = model_name
         self.served_name = served_name
@@ -767,6 +837,8 @@ class GpuBackend:
         self.vllm_base   = f"http://127.0.0.1:{slot.port}"
         self.script      = os.path.join(SCRIPT_DIR, script)
         self.max_num_seqs = max_num_seqs
+        self.idle_timeout = idle_timeout
+        self.coresident   = coresident
         safe             = model_name.replace(".", "_")
         self.log_path    = os.path.join(LOG_DIR, f"{safe}_slot{slot.slot_id}.log")
         self.log         = logging.getLogger(f"mgr.s{slot.slot_id}.{model_name}")
@@ -799,6 +871,10 @@ class GpuBackend:
         # Consecutive upstream 5xx seen while proxying to this backend; reset on
         # any non-5xx response.  Drives self-heal recycle (see _forward).
         self._consecutive_5xx = 0
+
+    def _base_idle_timeout(self) -> int:
+        """Seconds idle before unload: the model's own override, else the global."""
+        return self.idle_timeout or IDLE_TIMEOUT
 
     @property
     def is_running(self) -> bool:
@@ -940,7 +1016,7 @@ class GpuBackend:
                 # highest-slot instance is an "extra replica" and sheds early so
                 # the borrowed slot returns to its evicted model promptly.  The
                 # lowest-slot instance is the primary and keeps the full timeout.
-                timeout = IDLE_TIMEOUT
+                timeout = self._base_idle_timeout()
                 is_replica = False
                 if self.router is not None:
                     siblings = self.router._running_backends(self.model_name)
@@ -999,62 +1075,32 @@ class GpuBackend:
     # ── Process lifecycle ──────────────────────────────────────────────────────
 
     def _check_gpu_free(self) -> None:
-        """Raise RuntimeError if a leftover vLLM process is occupying this GPU's VRAM.
+        """Raise RuntimeError if a LEFTOVER vLLM process is occupying this GPU's VRAM.
 
-        Only processes whose /proc/<pid>/cmdline contains 'vllm' are considered
-        blockers.  Other legitimate GPU users (e.g. embedding servers) are ignored
-        because they share VRAM without consuming the full allocation that vLLM needs.
+        A leftover is a vLLM process that no live backend of ours owns.  Live
+        neighbours (a primary next to a co-resident model, or the reverse) are
+        expected and skipped; other GPU users (e.g. embedding servers) are
+        ignored because they share VRAM without the full allocation vLLM needs.
 
         vLLM's EngineCore and worker sub-processes can escape process-group kills
         and linger with large CUDA allocations.  Catching this before launching
         produces a clean error instead of an inscrutable OOM 60s into startup.
         """
-        try:
-            result = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-compute-apps=pid,used_memory",
-                    "--format=csv,noheader",
-                    f"--id={self.gpu_id}",
-                ],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode != 0:
-                return
-            lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-            if not lines:
-                return
-
-            vllm_procs = []
-            for line in lines:
-                parts = [p.strip() for p in line.split(",")]
-                pid_s = parts[0] if parts else ""
-                mem_s = parts[1] if len(parts) > 1 else "? MiB"
-                if not pid_s.isdigit():
-                    continue
-                pid = int(pid_s)
-                # Only flag processes that look like vLLM (cmdline contains 'vllm')
-                try:
-                    with open(f"/proc/{pid}/cmdline", "rb") as f:
-                        cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
-                    if "vllm" not in cmdline.lower():
-                        continue   # unrelated GPU user — ignore
-                except (FileNotFoundError, PermissionError):
-                    continue   # process gone or not readable — skip
-                vllm_procs.append(f"PID {pid} ({mem_s})")
-
-            if not vllm_procs:
-                return
-
-            msg = (
-                f"GPU {self.gpu_id} has leftover vLLM process(es) before spawn: "
-                + ", ".join(vllm_procs)
-                + ". Kill them manually or wait for them to exit, then retry."
-            )
-            self.log.error(msg)
-            raise RuntimeError(msg)
-        except FileNotFoundError:
-            pass  # nvidia-smi not installed — skip check
+        known = self.router.live_pgids() if self.router is not None else set()
+        vllm_procs = [
+            f"PID {pid} ({mem})"
+            for pid, mem in _gpu_vllm_pids(self.gpu_id)
+            if self._pgid_of(pid) not in known
+        ]
+        if not vllm_procs:
+            return
+        msg = (
+            f"GPU {self.gpu_id} has leftover vLLM process(es) before spawn: "
+            + ", ".join(vllm_procs)
+            + ". Kill them manually or wait for them to exit, then retry."
+        )
+        self.log.error(msg)
+        raise RuntimeError(msg)
 
     def _gpu_mem_util_for_spawn(self) -> float | None:
         """Compute a gpu_memory_utilization that fits this GPU's *current* free VRAM.
@@ -1111,7 +1157,6 @@ class GpuBackend:
             #
             # HARD_MARGIN is the minimum slack we insist on between the floor's raw
             # reservation and free VRAM, so a tiny nvidia-smi jitter doesn't OOM us.
-            HARD_MARGIN_MIB = 256.0
             floor_needs_mib = min_viable * total
             if free >= floor_needs_mib + HARD_MARGIN_MIB:
                 self.log.warning(
@@ -1186,6 +1231,10 @@ class GpuBackend:
         self._ensure_idle_task()
         if self.slot.backend is None:
             self.slot.backend = self
+        # Primaries outrank co-resident models for VRAM: stop an idle one on this
+        # GPU if the primary would otherwise be too tight.
+        if not self.coresident and self.router is not None:
+            await self.router.reclaim_coresident_for(self)
         self._check_gpu_free()
         # Re-evaluate context length from scratch each wake: GPU free VRAM
         # fluctuates (the embedding-provider idle-offloads), so a backend revived
@@ -1798,13 +1847,165 @@ class DynamicRouter:
         # Dedup for scale-out decline logging: (reason, monotonic) per model, so a
         # persistent blocker (e.g. GPU busy) logs once per window, not every cycle.
         self._scale_decline_log: dict[str, tuple[str, float]] = {}
+        # Co-resident models live in "lanes": one virtual GpuSlot per
+        # (model, gpu), created on demand.  Lanes are NOT in self.slots, so a
+        # co-resident backend never occupies a primary slot and primaries never
+        # see it as a claim; placement is decided by VRAM budget instead.
+        self._lanes: dict[tuple[str, int], GpuSlot] = {}
 
     # ── Slot / backend helpers ─────────────────────────────────────────────────
+
+    def _make_backend(self, model_name: str, slot: GpuSlot, *,
+                      served_name: str | None = None) -> GpuBackend:
+        """Build a backend for model_name on slot, wired to this router."""
+        config = self.model_configs[model_name]
+        b = GpuBackend(
+            model_name,
+            config.script,
+            served_name or config.served_name,
+            slot,
+            max_num_seqs=config.max_num_seqs,
+            idle_timeout=config.idle_timeout,
+            coresident=config.coresident,
+        )
+        b.router = self
+        return b
+
+    def _all_slots(self) -> list[GpuSlot]:
+        """Primary slots plus co-resident lanes."""
+        return [*self.slots, *self._lanes.values()]
+
+    def _coresident_names(self) -> list[str]:
+        return sorted(n for n, c in self.model_configs.items() if c.coresident)
+
+    def _lane_port(self, model_name: str, gpu_id: int) -> int:
+        idx = self._coresident_names().index(model_name)
+        return CORESIDENT_PORT_BASE + gpu_id * 100 + idx * 10
+
+    def _lane_slot(self, model_name: str, gpu_id: int) -> GpuSlot:
+        """The lane for (model, gpu): stable id and port, so a manager restart can
+        find and adopt the vLLM it left running."""
+        lane = self._lanes.get((model_name, gpu_id))
+        if lane is None:
+            idx = self._coresident_names().index(model_name)
+            lane = GpuSlot(
+                100 + gpu_id * 10 + idx, gpu_id, self._lane_port(model_name, gpu_id),
+            )
+            self._lanes[(model_name, gpu_id)] = lane
+        return lane
+
+    def _coresident_backends_on(self, gpu_id: int) -> list[GpuBackend]:
+        return [
+            lane.backend for (_m, g), lane in self._lanes.items()
+            if g == gpu_id and lane.backend is not None and not lane.backend._failed
+        ]
+
+    def live_pgids(self) -> set[int]:
+        """Process groups of every running backend (primary or co-resident).
+        _check_gpu_free treats these as expected neighbours, not leftovers."""
+        pgids: set[int] = set()
+        for slot in self._all_slots():
+            b = slot.backend
+            if b is None or not b.is_running:
+                continue
+            pid = b.process.pid if b.process is not None else b._adopted_pid
+            if pid is not None:
+                pgids.add(GpuBackend._pgid_of(pid) or pid)
+        return pgids
+
+    def _pick_coresident_gpu(self, model_name: str) -> int:
+        """GPU whose free VRAM covers this model's min-viable footprint.
+
+        The budget is the GPU's *current* free VRAM (nvidia-smi) minus what
+        co-resident models still starting there will take, against the model's
+        min-viable util plus HARD_MARGIN_MIB — the same test the backend applies
+        at spawn.  A GPU without a primary wins over one with more free VRAM, so
+        a primary's replica keeps its room.  Raises GPUBusyError if none fits."""
+        config = self.model_configs[model_name]
+        allowed = config.allowed_gpu_ids
+        gpus = sorted({
+            s.gpu_id for s in self.slots if allowed is None or s.gpu_id in allowed
+        })
+        min_util = MODEL_MIN_GPU_MEM_UTIL.get(model_name, GPU_MEM_UTIL_FLOOR)
+        options: list[tuple[bool, float, int]] = []
+        report: list[str] = []
+        need_gib = 0.0
+        for gpu in gpus:
+            total, free = _gpu_total_mib(gpu), _gpu_free_mib(gpu)
+            if not total or free is None:
+                report.append(f"GPU {gpu}: unreadable")
+                continue
+            reserved = sum(
+                MODEL_GPU_MEM_UTIL.get(
+                    b.model_name,
+                    MODEL_MIN_GPU_MEM_UTIL.get(b.model_name, GPU_MEM_UTIL_FLOOR),
+                ) * total
+                for b in self._coresident_backends_on(gpu) if not b._ready
+            )
+            avail = free - reserved
+            need = min_util * total + HARD_MARGIN_MIB
+            need_gib = need / 1024.0
+            report.append(f"GPU {gpu}: {avail / 1024.0:.1f} GiB free")
+            if avail >= need:
+                has_primary = any(
+                    s.gpu_id == gpu and s.backend is not None for s in self.slots
+                )
+                options.append((has_primary, -avail, gpu))
+        if not options:
+            raise GPUBusyError(
+                f"No GPU has room for '{model_name}': it needs >={need_gib:.1f} GiB "
+                f"free (min-viable util {min_util}); " + "; ".join(report) + ". "
+                f"Retry once a GPU frees up."
+            )
+        return min(options)[2]
+
+    async def _claim_coresident_locked(self, model_name: str) -> GpuBackend:
+        """Claim a lane on the GPU chosen by budget.  Caller holds _router_lock."""
+        gpu = self._pick_coresident_gpu(model_name)
+        lane = self._lane_slot(model_name, gpu)
+        b = self._make_backend(model_name, lane)
+        lane.backend = b
+        await b.start()
+        return b
+
+    async def reclaim_coresident_for(self, primary: GpuBackend) -> None:
+        """Primaries outrank co-resident models for VRAM.  If the primary about
+        to spawn on this GPU would not fit at its min-viable util, stop idle
+        co-resident models there until it does.  Busy ones are left running (the
+        spawn then fails as "too tight", as it would for any neighbour)."""
+        gpu = primary.gpu_id
+        victims = [
+            b for b in self._coresident_backends_on(gpu)
+            if b._ready and b.is_running and b._active_requests == 0
+        ]
+        if not victims:
+            return
+        total, free = _gpu_total_mib(gpu), _gpu_free_mib(gpu)
+        if not total or free is None:
+            return
+        need = (
+            MODEL_MIN_GPU_MEM_UTIL.get(primary.model_name, GPU_MEM_UTIL_FLOOR) * total
+            + HARD_MARGIN_MIB
+        )
+        for victim in victims:
+            if free >= need:
+                return
+            self.log.warning(
+                f"Reclaiming VRAM on GPU {gpu} for {primary.model_name}: stopping idle "
+                f"co-resident {victim.model_name} (free {free / 1024.0:.1f} GiB, "
+                f"need {need / 1024.0:.1f} GiB)"
+            )
+            await victim.stop()
+            # Let the killed process group release its CUDA memory before re-reading.
+            await asyncio.sleep(3)
+            free = _gpu_free_mib(gpu)
+            if free is None:
+                return
 
     def _running_backends(self, model_name: str) -> list[GpuBackend]:
         """Backends that are fully ready to serve (spawned AND healthy)."""
         return [
-            s.backend for s in self.slots
+            s.backend for s in self._all_slots()
             if s.backend
             and s.backend.model_name == model_name
             and s.backend._ready
@@ -1814,7 +2015,7 @@ class DynamicRouter:
     def _claimed_backends(self, model_name: str) -> list[GpuBackend]:
         """Running or mid-spawn, excluding permanently-failed ones."""
         return [
-            s.backend for s in self.slots
+            s.backend for s in self._all_slots()
             if s.backend
             and s.backend.model_name == model_name
             and not s.backend._failed
@@ -1902,8 +2103,31 @@ class DynamicRouter:
                            "starting"),
                 )
             slots.append(entry)
+        coresident = []
+        for lane in self._lanes.values():
+            b = lane.backend
+            if b is None:
+                continue
+            coresident.append({
+                "slot_id": lane.slot_id,
+                "gpu_id": lane.gpu_id,
+                "port": lane.port,
+                "model": b.model_name,
+                "ready": b._ready,
+                "running": b.is_running,
+                "failed": b._failed,
+                "active_requests": b._active_requests,
+                "idle_seconds": (None if b._active_requests > 0
+                                 else int(now - b.last_activity)),
+                "idle_timeout": b._base_idle_timeout(),
+                "adopted": b._adopted_pid is not None,
+                "state": ("failed" if b._failed else
+                          "ready" if (b._ready and b.is_running) else
+                          "starting"),
+            })
         return {
             "slots": slots,
+            "coresident": coresident,
             "models": list(self.model_configs),
             "model_limits": {
                 config.served_name: {"max_num_seqs": config.max_num_seqs}
@@ -1966,15 +2190,12 @@ class DynamicRouter:
                 self._admin_msg[slot_id] = (
                     f"{model_name} not allowed on GPU {slot.gpu_id}")
                 return
-            config = self.model_configs[model_name]
-            b = GpuBackend(
-                model_name,
-                config.script,
-                config.served_name,
-                slot,
-                max_num_seqs=config.max_num_seqs,
-            )
-            b.router = self
+            if self.model_configs[model_name].coresident:
+                self._admin_msg[slot_id] = (
+                    f"{model_name} is co-resident: it starts on demand by VRAM "
+                    f"budget, not into a slot")
+                return
+            b = self._make_backend(model_name, slot)
             slot.backend = b           # CLAIM
             await b.start()            # init session + watchdog
         self._admin_msg[slot_id] = f"starting {model_name}…"
@@ -2024,6 +2245,8 @@ class DynamicRouter:
             claimed = self._claimed_backends(model_name)
             if claimed:
                 b = claimed[0]   # another coroutine claimed while we waited — fall through
+            elif self.model_configs[model_name].coresident:
+                b = await self._claim_coresident_locked(model_name)
             else:
                 free = self._free_slots()
                 # Apply GPU affinity: drop slots on GPUs this model cannot use.
@@ -2045,15 +2268,7 @@ class DynamicRouter:
                         f"Retry after {IDLE_TIMEOUT}s idle."
                     )
                 slot   = self._by_free_vram(compatible)[0]
-                config = self.model_configs[model_name]
-                b      = GpuBackend(
-                    model_name,
-                    config.script,
-                    config.served_name,
-                    slot,
-                    max_num_seqs=config.max_num_seqs,
-                )
-                b.router = self
+                b      = self._make_backend(model_name, slot)
                 slot.backend = b          # CLAIM — blocks other models from this slot
                 await b.start()           # init session + idle watchdog
 
@@ -2094,6 +2309,9 @@ class DynamicRouter:
         are always occupied by different models — without this, scale-out would
         never trigger even when one GPU is at 100% and the other is fully idle.
         """
+        if self.model_configs[model_name].coresident:
+            return   # one small instance per GPU by budget; never a slot replica
+
         # Respect cooldown after a previous failure (prevents crash-loop when a
         # slot cannot physically start the model, e.g. insufficient free VRAM).
         last_fail = self._scale_fail_time.get(model_name, 0)
@@ -2215,15 +2433,7 @@ class DynamicRouter:
                 free = [victim_slot]
 
             slot   = self._by_free_vram(free)[0]
-            config = self.model_configs[model_name]
-            new_b  = GpuBackend(
-                model_name,
-                config.script,
-                config.served_name,
-                slot,
-                max_num_seqs=config.max_num_seqs,
-            )
-            new_b.router = self
+            new_b  = self._make_backend(model_name, slot)
             slot.backend = new_b
             await new_b.start()
 
@@ -2304,6 +2514,8 @@ class DynamicRouter:
                 self._sat_last_tick = now
 
                 for model_name in self.model_configs:
+                    if self.model_configs[model_name].coresident:
+                        continue
                     running = self._running_backends(model_name)
                     if not running:
                         self._scale_accrual.pop(model_name, None)
@@ -2418,7 +2630,7 @@ class DynamicRouter:
             return web.json_response({"ok": True, "action": action, "slot_id": slot_id})
 
         body = await request.read()
-        model_name = self._extract_model(body)
+        model_name = self._extract_model(body, request.headers.get("Content-Type", ""))
         if not model_name:
             return web.Response(
                 status=400, content_type="application/json",
@@ -2490,7 +2702,12 @@ class DynamicRouter:
         # the retry loop below.  x-task-id pins all turns of one task to the same
         # vLLM slot for prefix cache reuse; falls back to least-connections.
         parsed_body_for_sticky = parsed_body if isinstance(parsed_body, dict) else None
-        if config.request_kind == "speech":
+        if config.request_kind == "transcription":
+            sticky_slot = None
+            task_id = None
+            msgs = []
+            approx_chars = len(body)      # upload size, for the routing log
+        elif config.request_kind == "speech":
             sticky_slot = None
             task_id = None
             msgs = []
@@ -2559,6 +2776,12 @@ class DynamicRouter:
                     f"{backend.slot.slot_id} (input_chars={approx_chars}, "
                     f"instructions_chars={instructions_chars})"
                 )
+            elif config.request_kind == "transcription" and attempt == 0:
+                self.log.info(
+                    f"Transcription request: model={model_name} → lane slot "
+                    f"{backend.slot.slot_id} (GPU {getattr(backend, 'gpu_id', '?')}, "
+                    f"upload_bytes={approx_chars})"
+                )
             elif task_id:
                 hit_status = "hit" if sticky_backend is not None else "fresh"
                 retry_note = "" if attempt == 0 else f" (retry {attempt})"
@@ -2600,13 +2823,45 @@ class DynamicRouter:
         )
 
     @staticmethod
-    def _extract_model(body: bytes) -> str | None:
+    def _extract_model(body: bytes, content_type: str = "") -> str | None:
+        """The routing model: the JSON `model` key, or for a multipart upload
+        (audio transcription) the `model` form field."""
         if not body:
             return None
+        if content_type.lower().startswith("multipart/form-data"):
+            return DynamicRouter._multipart_field(body, content_type, "model")
         try:
             return json.loads(body).get("model")
-        except (json.JSONDecodeError, AttributeError):
+        except (ValueError, AttributeError):
             return None
+
+    @staticmethod
+    def _multipart_field(body: bytes, content_type: str, name: str) -> str | None:
+        """Text value of one multipart form field, without copying the body.
+
+        Only each part's header block (up to its first blank line) is searched
+        for the field name, so audio bytes that happen to contain form-data
+        text cannot be mistaken for a field."""
+        match = re.search(r'boundary=(?:"([^"]+)"|([^;\s]+))', content_type, re.I)
+        if not match:
+            return None
+        delim = b"--" + (match.group(1) or match.group(2)).encode()
+        needle = f'name="{name}"'.encode()
+        pos = body.find(delim)
+        while pos != -1:
+            start = pos + len(delim)
+            if body[start:start + 2] == b"--":
+                return None                      # closing delimiter
+            nxt = body.find(delim, start)
+            end = nxt if nxt != -1 else len(body)
+            head_end = body.find(b"\r\n\r\n", start, end)
+            if head_end != -1 and needle in body[start:head_end]:
+                value = body[head_end + 4:end]
+                if value.endswith(b"\r\n"):
+                    value = value[:-2]
+                return value.decode("utf-8", "replace").strip() or None
+            pos = nxt
+        return None
 
     @staticmethod
     def _invalid_request(message: str, param: str | None = None) -> web.Response:
@@ -2625,6 +2880,13 @@ class DynamicRouter:
         parsed_body: object,
         config: ModelConfig,
     ) -> web.Response | None:
+        if config.request_kind == "transcription":
+            if request.method != "POST" or request.path != "/v1/audio/transcriptions":
+                return self._invalid_request(
+                    "Transcription models are only available through "
+                    "POST /v1/audio/transcriptions"
+                )
+            return None
         if config.request_kind != "speech":
             return None
         if request.method != "POST" or request.path != "/v1/audio/speech":
@@ -2671,6 +2933,17 @@ class DynamicRouter:
         ) as session:
             await asyncio.gather(*(
                 self._try_adopt_slot(slot, session) for slot in self.slots
+            ))
+            # Co-resident vLLM instances survive a manager restart (KillMode=
+            # process) on their deterministic lane ports; adopt any that are up.
+            lanes = [
+                self._lane_slot(model, gpu)
+                for gpu in sorted({s.gpu_id for s in self.slots})
+                for model in self._coresident_names()
+                if _find_vllm_pid_for_port(self._lane_port(model, gpu)) is not None
+            ]
+            await asyncio.gather(*(
+                self._try_adopt_slot(lane, session) for lane in lanes
             ))
 
     async def _try_adopt_slot(self, slot: GpuSlot,
@@ -2729,14 +3002,7 @@ class DynamicRouter:
                 f"within {self.ADOPT_BOOT_WAIT}s — skipping"
             )
             return
-        b = GpuBackend(
-            model_name,
-            config.script,
-            served_name,
-            slot,
-            max_num_seqs=config.max_num_seqs,
-        )
-        b.router = self
+        b = self._make_backend(model_name, slot, served_name=served_name)
         await b.start()                # init session + idle watchdog
         b._adopted_pid = pid
         b._ready       = True
@@ -2798,7 +3064,7 @@ async def main() -> None:
         except asyncio.TimeoutError:
             log.warning("site.stop() exceeded 5s — forcing exit")
         log.info("Shutdown — leaving vLLM backends running (will adopt on next start)")
-        for slot in slots:
+        for slot in router._all_slots():
             if slot.backend and slot.backend._idle_task:
                 slot.backend._idle_task.cancel()
             if slot.backend:

@@ -51,6 +51,28 @@ Slot 2  API :9020  →  EngineCore IPC :9022  …
 
 If you assign consecutive ports (e.g. 9000 and 9001), slot 1 will always fail with *Address already in use*. The default gap of 10 is conservative and safe.
 
+### Co-resident small models (VRAM budget, not a slot)
+
+A slot holds one large model per GPU.  A *co-resident* model (`ModelConfig(coresident=True)`,
+today `qwen3-asr-1.7b`, ~7 GiB) instead shares a GPU with whatever primary owns the slot:
+
+- **Admission by budget.** A request is placed on a GPU whose *current* free VRAM (nvidia-smi),
+  minus what co-resident models still starting there will take, covers the model's min-viable
+  `gpu_memory_utilization` (`MODEL_MIN_GPU_MEM_UTIL`) plus `HARD_MARGIN_MIB`.  A GPU without a
+  primary is preferred, then the one with the most room.  If none fits the caller gets 503
+  `gpu_busy` with each GPU's free GiB.
+- **Lanes.** Each (model, GPU) gets a virtual slot with a fixed port
+  (`GPU_CORESIDENT_PORT_BASE + gpu*100 + model_index*10`, default 9100+), outside `self.slots`,
+  so it never occupies or blocks a primary slot.  Ports are fixed so a restart adopts the vLLM
+  it left running.
+- **Primaries outrank it.** Before a primary spawns, an *idle* co-resident model on that GPU is
+  stopped if the primary would otherwise be too tight.  A busy one is left alone.
+- **Own idle timeout** (`ModelConfig.idle_timeout`, ASR: 300 s) and no scale-out replicas.
+- `_check_gpu_free` treats live backends' process groups as expected neighbours; any other vLLM
+  process on the GPU is still a leftover.
+- Requests: `POST /v1/audio/transcriptions` (multipart; `model` is read from the form field
+  without copying the upload).  Status: `coresident` list in `/admin/status`.
+
 ### Scale-out threshold
 
 Scale-out only fires when **total concurrent active requests ≥ 2**. A single background health-check from LiteLLM is not enough to trigger a second GPU spawn. This prevents runaway GPU usage for low-load scenarios.
