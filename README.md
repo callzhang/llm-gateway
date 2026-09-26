@@ -54,7 +54,7 @@ If you assign consecutive ports (e.g. 9000 and 9001), slot 1 will always fail wi
 ### Co-resident small models (VRAM budget, not a slot)
 
 A slot holds one large model per GPU.  A *co-resident* model (`ModelConfig(coresident=True)`,
-today `qwen3-asr-1.7b`, ~7 GiB) instead shares a GPU with whatever primary owns the slot:
+today `qwen3-asr-0.6b`, ~3 GiB) instead shares a GPU with whatever primary owns the slot:
 
 - **Admission by budget.** A request is placed on a GPU whose *current* free VRAM (nvidia-smi),
   minus what co-resident models still starting there will take, covers the model's min-viable

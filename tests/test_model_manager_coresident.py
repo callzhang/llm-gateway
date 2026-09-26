@@ -1,6 +1,6 @@
 """Co-resident small models: scheduled by VRAM budget, never by taking a GPU slot.
 
-A co-resident model (ASR, ~7 GiB) shares a GPU with whatever primary model owns
+A co-resident model (ASR, ~3 GiB) shares a GPU with whatever primary model owns
 the slot.  It is admitted only if the GPU's *current* free VRAM covers its
 min-viable footprint, and it yields to primaries: an idle one is stopped when a
 primary spawn would otherwise be too tight.
@@ -23,7 +23,7 @@ from model_manager import (
     ModelConfig,
 )
 
-ASR = "qwen3-asr-1.7b"
+ASR = "qwen3-asr-0.6b"
 SMALL_B = "small-b"
 CHAT = "chat-a"
 TOTAL_MIB = 32000.0

@@ -462,12 +462,15 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
         max_input_chars=_tts_max_input_chars(),
     ),
     # Speech-to-text (POST /v1/audio/transcriptions), FP8 online-quantized.
-    # Co-resident: ~7 GiB, so it shares a GPU with a primary instead of taking
+    # Co-resident: ~3 GiB, so it shares a GPU with a primary instead of taking
     # a slot, and unloads after 5 idle minutes (uploads are rare and a cold
-    # start is ~1.5 min, so a short residency costs little and frees the card).
-    "qwen3-asr-1.7b": ModelConfig(
-        "run_qwen3_asr_1_7b.sh",
-        "qwen3-asr-1.7b",
+    # start is ~1 min, so a short residency costs little and frees the card).
+    # 0.6B rather than 1.7B (2026-09-26): on a 34 min meeting it agrees with the
+    # 1.7B BF16 at 0.954 (1.7B FP8: 0.971) and beats FunASR on product names
+    # (Codex/connector/eval), while fitting beside a 27B where 1.7B (~7 GiB) does not.
+    "qwen3-asr-0.6b": ModelConfig(
+        "run_qwen3_asr_0_6b.sh",
+        "qwen3-asr-0.6b",
         request_kind="transcription",
         coresident=True,
         idle_timeout=300,
@@ -530,12 +533,11 @@ MODEL_GPU_MEM_UTIL: dict[str, float] = {
     # late-loading video-transcribe (1.6) with ~0.8 spare; 0.92 would not.
     # The spawn-time clamp below still lowers this to fit whatever is free.
     "qwen3.8-27b":             0.90,
-    # Measured on an RTX 5090 (2026-09-26, vLLM 0.29 --quantization fp8,
-    # --max-model-len 4096): weights 3.16 GiB, 0.22 -> 1.96 GiB KV / 18,336 tokens
-    # (4.5x concurrency at 4096); 0.14 left a negative KV budget and died at
-    # startup.  BF16 needs 0.30.  Audio is cut to <=30 s chunks upstream, so
-    # this KV is ample.
-    "qwen3-asr-1.7b":          0.22,
+    # PROVISIONAL (0.6B FP8, --enforce-eager, --max-model-len 2048): weights ~1.1
+    # GiB + ~0.5 GiB CUDA context + activations/KV.  Not yet measured on a GPU
+    # with room; the 1.7B measurement it replaces was 0.22 (weights 3.16 GiB).
+    # Refine after the first real spawn (see the log's "Available KV cache").
+    "qwen3-asr-0.6b":          0.10,
 }
 # Margin (MiB) held back from current free VRAM when computing util — absorbs
 # nvidia-smi jitter and small growth by other GPU processes during vLLM startup.
@@ -574,9 +576,10 @@ CORESIDENT_PORT_BASE = int(os.environ.get("GPU_CORESIDENT_PORT_BASE", "9100"))
 MODEL_MIN_GPU_MEM_UTIL: dict[str, float] = {
     "qwen3.6-35b-a3b-heretic": 0.84,
     "qwen3.8-27b":             0.78,
-    # 0.14 is dead (negative KV); 0.19 leaves ~0.7 GiB of KV, still >2x a
-    # 30 s chunk.  Also the co-resident admission floor (see _pick_coresident_gpu).
-    "qwen3-asr-1.7b":          0.19,
+    # PROVISIONAL: a 2 GiB budget failed at startup on GPU0 (1.43 GiB usable
+    # after the CUDA context), so the floor is above that.  Also the co-resident
+    # admission floor (see _pick_coresident_gpu).
+    "qwen3-asr-0.6b":          0.08,
 }
 # Fallback floor for models not listed above (best-effort attempt, not fail-fast).
 GPU_MEM_UTIL_FLOOR = float(os.environ.get("GPU_MEM_UTIL_FLOOR", "0.78"))

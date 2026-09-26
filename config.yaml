@@ -65,6 +65,19 @@ model_list:
       api_key: local-qwen36
       timeout: 600
 
+  # ── Qwen3-ASR 0.6B (speech-to-text, FP8) ────────────────────────────────
+  # The unified ASR service: POST /v1/audio/transcriptions.  model_manager
+  # schedules it as a co-resident model (VRAM budget, no GPU slot) and unloads it
+  # after 5 idle minutes.  A 503 gpu_busy means no GPU has ~3 GiB free right now.
+  - model_name: qwen3-asr-0.6b
+    litellm_params:
+      model: openai/qwen3-asr-0.6b
+      api_base: http://127.0.0.1:8002/v1
+      api_key: local-qwen36
+      timeout: 900
+    model_info:
+      mode: audio_transcription
+
   # No external fallback by design — every model is served locally through
   # model_manager.  The old gpt-5.4-mini / api.kksj.org entry was removed along
   # with its OPENAI_API_KEY plumbing; the key was invalid (401) and a fallback
