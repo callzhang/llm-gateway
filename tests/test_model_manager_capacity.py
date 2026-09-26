@@ -44,6 +44,54 @@ class ModelSequenceLimitConfigTests(unittest.TestCase):
                 self.assertGreater(config.max_num_seqs, 0)
 
 
+class AdoptedBackendConfigTests(unittest.TestCase):
+    def test_adoption_rejects_backend_with_stale_memory_utilization(self) -> None:
+        cmdline = [
+            "vllm",
+            "serve",
+            "model",
+            "--served-model-name",
+            "qwen3.8-27b",
+            "--gpu-memory-utilization",
+            "0.900",
+            "--max-num-seqs",
+            "4",
+        ]
+        config = model_manager.ModelConfig(
+            script="run_qwen38_27b.sh",
+            served_name="qwen3.8-27b",
+            max_num_seqs=4,
+        )
+
+        with patch.object(model_manager, "_read_vllm_cmdline", return_value=cmdline):
+            self.assertFalse(
+                model_manager._adopted_vllm_matches_config(123, "qwen3.8-27b", config)
+            )
+
+    def test_adoption_accepts_lower_runtime_utilization_from_vram_clamp(self) -> None:
+        cmdline = [
+            "vllm",
+            "serve",
+            "model",
+            "--served-model-name",
+            "qwen3.8-27b",
+            "--gpu-memory-utilization",
+            "0.800",
+            "--max-num-seqs",
+            "4",
+        ]
+        config = model_manager.ModelConfig(
+            script="run_qwen38_27b.sh",
+            served_name="qwen3.8-27b",
+            max_num_seqs=4,
+        )
+
+        with patch.object(model_manager, "_read_vllm_cmdline", return_value=cmdline):
+            self.assertTrue(
+                model_manager._adopted_vllm_matches_config(123, "qwen3.8-27b", config)
+            )
+
+
 class ModelSequenceLimitRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_spawn_passes_configured_max_num_seqs(self) -> None:
         backend = model_manager.GpuBackend(

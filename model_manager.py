@@ -382,6 +382,98 @@ def _read_served_model_name(pid: int) -> str | None:
             return args[i + 1].decode("utf-8", errors="ignore")
     return None
 
+
+def _read_vllm_cmdline(pid: int) -> list[str] | None:
+    """Read a vLLM process command line for adoption validation."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [arg.decode("utf-8", errors="ignore") for arg in f.read().split(b"\x00") if arg]
+    except (FileNotFoundError, PermissionError):
+        return None
+
+
+def _cmdline_option(args: list[str], option: str) -> str | None:
+    try:
+        index = args.index(option)
+    except ValueError:
+        return None
+    if index + 1 >= len(args):
+        return None
+    return args[index + 1]
+
+
+def _adopted_vllm_matches_config(
+    pid: int,
+    model_name: str,
+    config: "ModelConfig",
+) -> bool:
+    """Return whether an existing vLLM is safe to adopt for current config.
+
+    A model-manager restart deliberately leaves vLLM children running.  That is
+    only safe when their admission settings still satisfy the current config;
+    otherwise a deployment can silently keep an old, higher-VRAM generation
+    alive and starve co-resident services.  Runtime VRAM clamping may lower
+    utilization, so only values above the configured ceiling are stale.
+    """
+    args = _read_vllm_cmdline(pid)
+    if not args:
+        return False
+
+    if config.max_num_seqs is not None:
+        raw_max_num_seqs = _cmdline_option(args, "--max-num-seqs")
+        if raw_max_num_seqs is None:
+            return False
+        try:
+            if int(raw_max_num_seqs) != config.max_num_seqs:
+                return False
+        except ValueError:
+            return False
+
+    desired_util = MODEL_GPU_MEM_UTIL.get(model_name)
+    if desired_util is not None:
+        raw_util = _cmdline_option(args, "--gpu-memory-utilization")
+        if raw_util is None:
+            return False
+        try:
+            if float(raw_util) > desired_util + 1e-6:
+                return False
+        except ValueError:
+            return False
+
+    return True
+
+
+async def _terminate_adopted_vllm(pid: int) -> None:
+    """Stop a stale adopted vLLM before the slot is made available."""
+    try:
+        process_group = os.getpgid(pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    try:
+        if process_group == pid:
+            os.killpg(process_group, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+
+    for _ in range(20):
+        await asyncio.sleep(0.5)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except (PermissionError, OSError):
+            break
+
+    try:
+        if process_group == pid:
+            os.killpg(process_group, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
 @dataclass(frozen=True)
 class ModelConfig:
     """Runtime and request contract for one dynamically scheduled model."""
@@ -3081,6 +3173,13 @@ class DynamicRouter:
             )
             return
         model_name, config = match
+        if not _adopted_vllm_matches_config(pid, model_name, config):
+            self.log.warning(
+                f"Slot {slot.slot_id}: refusing to adopt stale vLLM pid={pid} "
+                f"for {model_name}; stopping it so current runtime config applies"
+            )
+            await _terminate_adopted_vllm(pid)
+            return
         self.log.info(
             f"Slot {slot.slot_id}: found vLLM pid={pid} serving {served_name}, "
             f"waiting for /health (up to {self.ADOPT_BOOT_WAIT}s)"
