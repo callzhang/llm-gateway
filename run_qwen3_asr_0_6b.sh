@@ -6,7 +6,7 @@ set -euo pipefail
 
 # Weights (and the ForcedAligner used for timestamps) are cached here; never let
 # a cold start block on the Hub.
-export HF_HOME=${HF_HOME:-/home/derek/services/asr-provider/runtime-cache/qwen3-asr}
+export HF_HOME=${HF_HOME:-/home/derek/models/qwen3-asr}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export CUDA_VISIBLE_DEVICES=${VLLM_CUDA_DEVICE:-0}

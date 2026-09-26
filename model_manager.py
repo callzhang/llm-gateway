@@ -568,7 +568,7 @@ ASR_CPU_PYTHON = os.environ.get("ASR_CPU_PYTHON", "/home/derek/miniforge3/bin/py
 ASR_CPU_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asr_adapter", "cpu_worker.py")
 ASR_CPU_THREADS = os.environ.get("ASR_CPU_THREADS", "8")
 ASR_CPU_IDLE_SECONDS = float(os.environ.get("ASR_CPU_IDLE_SECONDS", "900"))
-ASR_HF_HOME = os.environ.get("ASR_HF_HOME", "/home/derek/services/asr-provider/runtime-cache/qwen3-asr")
+ASR_HF_HOME = os.environ.get("ASR_HF_HOME", "/home/derek/models/qwen3-asr")
 
 # Per-model MINIMUM viable gpu_memory_utilization.  vLLM allocates: weights +
 # activations first, then *all remaining* budget (util×total − used) becomes the
