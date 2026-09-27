@@ -62,8 +62,9 @@ export HF_HOME=/home/stardust/.cache/huggingface
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=${VLLM_CUDA_DEVICE:-1}
 
-# qwen3.8 MTP speculative decoding is disabled until vLLM/xgrammar
-# accepted-prefix state synchronization is fixed upstream.
+# MTP speculative decoding re-enabled 2026-09-11 on vLLM 0.29.0, which carries
+# the fix for vllm#34650 (spec decode desyncing xgrammar at the reasoning
+# boundary) — the bug that forced 490a648 to disable it on 0.25.1.
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
 export PYTHONNOUSERSITE=1
@@ -102,12 +103,14 @@ exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --port ${VLLM_PORT:-9010} \
   --api-key local-qwen36 \
   --served-model-name qwen3.8-27b \
+  --revision 35fd99fb8434ef70ee61372df3face5174bed2c8 \
   --gpu-memory-utilization ${GPU_MEM_UTIL} \
   --max-model-len ${MAX_MODEL_LEN} \
   --max-num-seqs "$MAX_NUM_SEQS" \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
   --enable-chunked-prefill \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":1,"revision":"35fd99fb8434ef70ee61372df3face5174bed2c8"}' \
   --structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}' \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
