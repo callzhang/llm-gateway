@@ -55,7 +55,7 @@ class AdoptedBackendConfigTests(unittest.TestCase):
             "--served-model-name",
             "qwen3.8-27b",
             "--gpu-memory-utilization",
-            "0.900",
+            "0.960",
             "--max-num-seqs",
             "4",
         ]
@@ -132,25 +132,28 @@ class ModelSequenceLimitRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
-class ChatModelNeighbourReserveTests(unittest.TestCase):
+class ChatModelUtilCeilingTests(unittest.TestCase):
     # RTX 5090 total and the util-independent footprint (CUDA context +
     # non-torch memory) measured 2026-09-26: 30108 MiB used at util 0.90.
     TOTAL_MIB = 32607.0
     OVERHEAD_MIB = 30108.0 - 0.90 * TOTAL_MIB
 
-    def test_chat_models_leave_neighbour_reserve_free(self) -> None:
+    def test_chat_models_share_one_ceiling(self) -> None:
         for name, config in model_manager.MODEL_CONFIGS.items():
             if config.request_kind != "chat":
                 continue
             with self.subTest(model=name):
-                util = model_manager.MODEL_GPU_MEM_UTIL[name]
-                footprint = util * self.TOTAL_MIB + self.OVERHEAD_MIB
-                free = self.TOTAL_MIB - footprint
-                self.assertGreaterEqual(
-                    free,
-                    model_manager.NEIGHBOUR_RESERVE_MIB,
-                    f"{name} at util {util} leaves only {free:.0f} MiB free",
+                self.assertEqual(
+                    model_manager.CHAT_GPU_MEM_UTIL_CEILING,
+                    model_manager.MODEL_GPU_MEM_UTIL[name],
                 )
+
+    def test_ceiling_footprint_fits_an_empty_card(self) -> None:
+        footprint = (
+            model_manager.CHAT_GPU_MEM_UTIL_CEILING * self.TOTAL_MIB
+            + self.OVERHEAD_MIB
+        )
+        self.assertLess(footprint, self.TOTAL_MIB)
 
     def test_chat_model_util_stays_above_min_viable_floor(self) -> None:
         for name, config in model_manager.MODEL_CONFIGS.items():
