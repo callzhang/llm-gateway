@@ -31,6 +31,26 @@ _WAIT_SECONDS = float(os.environ.get("PREVIOUS_RESPONSE_WAIT_SECONDS", "30"))
 _POLL_SECONDS = 1.0
 
 
+async def load_session_messages(previous_response_id: str) -> list[dict]:
+    """Stored chat messages for a previous_response_id, exactly as the bridge
+    will rebuild them.  Empty when nothing is stored.  trim_hook uses this to
+    count history that never appears in the request body."""
+    from litellm.proxy.hooks.responses_id_security import ResponsesIDSecurity
+    from litellm.responses.litellm_completion_transformation.session_handler import (
+        ResponsesSessionHandler,
+    )
+
+    # Hook order against LiteLLM's own ResponsesIDSecurity is not fixed, so
+    # accept both the encrypted id and the already-decrypted one.
+    security = ResponsesIDSecurity()
+    if security._is_encrypted_response_id(previous_response_id):
+        previous_response_id, _, _ = security._decrypt_response_id(previous_response_id)
+    session = await ResponsesSessionHandler.get_chat_completion_message_history_for_previous_response_id(
+        previous_response_id=previous_response_id
+    )
+    return session.get("messages") or []
+
+
 class PreviousResponseHistoryHook(CustomLogger):
     async def async_pre_call_hook(
         self,
@@ -45,26 +65,13 @@ class PreviousResponseHistoryHook(CustomLogger):
         if not previous_response_id:
             return data
 
-        from litellm.proxy.hooks.responses_id_security import ResponsesIDSecurity
-        from litellm.responses.litellm_completion_transformation.session_handler import (
-            ResponsesSessionHandler,
-        )
-
-        # Hook order against LiteLLM's own ResponsesIDSecurity is not fixed, so
-        # accept both the encrypted id and the already-decrypted one.
-        security = ResponsesIDSecurity()
-        if security._is_encrypted_response_id(previous_response_id):
-            previous_response_id, _, _ = security._decrypt_response_id(previous_response_id)
-
         deadline = time.monotonic() + _WAIT_SECONDS
         while True:
-            session = await ResponsesSessionHandler.get_chat_completion_message_history_for_previous_response_id(
-                previous_response_id=previous_response_id
-            )
-            if session.get("messages") or time.monotonic() >= deadline:
+            messages = await load_session_messages(previous_response_id)
+            if messages or time.monotonic() >= deadline:
                 break
             await asyncio.sleep(_POLL_SECONDS)
-        if not session.get("messages"):
+        if not messages:
             raise HTTPException(
                 status_code=410,
                 detail=(

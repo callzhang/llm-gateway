@@ -96,6 +96,36 @@ Formats: `json`, `verbose_json` (segments with start/end), `text`.  Settings: `A
 `ASR_CPU_PYTHON` (needs transformers >= 5.13: the miniforge base), `ASR_CPU_THREADS`,
 `ASR_CPU_IDLE_SECONDS`, `ASR_HF_HOME`, `ASR_GPU_API_KEY`.
 
+### Context-window fitting (`trim_hook.py`)
+
+vLLM rejects a request whose prompt plus requested output exceeds `--max-model-len`, and LiteLLM
+passes that 400 through (it only has `context_window_fallbacks`, which needs a second, larger
+model, and `trim_messages`, which neither caps output nor handles Responses `input`). The
+`trim_hook` pre-call hook therefore makes every `/v1/chat/completions` and `/v1/responses`
+request fit before it reaches vLLM.
+
+Input is counted exactly with the model's own tokenizer and chat template (tool definitions
+included; for `previous_response_id` the stored history too). With *R* = window − input −
+512 safety margin, *requested* = the caller's output cap (or `litellm_params.max_tokens`) and
+*F* = requested / 1.1:
+
+| Situation | Action |
+|---|---|
+| R ≥ requested | untouched |
+| F ≤ R < requested | cap the output at R. The model stops there with `finish_reason: "length"` (Responses: `status: "incomplete"`) — a normal response, not an error |
+| R < F | drop the oldest turns until R ≥ F, then cap the output at what is left |
+| F unreachable | drop history only if R < 1024 (just far enough to reach 1024); otherwise keep it and cap |
+| R < 1 even with only the latest turn | untouched; vLLM returns its own explicit 400 |
+
+A *turn* starts at a user message and runs to the next one, so a tool call always travels with
+its result. System/developer messages, `instructions` and the latest turn are never dropped.
+Limits come from `config.yaml` (`model_info.max_input_tokens`, `max_output_tokens`, `tokenizer`,
+`tokenizer_revision`); LiteLLM registers the first two into `litellm.model_cost`. A model that
+declares a window without a tokenizer fails at startup. Known gaps: image tokens expand inside
+vLLM and only their placeholder is counted (the 512 margin absorbs small images), and history
+behind `previous_response_id` is counted but cannot be trimmed. Reasoning models spend the
+output cap on thinking first, so a tight cap can end the answer before any visible text.
+
 ### Scale-out threshold
 
 Scale-out only fires when **total concurrent active requests ≥ 2**. A single background health-check from LiteLLM is not enough to trigger a second GPU spawn. This prevents runaway GPU usage for low-load scenarios.
