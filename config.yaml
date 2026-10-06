@@ -21,9 +21,11 @@ model_list:
       # over-length requests through and they failed at the backend.
       # max_input_tokens is the context window; LiteLLM registers it (and
       # max_output_tokens, which must equal litellm_params.max_tokens above)
-      # into litellm.model_cost.  trim_hook reads these plus the tokenizer.
+      # into litellm.model_cost.  trim_hook reads these plus the tokenizer and
+      # tool_cap_tokens (cap for tool arguments/results in history, default 2000).
       max_input_tokens: 81920
       max_output_tokens: 32768
+      tool_cap_tokens: 2000
       tokenizer: AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4
       supports_vision: true
 
@@ -51,6 +53,7 @@ model_list:
       # on 2026-09-02; model native is 262144).
       max_input_tokens: 131072
       max_output_tokens: 32768
+      tool_cap_tokens: 2000
       tokenizer: gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090
       tokenizer_revision: 35fd99fb8434ef70ee61372df3face5174bed2c8   # == --revision in run_qwen38_27b.sh
       supports_vision: true

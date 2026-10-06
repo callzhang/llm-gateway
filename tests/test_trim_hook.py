@@ -25,7 +25,7 @@ CONFIG = {
         {
             "model_name": "chat-model",
             "litellm_params": {"model": "custom_openai/chat-model", "max_tokens": 3000},
-            "model_info": {"max_input_tokens": CTX, "tokenizer": "stub/tok"},
+            "model_info": {"max_input_tokens": CTX, "tokenizer": "stub/tok", "tool_cap_tokens": 500},
         },
         {"model_name": "tts-model", "litellm_params": {"model": "custom_openai/tts"}},
     ]
@@ -33,13 +33,19 @@ CONFIG = {
 
 
 class StubTokenizer:
+    def encode(self, text, add_special_tokens=False):
+        return list(text)
+
+    def decode(self, ids):
+        return "".join(ids)
+
     def apply_chat_template(self, messages, tools=None, add_generation_prompt=True, tokenize=True, return_dict=True):
         n = 0
         for m in messages:
             content = m.get("content") or ""
             if isinstance(content, list):
                 content = "".join(p.get("text", "") for p in content)
-            n += len(content) + 4
+            n += len(content) + 4 + len(m.get("reasoning_content") or "")
             n += len(json.dumps(m.get("tool_calls") or ""))
         if tools:
             n += len(json.dumps(tools))
@@ -138,7 +144,7 @@ def test_tool_call_and_its_result_are_dropped_together(hook):
     result = {"role": "tool", "tool_call_id": "c1", "content": "r" * 3000}
     messages = [
         {"role": "user", "content": "first"}, call, result, {"role": "assistant", "content": "done"},
-        {"role": "user", "content": "q" * 7000},
+        {"role": "user", "content": "q" * 8000},
     ]
     data = {"model": "chat-model", "messages": messages, "max_tokens": 3000}
 
@@ -172,6 +178,187 @@ def test_history_is_dropped_only_as_far_as_the_minimum_output_when_the_floor_is_
     assert CTX - tokens(kept) - MARGIN >= trim_hook._MIN_OUTPUT
     assert data["max_tokens"] == CTX - tokens(kept) - MARGIN
 
+
+
+# ── shrinking steps before dropping turns ───────────────────────────────────
+# Budget with the stub tokenizer: input must end up <= CTX - MARGIN - 2728 = 6760.
+
+THINK = "pondering " * 300          # 3000 chars of chain of thought
+
+
+def calm_last(size=2000):
+    return {"role": "user", "content": "final question".ljust(size, "?")}
+
+
+def test_thinking_before_the_latest_user_message_is_removed_first(hook):
+    history = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1", "reasoning_content": THINK},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": THINK + "</think>\n\na2"},
+        {"role": "user", "content": "q3"},
+        {"role": "assistant", "content": "a3", "thinking_blocks": [{"thinking": THINK}]},
+    ]
+    last = calm_last(2000)
+    data = {"model": "chat-model", "messages": history + [last], "max_tokens": 3000}
+    assert tokens(history + [last]) > 6760
+
+    assert run(hook, data) is data
+    kept = data["messages"]
+    assert [m["content"] for m in kept[:6]] == ["q1", "a1", "q2", "a2", "q3", "a3"]
+    assert not any(k in m for m in kept for k in ("reasoning_content", "thinking_blocks"))
+    assert len(kept) == len(history) + 1          # nothing dropped
+    assert kept[-1] == last
+
+
+def test_thinking_in_the_current_turn_is_kept(hook):
+    last = {"role": "user", "content": "go".ljust(9000, ".")}
+    reply = {"role": "assistant", "content": "", "reasoning_content": THINK,
+             "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}
+    data = {"model": "chat-model", "messages": [last, reply, {"role": "tool", "tool_call_id": "c", "content": "ok"}], "max_tokens": 3000}
+    run(hook, data)
+    assert data["messages"][1]["reasoning_content"] == THINK
+
+
+def test_responses_reasoning_items_and_inline_thinking_are_removed(hook):
+    items = [
+        {"role": "user", "content": "q1"},
+        {"type": "reasoning", "id": "r1", "summary": [{"type": "summary_text", "text": THINK}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": THINK + "</think>\n\nanswer"}]},
+        {"role": "user", "content": "q2".ljust(7000, "?")},
+    ]
+    data = {"model": "chat-model", "input": items, "max_output_tokens": 3000}
+    run(hook, data, "aresponses")
+    assert [i.get("type") for i in data["input"]] == [None, None, None]
+    assert data["input"][1]["content"][0]["text"] == "answer"
+
+
+def test_later_steps_are_skipped_once_the_request_fits(hook):
+    dup = "same file contents " * 40
+    history = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1", "reasoning_content": THINK},
+        {"role": "user", "content": dup},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": dup},
+        {"role": "assistant", "content": "ok again"},
+    ]
+    last = calm_last(2300)
+    data = {"model": "chat-model", "messages": history + [last], "max_tokens": 3000}
+    assert tokens(history + [last]) - len(THINK) <= 6760 < tokens(history + [last])
+
+    run(hook, data)
+    assert [m["content"] for m in data["messages"] if m["role"] == "user"][1:3] == [dup, dup]   # dedup not run
+
+
+def test_near_duplicate_history_is_stubbed_and_the_latest_copy_kept(hook):
+    page = " ".join(f"word{i}" for i in range(600))                 # ~4.1k chars
+    nearly = page.replace("word300", "WORD300")                      # 1 word changed: 591/601 = 98.3% of 5-grams shared
+    different = " ".join(f"other{i}" for i in range(60))             # ~0.4k chars, unrelated
+    history = [
+        {"role": "user", "content": "q1"}, {"role": "assistant", "content": page},
+        {"role": "user", "content": "q2"}, {"role": "assistant", "content": different},
+        {"role": "user", "content": "q3"}, {"role": "assistant", "content": nearly},
+    ]
+    last = {"role": "user", "content": "go".ljust(1500, "?")}
+    data = {"model": "chat-model", "messages": history + [last], "max_tokens": 3000}
+    assert tokens(history + [last]) > 6760
+
+    run(hook, data)
+    got = [m["content"] for m in data["messages"]]
+    assert got[1] == trim_hook._DUPLICATE_STUB        # older copy replaced
+    assert got[3] == different                        # dissimilar kept
+    assert got[5] == nearly                           # latest copy kept
+    assert [m["role"] for m in data["messages"]] == [m["role"] for m in history + [last]]
+
+
+def test_a_copy_in_the_latest_turn_is_kept_and_the_history_copy_is_stubbed(hook):
+    page = " ".join(f"word{i}" for i in range(600))
+    messages = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": page}, {"role": "user", "content": page}]
+    data = {"model": "chat-model", "messages": list(messages), "max_tokens": 3000}
+    assert tokens(messages) > 6760
+
+    run(hook, data)
+    assert data["messages"][1]["content"] == trim_hook._DUPLICATE_STUB
+    assert data["messages"][2] == messages[2]
+
+
+def test_a_message_that_is_less_similar_than_the_threshold_is_kept(hook):
+    page = " ".join(f"word{i}" for i in range(600))
+    edited = " ".join(w if i % 20 else "changed" for i, w in enumerate(page.split()))   # every 20th word differs
+    messages = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": page},
+                {"role": "user", "content": "q2"}, {"role": "assistant", "content": edited},
+                {"role": "user", "content": "go".ljust(500, "?")}]
+    data = {"model": "chat-model", "messages": list(messages), "max_tokens": 3000}
+    run(hook, data)
+    assert trim_hook._DUPLICATE_STUB not in [m["content"] for m in data["messages"]]
+
+
+def test_short_messages_are_never_deduplicated(hook):
+    history = [m for i in range(10) for m in ({"role": "user", "content": "same"}, {"role": "assistant", "content": "same"})]
+    messages = history + [{"role": "user", "content": "z" * 3000}]
+    data = {"model": "chat-model", "messages": messages, "max_tokens": 3000}
+    run(hook, data)
+    assert trim_hook._DUPLICATE_STUB not in [m["content"] for m in data["messages"]]
+
+
+def test_history_tool_results_and_arguments_are_capped_but_the_current_ones_are_not(hook):
+    call = lambda cid, args: {"role": "assistant", "content": "", "tool_calls": [
+        {"id": cid, "type": "function", "function": {"name": "f", "arguments": args}}]}
+    args_old = json.dumps({"path": "a.txt", "body": "B" * 3000, "n": 7})
+    args_new = json.dumps({"body": "N" * 1500})
+    messages = [
+        {"role": "user", "content": "first"}, call("c1", args_old), {"role": "tool", "tool_call_id": "c1", "content": "R" * 3000},
+        {"role": "user", "content": "second".ljust(300, "?")}, call("c2", args_new),
+        {"role": "tool", "tool_call_id": "c2", "content": "S" * 1500},
+    ]
+    data = {"model": "chat-model", "messages": messages, "max_tokens": 3000}
+    assert tokens(messages) > 6760
+
+    run(hook, data)
+    kept = data["messages"]
+    assert len(kept) == len(messages)
+    assert kept[2]["content"].startswith("R" * 250) and kept[2]["content"].endswith("R" * 250)
+    assert "tokens omitted" in kept[2]["content"] and len(kept[2]["content"]) < 700
+    old_args = json.loads(kept[1]["tool_calls"][0]["function"]["arguments"])   # still valid JSON
+    assert old_args["path"] == "a.txt" and old_args["n"] == 7
+    assert "tokens omitted" in old_args["body"] and len(old_args["body"]) < 700
+    assert kept[4] == messages[4] and kept[5] == messages[5]                  # current turn untouched
+
+
+def test_responses_function_call_items_are_capped_in_history(hook):
+    items = [
+        {"role": "user", "content": "first"},
+        {"type": "function_call", "call_id": "c1", "name": "f", "arguments": json.dumps({"body": "B" * 3000})},
+        {"type": "function_call_output", "call_id": "c1", "output": "R" * 3000},
+        {"role": "user", "content": "second".ljust(5000, "?")},
+    ]
+    data = {"model": "chat-model", "input": items, "max_output_tokens": 3000}
+    run(hook, data, "aresponses")
+    kept = data["input"]
+    assert len(kept) == len(items)
+    assert "tokens omitted" in kept[2]["output"]
+    assert "tokens omitted" in json.loads(kept[1]["arguments"])["body"]
+
+
+def test_tool_arguments_that_are_not_json_are_left_alone(hook):
+    msgs = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "not json " * 500}}]},
+        {"role": "user", "content": "q".ljust(8000, "?")},
+    ]
+    data = {"model": "chat-model", "messages": msgs, "max_tokens": 3000}
+    run(hook, data)
+    kept_args = [m for m in data["messages"] if m.get("tool_calls")]
+    assert not kept_args or kept_args[0]["tool_calls"][0]["function"]["arguments"] == "not json " * 500
+
+
+def test_turns_are_dropped_only_after_every_shrinking_step_was_not_enough(hook):
+    history = [m for i in range(5) for m in turn(i, 1500)]       # plain text, nothing to strip/dedup/cap
+    data = {"model": "chat-model", "messages": history + [calm_last(100)], "max_tokens": 3000}
+    run(hook, data)
+    assert len(data["messages"]) < len(history) + 1
+    assert CTX - tokens(data["messages"]) - MARGIN >= math.ceil(3000 / 1.1)
 
 def test_mandatory_content_over_the_window_is_left_for_vllm_to_reject(hook):
     data = {"model": "chat-model", "messages": [{"role": "user", "content": "z" * (CTX + 10)}], "max_tokens": 3000}
@@ -211,7 +398,7 @@ def test_responses_function_call_items_travel_with_their_turn(hook):
         {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "c1", "output": "r" * 3000},
         {"role": "assistant", "content": "done"},
-        {"role": "user", "content": "q" * 7000},
+        {"role": "user", "content": "q" * 8000},
     ]
     data = {"model": "chat-model", "input": items, "max_output_tokens": 3000}
 
@@ -344,3 +531,24 @@ def test_real_tokenizer_trims_a_long_conversation_to_fit():
     n = limits.tokenizer.count(kept, None)
     assert n + data["max_tokens"] + trim_hook._SAFETY_MARGIN <= limits.context_window
     assert data["max_tokens"] == 32768   # trimmed enough that the cap was not needed
+
+
+def test_real_template_bills_old_thinking_in_full_and_stripping_it_recovers_the_room():
+    real = trim_hook.context_trim_hook
+    limits = real._limits["qwen3.8-27b"]
+    think = "let me think about this carefully step by step " * 1200
+    history = [m for i in range(10) for m in (
+        {"role": "user", "content": f"question {i}"},
+        {"role": "assistant", "content": f"answer {i}", "reasoning_content": think},
+    )]
+    last = {"role": "user", "content": "final question"}
+    messages = history + [last]
+    assert limits.tokenizer.count(messages, None) > 100_000
+
+    data = {"model": "qwen3.8-27b", "messages": messages, "max_tokens": 32768}
+    assert run(real, data) is data
+    kept = data["messages"]
+    assert len(kept) == len(messages)                   # no turn dropped
+    assert all("reasoning_content" not in m for m in kept)
+    assert limits.tokenizer.count(kept, None) < 2_000
+    assert data["max_tokens"] == 32768

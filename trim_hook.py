@@ -18,23 +18,43 @@ accept without touching the input):
                                      stops at the cap with finish_reason
                                      "length" (Responses: status "incomplete"),
                                      which is a normal response, not an error.
-  * R < F                            drop the oldest turns until R >= F, then
-                                     shrink the output cap to what is left.
-                                     A turn starts at a user message and runs
-                                     to the next one, so tool calls stay paired
-                                     with their results.  System/developer
-                                     messages, `instructions` and the latest
-                                     turn are always kept.
+  * R < F                            shrink the input, least lossy step first,
+                                     recounting after each and stopping as soon
+                                     as R >= F:
+                                       1. drop thinking from turns before the
+                                          latest user message (Qwen's template
+                                          keeps old reasoning_content, so it is
+                                          billed in full for no benefit)
+                                       2. replace messages that are >= 98%
+                                          similar to a LATER message with a
+                                          one-line stub (the latest copy is the
+                                          current state; messages stay so roles
+                                          and tool pairing are intact)
+                                       3. cap tool-call arguments (string values
+                                          inside the JSON) and tool results to
+                                          model_info.tool_cap_tokens, head+tail
+                                       4. drop the oldest turns.  A turn starts
+                                          at a user message and runs to the next
+                                          one, so tool calls stay paired with
+                                          their results.
+                                     Steps 1-3 only touch turns before the latest
+                                     user message; system/developer messages,
+                                     `instructions` and the latest turn are
+                                     never modified or dropped.  Then the output
+                                     cap shrinks to what is left.
   * F unreachable                    even with only the latest turn left R < F.
-                                     History is then only dropped when R is
-                                     below MIN_OUTPUT (an answer that short is
-                                     useless, or the request would 400 outright);
-                                     it is dropped just far enough to reach
-                                     MIN_OUTPUT.  Otherwise it is kept and only
-                                     the cap shrinks.
+                                     Turns are then only dropped when R is below
+                                     MIN_OUTPUT (an answer that short is useless,
+                                     or the request would 400 outright), just far
+                                     enough to reach MIN_OUTPUT.  Otherwise they
+                                     are kept and only the cap shrinks.
   * R < 1 after all that             the mandatory content alone overflows; the
                                      request is left untouched so vLLM answers
                                      with its own explicit 400.
+
+Requests that already fit are never modified, which keeps vLLM's prefix cache
+valid.  Steps 1 and 3 are per-message and deterministic; 2 and 4 are not
+prefix-stable, which only costs cache hits on conversations that overflow.
 
 Input tokens are counted exactly: the model's own tokenizer and chat template
 run on the same messages (and tool definitions) vLLM will render.  Image parts
@@ -89,6 +109,18 @@ _OUTPUT_TOLERANCE = 1.1
 # generation prompt something to anchor on without steering the output.
 _FILLER_USER = "."
 
+# Near-duplicate removal (step 2).  Similarity is Jaccard over word 5-grams, so
+# it measures how much text two messages share, not what they mean.  Messages
+# shorter than _DEDUP_MIN_CHARS are never worth a stub.
+_DEDUP_SIMILARITY = 0.98
+_DEDUP_MIN_CHARS = 400
+_SHINGLE_WORDS = 5
+_DUPLICATE_STUB = "[omitted: near-duplicate of a later message]"
+
+# Tool arguments/results cap (step 3) when model_info.tool_cap_tokens is absent.
+_DEFAULT_TOOL_CAP_TOKENS = 2000
+
+_THINK_END = "</think>"
 _FIXED_ROLES = ("system", "developer")
 _CHAT_OUTPUT_KEYS = ("max_tokens", "max_completion_tokens")
 _RESPONSES_OUTPUT_KEYS = ("max_output_tokens",)
@@ -99,6 +131,7 @@ class ModelLimits:
     context_window: int
     default_output: int
     tokenizer: Any
+    tool_cap_tokens: int
 
 
 class _Counter:
@@ -119,6 +152,14 @@ class _Counter:
             )
         return len(encoded["input_ids"])
 
+    def encode(self, text: str) -> list[int]:
+        with self._lock:
+            return self._tokenizer.encode(text, add_special_tokens=False)
+
+    def decode(self, ids: list[int]) -> str:
+        with self._lock:
+            return self._tokenizer.decode(ids)
+
 
 def _as_dict(msg: Any) -> dict:
     return msg if isinstance(msg, dict) else msg.model_dump(exclude_none=True)
@@ -136,7 +177,10 @@ def _template_messages(messages: list[dict]) -> list[dict]:
                 call = _as_dict(call)
                 fn = dict(call.get("function") or {})
                 if isinstance(fn.get("arguments"), str):
-                    fn["arguments"] = json.loads(fn["arguments"] or "{}")
+                    try:
+                        fn["arguments"] = json.loads(fn["arguments"] or "{}")
+                    except json.JSONDecodeError:
+                        pass   # vLLM rejects this request itself; keep counting instead of 500-ing here
                 calls.append({**call, "function": fn})
             msg = {**msg, "tool_calls": calls}
         out.append(msg)
@@ -173,6 +217,7 @@ def _load_model_limits(
             context_window=int(ctx),
             default_output=int(max_out) if max_out else _DEFAULT_OUT,
             tokenizer=_Counter(tokenizer_loader(repo, info.get("tokenizer_revision"))),
+            tool_cap_tokens=int(info.get("tool_cap_tokens") or _DEFAULT_TOOL_CAP_TOKENS),
         )
     return limits
 
@@ -223,6 +268,190 @@ def _fit_input(
         else:
             lo = mid + 1
     return lo
+
+
+# ── input-shrinking steps ───────────────────────────────────────────────────
+# Items are chat messages ("chat") or Responses input items ("responses").  Both
+# are plain dicts; steps return a new list, or None when nothing changed.
+
+def _get(item: Any, path: tuple) -> Any:
+    for key in path:
+        item = item[key]
+    return item
+
+
+def _set(item: Any, path: tuple, value: Any) -> Any:
+    """Copy of `item` with the value at `path` replaced (copies only the spine)."""
+    if not path:
+        return value
+    child = _set(item[path[0]], path[1:], value)
+    if isinstance(item, list):
+        out = list(item)
+    else:
+        out = dict(item)
+    out[path[0]] = child
+    return out
+
+
+def _content_paths(item: dict, key: str, kind: str):
+    content = item.get(key)
+    if isinstance(content, str):
+        yield kind, (key,)
+    elif isinstance(content, list):
+        for i, part in enumerate(content):
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                yield kind, (key, i, "text")
+
+
+def _text_paths(item: Any, shape: str):
+    """(kind, path) of every text field in an item: "message" (user/assistant
+    text), "result" (tool output) or "args" (tool-call arguments JSON)."""
+    if not isinstance(item, dict) or item.get("role") in _FIXED_ROLES:
+        return
+    if shape == "chat":
+        if item.get("role") == "tool":
+            yield from _content_paths(item, "content", "result")
+            return
+        yield from _content_paths(item, "content", "message")
+        for i, call in enumerate(item.get("tool_calls") or []):
+            if isinstance((call.get("function") or {}).get("arguments"), str):
+                yield "args", ("tool_calls", i, "function", "arguments")
+        return
+    kind = item.get("type")
+    if kind == "function_call_output":
+        yield from _content_paths(item, "output", "result")
+    elif kind == "function_call":
+        if isinstance(item.get("arguments"), str):
+            yield "args", ("arguments",)
+    elif kind != "reasoning":
+        yield from _content_paths(item, "content", "message")
+
+
+def _history_end(items: list, role_of: Callable[[Any], str | None]) -> int:
+    """Index where the latest turn starts; everything before it is history."""
+    turns = _split_turns(items, role_of)
+    return turns[-1][0] if turns else 0
+
+
+def _without_thinking(text: str) -> str:
+    """Drop a leading chain of thought.  Qwen's generation prompt already opens
+    <think>, so a stored answer carries only the closing tag."""
+    return text.rsplit(_THINK_END, 1)[1].lstrip() if _THINK_END in text else text
+
+
+def _strip_thinking(items: list, shape: str, role_of, limits: ModelLimits) -> list | None:
+    end = _history_end(items, role_of)
+    out: list = []
+    changed = False
+    for i, item in enumerate(items):
+        if i >= end or not isinstance(item, dict):
+            out.append(item)
+            continue
+        if shape == "responses" and item.get("type") == "reasoning":
+            changed = True
+            continue
+        if shape == "chat" and item.get("role") == "assistant":
+            stripped = {k: v for k, v in item.items() if k not in ("reasoning_content", "thinking_blocks", "reasoning")}
+            changed |= len(stripped) != len(item)
+            item = stripped
+        if item.get("role") == "assistant":
+            for kind, path in _text_paths(item, shape):
+                if kind == "message":
+                    text = _get(item, path)
+                    plain = _without_thinking(text)
+                    if plain != text:
+                        item, changed = _set(item, path, plain), True
+        out.append(item)
+    return out if changed else None
+
+
+def _shingles(text: str) -> set[int]:
+    words = text.split()
+    if len(words) < _SHINGLE_WORDS:
+        return {hash(tuple(words))}
+    return {hash(tuple(words[i:i + _SHINGLE_WORDS])) for i in range(len(words) - _SHINGLE_WORDS + 1)}
+
+
+def _dedup_similar(items: list, shape: str, role_of, limits: ModelLimits) -> list | None:
+    """Stub history messages that are >= _DEDUP_SIMILARITY similar to a later one.
+    Walks from the end so the latest copy is the one kept."""
+    end = _history_end(items, role_of)
+    out = list(items)
+    kept: list[tuple[int, set[int]]] = []
+    changed = False
+    for idx in range(len(items) - 1, -1, -1):
+        for kind, path in _text_paths(items[idx], shape):
+            if kind == "args":
+                continue
+            text = _get(items[idx], path)
+            if len(text) < _DEDUP_MIN_CHARS:
+                continue
+            grams = _shingles(text)
+            # Jaccard >= s needs the sizes to be within a factor s of each other.
+            duplicate = any(
+                min(len(grams), len(other)) >= _DEDUP_SIMILARITY * max(len(grams), len(other))
+                and len(grams & other) / len(grams | other) >= _DEDUP_SIMILARITY
+                for _, other in kept
+            )
+            if duplicate and idx < end:
+                out[idx] = _set(out[idx], path, _DUPLICATE_STUB)
+                changed = True
+            else:
+                kept.append((len(text), grams))
+    return out if changed else None
+
+
+def _cap_text(text: str, cap: int, tokenizer: _Counter) -> str:
+    """Keep the first and last cap/2 tokens of `text`."""
+    if len(text) <= cap:           # a token is at least one character
+        return text
+    ids = tokenizer.encode(text)
+    if len(ids) <= cap:
+        return text
+    head = cap // 2
+    return (
+        tokenizer.decode(ids[:head])
+        + f"\n[... {len(ids) - cap} tokens omitted ...]\n"
+        + tokenizer.decode(ids[len(ids) - (cap - head):])
+    )
+
+
+def _cap_json_strings(value: Any, cap: int, tokenizer: _Counter) -> Any:
+    if isinstance(value, str):
+        return _cap_text(value, cap, tokenizer)
+    if isinstance(value, list):
+        return [_cap_json_strings(v, cap, tokenizer) for v in value]
+    if isinstance(value, dict):
+        return {k: _cap_json_strings(v, cap, tokenizer) for k, v in value.items()}
+    return value
+
+
+def _cap_tool_io(items: list, shape: str, role_of, limits: ModelLimits) -> list | None:
+    """Cap history tool results, and the string values inside tool-call
+    arguments (which must stay valid JSON, so the raw string is never cut)."""
+    end = _history_end(items, role_of)
+    cap, tokenizer = limits.tool_cap_tokens, limits.tokenizer
+    out = list(items)
+    changed = False
+    for idx in range(end):
+        for kind, path in _text_paths(items[idx], shape):
+            if kind == "message":
+                continue
+            text = _get(items[idx], path)
+            if kind == "args":
+                try:
+                    capped = json.dumps(_cap_json_strings(json.loads(text), cap, tokenizer), ensure_ascii=False)
+                except json.JSONDecodeError:
+                    continue
+                if capped == json.dumps(json.loads(text), ensure_ascii=False):
+                    continue
+            else:
+                capped = _cap_text(text, cap, tokenizer)
+                if capped == text:
+                    continue
+            out[idx] = _set(out[idx], path, capped)
+            changed = True
+    return out if changed else None
 
 
 class ContextTrimHook(CustomLogger):
@@ -276,7 +505,7 @@ class ContextTrimHook(CustomLogger):
 
         tools = data.get("tools") or None
         changed = await asyncio.to_thread(
-            self._fit, data, limits, messages, "messages",
+            self._fit, data, limits, messages, "messages", "chat",
             _CHAT_OUTPUT_KEYS, lambda m: m.get("role"),
             lambda items: limits.tokenizer.count(items, tools),
         )
@@ -313,7 +542,7 @@ class ContextTrimHook(CustomLogger):
             return limits.tokenizer.count(list(history) + list(messages), tools)
 
         changed = await asyncio.to_thread(
-            self._fit, data, limits, data.get("input"), "input",
+            self._fit, data, limits, data.get("input"), "input", "responses",
             _RESPONSES_OUTPUT_KEYS, lambda item: item.get("role") if isinstance(item, dict) else None,
             count,
         )
@@ -327,6 +556,7 @@ class ContextTrimHook(CustomLogger):
         limits: ModelLimits,
         items: Any,
         items_key: str,
+        shape: str,
         output_keys: tuple[str, ...],
         role_of: Callable[[Any], str | None],
         count: Callable[[Any], int],
@@ -340,6 +570,25 @@ class ContextTrimHook(CustomLogger):
         input_tokens = count(items)
         room = ctx - input_tokens - _SAFETY_MARGIN
         changed = False
+
+        if room < floor and isinstance(items, list):
+            for name, step in (
+                ("thinking", _strip_thinking),
+                ("near-duplicates", _dedup_similar),
+                ("tool arguments/results", _cap_tool_io),
+            ):
+                shrunk = step(items, shape, role_of, limits)
+                if shrunk is None:
+                    continue
+                new_tokens = count(shrunk)
+                logger.info(
+                    "trim_hook: shrank %s for %s (input tokens %d → %d, ctx=%d, requested output=%d)",
+                    name, model, input_tokens, new_tokens, ctx, requested,
+                )
+                items, input_tokens, room, changed = shrunk, new_tokens, ctx - new_tokens - _SAFETY_MARGIN, True
+                data[items_key] = items
+                if room >= floor:
+                    break
 
         if room < floor and isinstance(items, list):
             turns = _split_turns(items, role_of)
