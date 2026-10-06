@@ -73,8 +73,7 @@ import logging
 import math
 import os
 import threading
-from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import yaml
 from litellm.integrations.custom_logger import CustomLogger
@@ -126,8 +125,7 @@ _CHAT_OUTPUT_KEYS = ("max_tokens", "max_completion_tokens")
 _RESPONSES_OUTPUT_KEYS = ("max_output_tokens",)
 
 
-@dataclass(frozen=True)
-class ModelLimits:
+class ModelLimits(NamedTuple):   # not a dataclass: LiteLLM loads this file without registering it in sys.modules
     context_window: int
     default_output: int
     tokenizer: Any

@@ -552,3 +552,32 @@ def test_real_template_bills_old_thinking_in_full_and_stripping_it_recovers_the_
     assert all("reasoning_content" not in m for m in kept)
     assert limits.tokenizer.count(kept, None) < 2_000
     assert data["max_tokens"] == 32768
+
+
+# ── loading the way LiteLLM does ────────────────────────────────────────────
+
+def test_callbacks_load_by_file_path_like_the_proxy_does():
+    """LiteLLM execs each callback file from its path without registering the
+    module in sys.modules (a @dataclass here crashed the proxy at startup) and
+    with only run_litellm.sh's PYTHONPATH to find sibling modules by name."""
+    import subprocess
+    import sys
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = (
+        "import importlib, yaml\n"
+        "from litellm.proxy.types_utils.utils import get_instance_fn\n"
+        f"cfg = yaml.safe_load(open({repo!r} + '/config.yaml'))\n"
+        "for name in cfg['litellm_settings']['callbacks']:\n"
+        f"    get_instance_fn(name, config_file_path={repo!r} + '/config.yaml')\n"
+        "importlib.import_module('previous_response_hook')\n"
+        "print('ok')\n"
+    )
+    run_script = open(os.path.join(repo, "run_litellm.sh")).read()
+    assert 'export PYTHONPATH="$SCRIPT_DIR' in run_script
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd="/", capture_output=True, text=True,
+        env={**os.environ, "PYTHONPATH": repo, "PYTHONNOUSERSITE": "1"},
+    )
+    assert result.returncode == 0, result.stderr[-1500:]
+    assert result.stdout.strip().endswith("ok")

@@ -2,6 +2,10 @@
 # Run LiteLLM proxy — foreground for systemd
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONNOUSERSITE=1
+# LiteLLM loads the callbacks in config.yaml by file path, so sibling modules are not
+# importable by name unless this directory is on the path (trim_hook imports
+# previous_response_hook).
+export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export PATH="/home/derek/miniforge3/envs/llm-gateway-vllm/bin:$PATH"   # make prisma CLI visible for schema migration
 # No fallback default: the key must come from gateway.env (gitignored).  A
 # hardcoded default here is a tracked file in a PUBLIC repo, so it would be a
