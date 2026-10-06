@@ -1022,6 +1022,9 @@ class GpuBackend:
         self._active_requests = 0
         self._lock            = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
+        self._startup_task: asyncio.Task | None = None
+        self._startup_shutdown_task: asyncio.Task | None = None
+        self._closing = False
         self._session: aiohttp.ClientSession | None = None
         # Set by DynamicRouter after construction; used for replica-aware idle
         # timeout (count sibling instances of the same model).
@@ -1114,6 +1117,7 @@ class GpuBackend:
         """Gracefully stop this backend and release its slot."""
         if self._idle_task:
             self._idle_task.cancel()
+        await self._cancel_startup()
         async with self._lock:
             await self._kill_process_locked()
         await self._close_session()
@@ -1122,8 +1126,40 @@ class GpuBackend:
 
     async def _close_session(self) -> None:
         """Close the aiohttp session if still open.  Safe to call multiple times."""
+        await self._cancel_startup()
         if self._session and not self._session.closed:
             await self._session.close()
+
+    async def _cancel_startup(self) -> None:
+        """Backend shutdown, unlike a request disconnect, owns startup cancellation."""
+        task = self._startup_task
+        if self._startup_shutdown_task is None and task is not None and not task.done():
+            # Closing prevents new startup without advertising free GPU capacity.
+            self._closing = True
+            self._startup_shutdown_task = asyncio.create_task(self._stop_startup(task))
+            self._startup_shutdown_task.add_done_callback(self._observe_startup)
+        if self._startup_shutdown_task is not None:
+            # A bounded caller timeout must not abandon the owned process reap.
+            await asyncio.shield(self._startup_shutdown_task)
+
+    async def _stop_startup(self, task: asyncio.Task) -> None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if not self._ready:
+            # A spawn cancelled after Popen is not a warm backend to adopt.
+            # Reap only our owned process group; leave ready models running.
+            process = self.process
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await asyncio.to_thread(process.wait)
+                if self.process is process:
+                    self.process = None
+            self._failed = True
+            if self.slot.backend is self:
+                self.slot.backend = None
 
     # ── Idle / dead-process watchdog ───────────────────────────────────────────
 
@@ -1611,7 +1647,9 @@ class GpuBackend:
         self._adopted_pid = None
 
     async def _ensure_running(self) -> None:
-        """Block until this backend's vLLM is ready.  Serialised per-backend."""
+        """Wait for backend-owned startup without handing ownership to a caller."""
+        if self._closing:
+            raise RuntimeError(f"Backend on slot {self.slot.slot_id} is closing.")
         if self._failed:
             raise RuntimeError(
                 f"Backend for '{self.model_name}' on slot {self.slot.slot_id} "
@@ -1619,6 +1657,19 @@ class GpuBackend:
             )
         if self._ready and self.is_running:
             return
+        if self._startup_task is None or self._startup_task.done():
+            self._startup_task = asyncio.create_task(self._start_model())
+            self._startup_task.add_done_callback(self._observe_startup)
+        await asyncio.shield(self._startup_task)
+
+    def _observe_startup(self, task: asyncio.Task) -> None:
+        # Retrieve failures even when every request has disconnected. Active
+        # waiters still receive the original exception through shield().
+        if not task.cancelled():
+            task.exception()
+
+    async def _start_model(self) -> None:
+        """One shared startup; the lock also serialises explicit stop operations."""
         async with self._lock:
             if self._failed:
                 raise RuntimeError(
@@ -1631,6 +1682,8 @@ class GpuBackend:
                 await self._spawn_locked()
             except Exception:
                 self._failed = True
+                if self.slot.backend is self:
+                    self.slot.backend = None
                 raise
 
     # ── Request proxying ───────────────────────────────────────────────────────
@@ -1639,10 +1692,28 @@ class GpuBackend:
         self._active_requests += 1
         self.last_activity = time.monotonic()
         try:
-            return await self._forward(request, body)
+            forward = asyncio.create_task(self._forward(request, body))
+            disconnect = asyncio.create_task(self._cancel_forward_on_disconnect(request, forward))
+            try:
+                return await forward
+            finally:
+                forward.cancel()
+                disconnect.cancel()
+                await asyncio.gather(forward, disconnect, return_exceptions=True)
         finally:
             self._active_requests -= 1
             self.last_activity = time.monotonic()
+
+    async def _cancel_forward_on_disconnect(
+        self, request: web.Request, forward: asyncio.Task,
+    ) -> None:
+        """Cancel only this inference; shared ASR/admin handlers keep their lifetime."""
+        transport = request.transport
+        while not forward.done():
+            if transport is None or transport.is_closing():
+                forward.cancel()
+                return
+            await asyncio.sleep(0.05)
 
     async def transcribe_chunk(self, wav: bytes, language: str | None) -> str:
         """One already-chunked clip through this vLLM, for the ASR adapter.  Any
@@ -2202,6 +2273,7 @@ class DynamicRouter:
             if s.backend
             and s.backend.model_name == model_name
             and s.backend._ready
+            and not s.backend._closing
             and s.backend.is_running
         ]
 

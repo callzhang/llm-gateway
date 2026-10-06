@@ -197,7 +197,8 @@ class SpeechLifecycleTests(unittest.IsolatedAsyncioTestCase):
             return web.Response(body=b"done")
 
         with patch.object(backend, "_forward", side_effect=blocked_forward):
-            task = asyncio.create_task(backend.proxy(None, b""))
+            request = SimpleNamespace(transport=SimpleNamespace(is_closing=lambda: False))
+            task = asyncio.create_task(backend.proxy(request, b""))
             await entered.wait()
             self.assertEqual(1, backend._active_requests)
             release.set()
