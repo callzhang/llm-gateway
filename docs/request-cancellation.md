@@ -45,6 +45,25 @@ Task；若已生成未就绪进程，则 SIGKILL 自有进程组并 reap，随�
 全量：`.venv/bin/python -m unittest discover -s tests -q`。
 隔离虚拟环境补入 LiteLLM 1.99.0 仅用于已有 hook 测试，不修改共享 Python 环境。
 
+### 正常整合后续 master（2026-10-07）
+
+正常合入 `ee17b81ad402d2f211b577179683b982d7229630`，集成提交
+`755eab280d91054bd854ddbfd5087e097756305b`。本次取消实现及其测试与原修复
+`ece4eebc75abe8616ebdf02563595ba7107d91c5` 的逐文件 diff 为空；新 master 的
+context fitting、历史响应读取和 callback loader 修改保留。
+
+- 取消控制仍为 13 项通过；完整 unittest 146 项通过，但 unittest 不包含全部
+  pytest 函数，不能以它替代完整测试集合。
+- 首次完整 pytest：215 PASS / 3 FAIL。三个失败均在导入 LiteLLM proxy hooks 时
+  缺少 `orjson`，还未进入历史响应断言，不是取消修复引起的业务回归。
+- 在本 worktree 的忽略 `.venv` 补齐同版本 `litellm[proxy]==1.99.0` 声明依赖，
+  不修改共享环境、服务或仓库 runtime。随后完整 `python -m pytest tests -q`
+  终态 exit 0：218 PASS，59 个 subtest PASS，35 warnings，23.80 秒。
+  JUnit 共 277 testcase，0 failure/error/skip。
+- 环境使用 system-site-packages；pip 报告继承包的版本冲突，测试仍全部通过。
+  此结果不证明生产依赖一致或日志无告警；共享发布必须另行核对实际环境。
+- 仍未 push、发布或重启共享 gateway；本地测试不替代真实 GPU 释放及保险验收。
+
 ## 尚未证明
 
 本地代理关闭连接，不单独证明已部署的 vLLM 在同一时刻释放实际 GPU 序列；需要获
