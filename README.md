@@ -142,6 +142,14 @@ declares a window without a tokenizer fails at startup. Known gaps: image tokens
 vLLM and only their placeholder is counted (the 512 margin absorbs small images), and history
 behind `previous_response_id` is counted but cannot be trimmed. Reasoning models spend the
 output cap on thinking first, so a tight cap can end the answer before any visible text.
+LiteLLM 1.99 reports a capped Responses answer as `status: "incomplete"` with
+`incomplete_details: null` (newer LiteLLM fills `reason`); clients should key on `status`.
+
+**Callback loading.** LiteLLM execs each callback in `config.yaml` by file path without registering
+it in `sys.modules`, so callback files must not use `@dataclass`, and sibling modules are only
+importable because `run_litellm.sh` puts its own directory on `PYTHONPATH`.
+`tests/test_trim_hook.py::test_callbacks_load_by_file_path_like_the_proxy_does` loads every
+callback the way the proxy does; run it before restarting `llm-litellm` after editing one.
 
 ### Scale-out threshold
 
