@@ -19,7 +19,14 @@ model_list:
       # Must match --max-model-len in run_qwen36_35b_heretic.sh.  This said
       # 122880 while vLLM was actually loaded with far less, so trim_hook let
       # over-length requests through and they failed at the backend.
-      max_context_window_tokens: 81920
+      # max_input_tokens is the context window; LiteLLM registers it (and
+      # max_output_tokens, which must equal litellm_params.max_tokens above)
+      # into litellm.model_cost.  trim_hook reads these plus the tokenizer and
+      # tool_cap_tokens (cap for tool arguments/results in history, default 2000).
+      max_input_tokens: 81920
+      max_output_tokens: 32768
+      tool_cap_tokens: 2000
+      tokenizer: AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4
       supports_vision: true
 
 
@@ -43,8 +50,12 @@ model_list:
       allowed_openai_params: ["reasoning_effort"]
     model_info:
       # Must match --max-model-len in run_qwen38_27b.sh (raised 65536→131072
-      # on 2026-09-02; model native is 262144).  trim_hook reads this value.
-      max_context_window_tokens: 131072
+      # on 2026-09-02; model native is 262144).
+      max_input_tokens: 131072
+      max_output_tokens: 32768
+      tool_cap_tokens: 2000
+      tokenizer: gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090
+      tokenizer_revision: 35fd99fb8434ef70ee61372df3face5174bed2c8   # == --revision in run_qwen38_27b.sh
       supports_vision: true
       # The chat template raises on anything outside these levels (xhigh is its
       # default); reasoning_effort_hook maps OpenAI-style aliases onto them and
@@ -95,15 +106,18 @@ litellm_settings:
   drop_params: true
   set_verbose: false
 
-  # Trim over-long histories before they reach vLLM, instead of returning 400.
-  # trim_hook.py is in the same directory as this config file.
+  # Order matters: previous_response_history_hook runs first so the stored
+  # history is waited for (or rejected with 410) before trim_hook counts it.
+  # Files are in the same directory as this config file.
   callbacks:
-    - trim_hook.context_trim_hook
-    # Map reasoning_effort onto what each model's chat template accepts.
-    - reasoning_effort_hook.reasoning_effort_hook
     # Reject previous_response_id with no stored history instead of letting
     # LiteLLM silently run the request without it.
     - previous_response_hook.previous_response_history_hook
+    # Fit input + output into the context window (shrink the output cap, drop
+    # the oldest turns), instead of returning 400.
+    - trim_hook.context_trim_hook
+    # Map reasoning_effort onto what each model's chat template accepts.
+    - reasoning_effort_hook.reasoning_effort_hook
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

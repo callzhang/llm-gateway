@@ -96,6 +96,61 @@ Formats: `json`, `verbose_json` (segments with start/end), `text`.  Settings: `A
 `ASR_CPU_PYTHON` (needs transformers >= 5.13: the miniforge base), `ASR_CPU_THREADS`,
 `ASR_CPU_IDLE_SECONDS`, `ASR_HF_HOME`, `ASR_GPU_API_KEY`.
 
+### Context-window fitting (`trim_hook.py`)
+
+vLLM rejects a request whose prompt plus requested output exceeds `--max-model-len`, and LiteLLM
+passes that 400 through (it only has `context_window_fallbacks`, which needs a second, larger
+model, and `trim_messages`, which neither caps output nor handles Responses `input`). The
+`trim_hook` pre-call hook therefore makes every `/v1/chat/completions` and `/v1/responses`
+request fit before it reaches vLLM.
+
+Input is counted exactly with the model's own tokenizer and chat template (tool definitions
+included; for `previous_response_id` the stored history too). With *R* = window − input −
+512 safety margin, *requested* = the caller's output cap (or `litellm_params.max_tokens`) and
+*F* = requested / 1.1:
+
+| Situation | Action |
+|---|---|
+| R ≥ requested | untouched |
+| F ≤ R < requested | cap the output at R. The model stops there with `finish_reason: "length"` (Responses: `status: "incomplete"`) — a normal response, not an error |
+| R < F | shrink the input, least lossy step first, recounting after each and stopping once R ≥ F (steps 1–3 below), then drop the oldest turns (step 4), then cap the output at what is left |
+| F unreachable | drop turns only if R < 1024 (just far enough to reach 1024); otherwise keep them and cap |
+| R < 1 even with only the latest turn | untouched; vLLM returns its own explicit 400 |
+
+Input-shrinking steps, in order. Steps 1–3 only touch turns before the latest user message;
+system/developer messages, `instructions` and the latest turn are never modified.
+
+1. **Drop thinking.** Qwen's chat template keeps `reasoning_content` of old turns, so it is billed
+   in full (measured: 1,873 vs 68 tokens for one old turn). Removes `reasoning_content`,
+   `thinking_blocks`, Responses `reasoning` items and a leading `…</think>` in answers.
+2. **Stub near-duplicates.** A message ≥ 98% similar (Jaccard over word 5-grams, ≥ 400 chars) to a
+   *later* message is replaced by a one-line stub; the latest copy is the current state. The
+   message itself stays, so roles and tool-call pairing are intact.
+3. **Cap tool arguments and results** to `model_info.tool_cap_tokens` (2000), keeping head and
+   tail. Arguments stay valid JSON: only string values inside them are cut.
+4. **Drop the oldest turns.**
+
+Requests that already fit are never modified, so vLLM's prefix cache stays valid. Steps 1 and 3
+are per-message and deterministic; 2 and 4 change earlier messages, which only costs cache hits on
+conversations that overflow.
+
+A *turn* starts at a user message and runs to the next one, so a tool call always travels with
+its result.
+Limits come from `config.yaml` (`model_info.max_input_tokens`, `max_output_tokens`, `tokenizer`,
+`tokenizer_revision`, optional `tool_cap_tokens`); LiteLLM registers the first two into `litellm.model_cost`. A model that
+declares a window without a tokenizer fails at startup. Known gaps: image tokens expand inside
+vLLM and only their placeholder is counted (the 512 margin absorbs small images), and history
+behind `previous_response_id` is counted but cannot be trimmed. Reasoning models spend the
+output cap on thinking first, so a tight cap can end the answer before any visible text.
+LiteLLM 1.99 reports a capped Responses answer as `status: "incomplete"` with
+`incomplete_details: null` (newer LiteLLM fills `reason`); clients should key on `status`.
+
+**Callback loading.** LiteLLM execs each callback in `config.yaml` by file path without registering
+it in `sys.modules`, so callback files must not use `@dataclass`, and sibling modules are only
+importable because `run_litellm.sh` puts its own directory on `PYTHONPATH`.
+`tests/test_trim_hook.py::test_callbacks_load_by_file_path_like_the_proxy_does` loads every
+callback the way the proxy does; run it before restarting `llm-litellm` after editing one.
+
 ### Scale-out threshold
 
 Scale-out only fires when **total concurrent active requests ≥ 2**. A single background health-check from LiteLLM is not enough to trigger a second GPU spawn. This prevents runaway GPU usage for low-load scenarios.
