@@ -21,6 +21,43 @@ Task；若已生成未就绪进程，则 SIGKILL 自有进程组并 reap，随�
 不改变模型、max_num_seqs、请求参数、路由策略、响应状态或正文，不新增重试。
 本次没有部署、重启共享服务或调用真实 GPU 模型。
 
+## LiteLLM Responses 边界：断连取消配置
+
+仅修 model_manager 还不够：它的直接客户端实际是 LiteLLM，而不是最外层的
+Responses 调用方。仓库配置没有声明 `general_settings.cancel_on_disconnect`，
+本地安装的 LiteLLM1.99.0 在此设置缺省时继续等待模型调用；外层客户端已断开，
+LiteLLM 到 model_manager 的连接却仍在，因此后者无法观察原客户端断开。
+
+最小修复是启用 LiteLLM 已有的 `cancel_on_disconnect: true`。不新增中间层、
+重试、fallback、模型参数或等待预算；不改 Responses 路由或正常请求的输出。
+代理内部将已断开请求标为499并取消该请求所属的 upstream task；不会把499作为
+正常连接上的模型回答。该开关作用于 LiteLLM 的共同请求处理器，不仅 Responses。
+
+新增回归 `test_configured_responses_proxy_disconnect_reaches_gateway_upstream`：
+使用真实 Starlette Request/已安装的 LiteLLM aresponses 请求处理器，模拟 ASGI
+`http.disconnect`；其下游为真实 localhost HTTP→真实 GpuBackend.proxy→受控慢上游。
+只有模型路由、认证准备和日志准备受控，没有生成模型或共享服务。修复前在上游
+已进入后断开，请求仍pending，按目标断言RED；配置开启后 processor 取消、下游
+HTTP关闭、慢上游收到取消、活动计数归零，断言均发生在测试finally清理之前。
+
+- 当前取消控制完整文件14 PASS，4.24s。
+- 完整 gateway pytest：219 PASS、59 subtests PASS、35warnings，53.69s，exit0。
+  JUnit有219个testcase元素，suite测试计数278包含59个subtests，0failure/error/skip。
+- 两个被读取的 LiteLLM proxy源文件均与安装包RECORD SHA256一致；没有修改库。
+- 此测试不是完整部署的FastAPI前端/OpenAI响应转换验收，也不是实际GPU abort证明。
+  部署时必须核对实际LiteLLM版本、有效general_settings、代理及路由器加载的提交。
+
+独立SPEC/QUALITY审阅无Critical/Important。一个非阻断覆盖缺口保留：既有正常响应
+与独立请求取消控制只经过model_manager，而非新增LiteLLM入口；不能把它们描述为
+LiteLLM入口的normal/peer验收。源码所读monitor/event/gather均由每个processor调用
+独立持有，但这不是该入口的并发实测。测试覆盖等待响应/流建立前的取消传播，不
+声称已经覆盖整个streaming生命周期；未来启用后台polling模式时需单独验证交互。
+
+本修复补齐断连传播，并不证明 #1036 四个首轮600秒TimeoutError由这一缺口导致，
+也不保证让原本超时的生成请求成功。排队与生成分段还需同请求证据。共享交付若
+获授权，需要同时使 LiteLLM 新配置和 model_manager 取消修复生效；原先仅重启
+model_manager 的验收范围不足，不能在未获完整共享发布授权时擅自重启任一服务。
+
 ## 本地验证
 
 基线：`08983f375097aa872e976bf1cd76532115b50701`。

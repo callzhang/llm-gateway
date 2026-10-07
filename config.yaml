@@ -120,6 +120,7 @@ litellm_settings:
     - reasoning_effort_hook.reasoning_effort_hook
 
 general_settings:
+  cancel_on_disconnect: true
   master_key: os.environ/LITELLM_MASTER_KEY
   port: 8900
   proxy_base_url: "http://stardust-gpu4:8900"
