@@ -47,11 +47,25 @@ HTTP关闭、慢上游收到取消、活动计数归零，断言均发生在测�
 - 此测试不是完整部署的FastAPI前端/OpenAI响应转换验收，也不是实际GPU abort证明。
   部署时必须核对实际LiteLLM版本、有效general_settings、代理及路由器加载的提交。
 
-独立SPEC/QUALITY审阅无Critical/Important。一个非阻断覆盖缺口保留：既有正常响应
-与独立请求取消控制只经过model_manager，而非新增LiteLLM入口；不能把它们描述为
-LiteLLM入口的normal/peer验收。源码所读monitor/event/gather均由每个processor调用
-独立持有，但这不是该入口的并发实测。测试覆盖等待响应/流建立前的取消传播，不
-声称已经覆盖整个streaming生命周期；未来启用后台polling模式时需单独验证交互。
+独立SPEC/QUALITY审阅无Critical/Important。首轮审阅的非阻断覆盖缺口随后关闭：
+新增LiteLLM入口正常完成和peer隔离控制，仍走真实common processor和localhost
+HTTP。正常请求完整读取body后才构造typed Responses结果，断言output_text、status、
+model、monitor等待退出和计数归零。两个请求先真实进入同一backend（计数2），
+断开其中一个后计数1且peer仍pending，释放上游后peer完整返回body、计数0；全部
+业务断言都在contextmanager/finally清理之前。模型路由和认证/日志准备受控，
+不能把typed结果构造当作实际provider/OpenAI响应转换的验收。
+
+- 重构后的原回归在仅测试进程设置开关false时，仍触发“断开请求继续pending”的
+  预期失败断言：1failure、0error；没有改仓库或共享配置。
+- 当前取消控制16 PASS，3.29s；完整gateway pytest：221 PASS、59 subtests PASS、
+  35warnings，23.46s，exit0。JUnit221 testcase元素，suite计数280包含subtests，
+  0failure/error/skip；三个LiteLLM入口控制均存在并通过。
+- 原独立reviewer仅复核本次测试diff及完整JUnit，没有重复跑测试；无Critical、
+  Important或新增Minor，原normal/peer覆盖缺口关闭。生产代码没有新增改动。
+
+这些测试覆盖等待响应/流建立前的取消传播，不声称完整FastAPI前端、真实认证或
+post-call guardrails、整个streaming生命周期及所有后台任务无泄漏均已验收。
+未来启用后台polling模式时需单独验证交互。
 
 本修复补齐断连传播，并不证明 #1036 四个首轮600秒TimeoutError由这一缺口导致，
 也不保证让原本超时的生成请求成功。排队与生成分段还需同请求证据。共享交付若

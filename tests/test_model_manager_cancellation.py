@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -308,54 +308,101 @@ class HttpCancellationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.upstream_cancelled.wait(), 1)
         self.assertEqual(0, backend._active_requests)
 
-    async def test_configured_responses_proxy_disconnect_reaches_gateway_upstream(self):
+    @asynccontextmanager
+    async def configured_responses_proxy(self, client, url):
         # Characterize our configured LiteLLM boundary, not a mock cancellation:
         # the real aresponses processor owns a real HTTP call to GpuBackend.proxy.
         # Only model routing/auth setup are controlled; no model is started.
         from pathlib import Path
 
         import yaml
-        from fastapi import HTTPException, Response
+        from fastapi import Response
         from starlette.requests import Request
         from litellm.proxy import common_request_processing as processing
         from litellm.proxy._types import UserAPIKeyAuth
-
-        backend, client, url = await self.start_proxy()
-        received = asyncio.Queue()
-        request = Request(
-            {"type": "http", "method": "POST", "path": "/v1/responses", "headers": []},
-            receive=received.get,
-        )
+        from litellm.types.llms.openai import ResponsesAPIResponse
 
         async def infer():
             async with client.post(url, data=b"{}") as response:
-                return await response.read()
+                self.assertEqual(200, response.status)
+                body = (await response.read()).decode()
+            # Controlled model adapter only; the real HTTP body must arrive before
+            # constructing a real typed Responses result for the processor tail.
+            return ResponsesAPIResponse(
+                id="resp-synthetic", created_at=0, model="synthetic-cancellation",
+                object="response", status="completed",
+                output=[{"type": "message", "role": "assistant", "id": "msg-synthetic",
+                         "status": "completed", "content": [
+                             {"type": "output_text", "text": body, "annotations": []}]}],
+            )
 
         async def route(*, data, route_type, **_unused):
             if route_type != "aresponses" or data["model"] != "synthetic-cancellation":
                 raise AssertionError("unexpected route at the controlled model boundary")
             return infer()
 
-        async def during_call_hook(**_unused):
+        async def no_op(**_unused):
             return None
+
+        async def successful_response(*, response, **_unused):
+            return response
 
         # Do not send real config credentials into the synthetic request.
         settings = yaml.safe_load((Path(__file__).parents[1] / "config.yaml").read_text())
         general_settings = {
             "cancel_on_disconnect": settings.get("general_settings", {}).get("cancel_on_disconnect", False)
         }
-        processor = processing.ProxyBaseLLMRequestProcessing({
-            "model": "synthetic-cancellation", "stream": False,
-            "litellm_logging_obj": SimpleNamespace(),
-        })
-        with patch.object(processing, "route_request", side_effect=route):
+        logging = SimpleNamespace(
+            during_call_hook=no_op, update_request_status=no_op,
+            post_call_success_hook=successful_response, post_call_response_headers_hook=no_op,
+        )
+        pending_requests = []
+
+        def start_request():
+            received, monitor_closed = asyncio.Queue(), asyncio.Event()
+
+            async def receive():
+                try:
+                    return await received.get()
+                finally:
+                    monitor_closed.set()
+
+            request = Request(
+                {"type": "http", "method": "POST", "path": "/v1/responses", "headers": []},
+                receive=receive,
+            )
+            processor = processing.ProxyBaseLLMRequestProcessing({
+                "model": "synthetic-cancellation", "stream": False,
+                "litellm_logging_obj": SimpleNamespace(
+                    litellm_call_id="synthetic-call", litellm_params={},
+                    model_call_details={"response_cost": 0},
+                ),
+            })
             pending = asyncio.create_task(processor.base_process_llm_request(
                 request=request, fastapi_response=Response(),
                 user_api_key_dict=UserAPIKeyAuth(), route_type="aresponses",
-                proxy_logging_obj=SimpleNamespace(during_call_hook=during_call_hook),
+                proxy_logging_obj=logging,
                 general_settings=general_settings, proxy_config=SimpleNamespace(),
                 skip_pre_call_logic=True,
             ))
+            pending_requests.append(pending)
+            return pending, received, monitor_closed
+
+        with patch.object(processing, "route_request", side_effect=route):
+            try:
+                yield start_request
+            finally:
+                for pending in pending_requests:
+                    if not pending.done():
+                        pending.cancel()
+                await asyncio.gather(*pending_requests, return_exceptions=True)
+
+    async def test_configured_responses_proxy_disconnect_reaches_gateway_upstream(self):
+        from fastapi import HTTPException
+
+        backend, client, url = await self.start_proxy()
+        async with self.configured_responses_proxy(client, url) as start_request:
+            pending, received, _ = start_request()
             try:
                 await asyncio.wait_for(self.upstream_entered.wait(), 3)
                 self.assertEqual(1, backend._active_requests)
@@ -372,6 +419,46 @@ class HttpCancellationTests(unittest.IsolatedAsyncioTestCase):
                 pending.cancel()
                 with suppress(asyncio.CancelledError, HTTPException):
                     await pending
+
+    async def test_configured_responses_proxy_normal_request_completes(self):
+        backend, client, url = await self.start_proxy()
+        async with self.configured_responses_proxy(client, url) as start_request:
+            pending, _, monitor_closed = start_request()
+            await asyncio.wait_for(self.upstream_entered.wait(), 3)
+            self.upstream_release.set()
+            response = await asyncio.wait_for(pending, 3)
+            self.assertEqual("complete", response.output_text)
+            self.assertEqual("completed", response.status)
+            self.assertEqual("synthetic-cancellation", response.model)
+            self.assertFalse(self.upstream_cancelled.is_set())
+            await asyncio.wait_for(monitor_closed.wait(), 1)
+            self.assertEqual(0, backend._active_requests)
+
+    async def test_configured_responses_proxy_disconnect_does_not_cancel_peer(self):
+        from fastapi import HTTPException
+
+        backend, client, url = await self.start_proxy()
+        async with self.configured_responses_proxy(client, url) as start_request:
+            first, received, _ = start_request()
+            await asyncio.wait_for(self.upstream_entered.wait(), 3)
+            peer, _, peer_monitor_closed = start_request()
+            async with asyncio.timeout(3):
+                while backend._active_requests != 2:
+                    await asyncio.sleep(0.001)
+            received.put_nowait({"type": "http.disconnect"})
+            with self.assertRaises(HTTPException) as cancelled:
+                await asyncio.wait_for(first, 1)
+            self.assertEqual(499, cancelled.exception.status_code)
+            await asyncio.wait_for(self.proxy_done.wait(), 1)
+            await asyncio.wait_for(self.upstream_cancelled.wait(), 1)
+            self.assertEqual(1, backend._active_requests)
+            self.assertFalse(peer.done())
+            self.upstream_release.set()
+            response = await asyncio.wait_for(peer, 3)
+            self.assertEqual("complete", response.output_text)
+            self.assertEqual("completed", response.status)
+            await asyncio.wait_for(peer_monitor_closed.wait(), 1)
+            self.assertEqual(0, backend._active_requests)
 
     async def test_disconnect_during_stream_cancels_upstream_and_releases_counter(self):
         backend, client, url = await self.start_proxy(streaming=True)
