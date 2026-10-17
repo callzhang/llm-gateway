@@ -181,5 +181,64 @@ class BackendGateIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await runner.cleanup()
 
 
+class HandlePriorityTests(unittest.IsolatedAsyncioTestCase):
+    MODEL = "qwen3.8-27b"
+
+    async def asyncSetUp(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        config = mm.ModelConfig(
+            script="unused.sh", served_name=self.MODEL, max_num_seqs=8, request_kind="chat",
+        )
+        self.router = mm.DynamicRouter([mm.GpuSlot(0, 0, 9000)], {self.MODEL: config})
+        self.proxied: list[tuple[dict, int]] = []
+
+        async def proxy(request, body, priority=mm.DEFAULT_REQUEST_PRIORITY):
+            self.proxied.append((json.loads(body), priority))
+            return web.json_response({"ok": True})
+
+        backend = type("B", (), {"slot": mm.GpuSlot(0, 0, 9000), "proxy": staticmethod(proxy)})()
+        self.get_or_start_calls = 0
+
+        async def get_or_start(_model):
+            self.get_or_start_calls += 1
+            return [backend]
+
+        self.router._get_or_start = get_or_start
+        self.router._pick = lambda backends: backends[0]
+        app = web.Application()
+        app.router.add_route("*", "/{path_info:.*}", self.router.handle)
+        self.client = TestClient(TestServer(app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+
+    async def _post(self, **extra):
+        payload = {"model": self.MODEL, "messages": [{"role": "user", "content": "hi"}], **extra}
+        return await self.client.post("/v1/chat/completions", json=payload)
+
+    async def test_invalid_priority_is_a_400_before_any_backend_work(self):
+        for bad in (-1, 256, 1.5, "high", None):
+            with self.subTest(bad=bad):
+                response = await self._post(priority=bad)
+                self.assertEqual(400, response.status)
+                self.assertIn("priority", (await response.json())["error"]["message"])
+        self.assertEqual(0, self.get_or_start_calls)
+        self.assertEqual([], self.proxied)
+
+    async def test_valid_priority_reaches_the_backend_and_not_vllm(self):
+        response = await self._post(priority=200)
+        self.assertEqual(200, response.status)
+        body, priority = self.proxied[0]
+        self.assertEqual(200, priority)
+        self.assertNotIn("priority", body)
+
+    async def test_missing_priority_is_normal(self):
+        response = await self._post()
+        self.assertEqual(200, response.status)
+        self.assertEqual(mm.DEFAULT_REQUEST_PRIORITY, self.proxied[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()
