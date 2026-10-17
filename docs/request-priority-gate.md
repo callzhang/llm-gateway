@@ -1,4 +1,4 @@
-# 请求优先级闸门（设计，未实现）
+# 请求优先级闸门（已实现，未部署）
 
 ## 问题
 
@@ -37,6 +37,10 @@ LiteLLM 会丢弃客户端 header（见 `_extract_task_id` 的注释），所以
 - LiteLLM v1.77.3 的 Priority Quota Reservation：按 key 预留 TPM/RPM 比例，是配额，不是排队，超额直接拒绝。
 - vLLM `--scheduling-policy priority`：需要重启 vLLM，影响所有调用方；且多副本各自生效。已被明确排除。
 - memory-connector 内的 job 队列：live 与 CI 各自一套，彼此不可见，无法仲裁（见 memory-connector 的 `config-driven-channel-concurrency` change）。
+
+## 对扩容信号的影响
+
+model_manager 的 scale-out 监视器用 vLLM 的 `num_requests_waiting` 判断饱和。闸门会让 vLLM 自己的队列保持为空，所以 `GpuBackend.queue_depth()` 返回 vLLM 的排队数加上闸门的等待数，否则积压对扩容不可见。
 
 ## 可观察性
 
