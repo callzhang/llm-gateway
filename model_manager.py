@@ -28,6 +28,8 @@ Environment overrides:
 """
 
 import asyncio
+import heapq
+import itertools
 import fcntl
 import hashlib
 import json
@@ -979,6 +981,75 @@ class GpuSlot:
 
 # ── Per-(model, slot) subprocess controller ────────────────────────────────────
 
+DEFAULT_REQUEST_PRIORITY = 100
+MAX_REQUEST_PRIORITY = 255
+
+
+def request_priority(parsed_body: dict | None) -> int:
+    """Priority carried in the request body: an integer 0..255, smaller runs first.
+
+    LiteLLM drops client headers, so the body is the only carrier.  A request without
+    the field is NORMAL (100); a malformed value is an error, never silently changed.
+    """
+    if not isinstance(parsed_body, dict) or "priority" not in parsed_body:
+        return DEFAULT_REQUEST_PRIORITY
+    value = parsed_body["priority"]
+    if type(value) is not int or not 0 <= value <= MAX_REQUEST_PRIORITY:
+        raise ValueError(
+            f"priority must be an integer between 0 and {MAX_REQUEST_PRIORITY}, got {value!r}"
+        )
+    return value
+
+
+class PriorityGate:
+    """Admit at most ``capacity`` requests; order the rest by (priority, arrival).
+
+    Strict: a waiting request is never promoted for having waited long, so a steady
+    stream of higher-priority requests can keep lower-priority ones waiting.
+    """
+
+    def __init__(self, capacity: int):
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError("gate capacity must be a positive integer")
+        self.capacity = capacity
+        self.in_flight = 0
+        self._waiters: list[tuple[int, int, asyncio.Future]] = []
+        self._arrivals = itertools.count()
+
+    @property
+    def waiting(self) -> int:
+        return sum(1 for _p, _n, fut in self._waiters if not fut.done())
+
+    def waiting_by_priority(self) -> dict[int, int]:
+        counts: dict[int, int] = {}
+        for priority, _n, fut in self._waiters:
+            if not fut.done():
+                counts[priority] = counts.get(priority, 0) + 1
+        return counts
+
+    async def acquire(self, priority: int) -> None:
+        if self.in_flight < self.capacity:
+            self.in_flight += 1
+            return
+        fut = asyncio.get_running_loop().create_future()
+        heapq.heappush(self._waiters, (priority, next(self._arrivals), fut))
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self.release()  # the slot was granted just as this waiter was cancelled
+            raise
+
+    def release(self) -> None:
+        self.in_flight -= 1
+        while self._waiters and self.in_flight < self.capacity:
+            _p, _n, fut = heapq.heappop(self._waiters)
+            if fut.done():
+                continue
+            self.in_flight += 1
+            fut.set_result(None)
+
+
 class GpuBackend:
     """Manages one vLLM subprocess: a specific model on a specific GPU slot."""
 
@@ -1020,6 +1091,11 @@ class GpuBackend:
         self._failed          = False   # permanently dead; don't retry on this object
         self.last_activity    = time.monotonic()
         self._active_requests = 0
+        # Chat backends cap in-flight requests at max_num_seqs so vLLM never queues;
+        # waiting requests are ordered by priority (see docs/request-priority-gate.md).
+        self._gate: PriorityGate | None = (
+            PriorityGate(max_num_seqs) if max_num_seqs is not None else None
+        )
         self._lock            = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
         self._startup_task: asyncio.Task | None = None
@@ -1090,10 +1166,14 @@ class GpuBackend:
 
         This is the count of requests vLLM cannot fit into its current batch
         (KV-cache full or max_num_seqs reached) — the true saturation signal.
-        Returns 0 on any error so a flaky /metrics never blocks scale decisions.
+        Requests held back by the priority gate are also waiting for a batch slot, so
+        they are added: the gate keeps vLLM's own queue empty and scale-out would
+        otherwise never see the backlog.  A flaky /metrics never blocks scale decisions
+        (it contributes 0; the gate count is still reported).
         """
         if not self._ready or not self.is_running:
             return 0
+        gate_waiting = self._gate.waiting if self._gate is not None else 0
         self._ensure_session()
         try:
             async with self._session.get(
@@ -1101,17 +1181,17 @@ class GpuBackend:
                 timeout=aiohttp.ClientTimeout(total=3),
             ) as r:
                 if r.status != 200:
-                    return 0
+                    return gate_waiting
                 text = await r.text()
         except Exception:
-            return 0
+            return gate_waiting
         for line in text.splitlines():
             if line.startswith("vllm:num_requests_waiting"):
                 try:
-                    return int(float(line.rsplit(" ", 1)[1]))
+                    return int(float(line.rsplit(" ", 1)[1])) + gate_waiting
                 except (ValueError, IndexError):
-                    return 0
-        return 0
+                    return gate_waiting
+        return gate_waiting
 
     async def stop(self) -> None:
         """Gracefully stop this backend and release its slot."""
@@ -1688,11 +1768,13 @@ class GpuBackend:
 
     # ── Request proxying ───────────────────────────────────────────────────────
 
-    async def proxy(self, request: web.Request, body: bytes) -> web.StreamResponse:
+    async def proxy(
+        self, request: web.Request, body: bytes, priority: int = DEFAULT_REQUEST_PRIORITY,
+    ) -> web.StreamResponse:
         self._active_requests += 1
         self.last_activity = time.monotonic()
         try:
-            forward = asyncio.create_task(self._forward(request, body))
+            forward = asyncio.create_task(self._forward_gated(request, body, priority))
             disconnect = asyncio.create_task(self._cancel_forward_on_disconnect(request, forward))
             try:
                 return await forward
@@ -1703,6 +1785,25 @@ class GpuBackend:
         finally:
             self._active_requests -= 1
             self.last_activity = time.monotonic()
+
+    async def _forward_gated(
+        self, request: web.Request, body: bytes, priority: int,
+    ) -> web.StreamResponse:
+        if self._gate is None:
+            return await self._forward(request, body)
+        waited_from = time.monotonic()
+        await self._gate.acquire(priority)
+        try:
+            waited_ms = int((time.monotonic() - waited_from) * 1000)
+            if waited_ms >= 1000:
+                self.log.info(
+                    f"priority gate: slot {self.slot.slot_id} admitted priority={priority} "
+                    f"after {waited_ms} ms (in_flight={self._gate.in_flight}, "
+                    f"waiting={self._gate.waiting})"
+                )
+            return await self._forward(request, body)
+        finally:
+            self._gate.release()
 
     async def _cancel_forward_on_disconnect(
         self, request: web.Request, forward: asyncio.Task,
@@ -2356,6 +2457,17 @@ class DynamicRouter:
                     running=b.is_running,
                     failed=b._failed,
                     active_requests=b._active_requests,
+                    gate=(
+                        {
+                            "capacity": b._gate.capacity,
+                            "in_flight": b._gate.in_flight,
+                            "waiting": b._gate.waiting,
+                            "waiting_by_priority": {
+                                str(k): v for k, v in sorted(b._gate.waiting_by_priority().items())
+                            },
+                        }
+                        if b._gate is not None else None
+                    ),
                     # last_activity is stamped at request start/end, so during
                     # a long request "now - last_activity" grows while the
                     # backend is busy.  A busy backend is not idle — report
@@ -2965,6 +3077,23 @@ class DynamicRouter:
         except Exception:
             pass
 
+        # Priority for the backend's admission gate (chat requests only).  The field is
+        # for this gateway, not for vLLM: validate it, then remove it from the body.
+        priority = DEFAULT_REQUEST_PRIORITY
+        if config.request_kind == "chat" and isinstance(parsed_body, dict):
+            try:
+                priority = request_priority(parsed_body)
+            except ValueError as exc:
+                return web.Response(
+                    status=400, content_type="application/json",
+                    body=json.dumps({"error": {
+                        "message": str(exc), "type": "invalid_request_error",
+                    }}),
+                )
+            if "priority" in parsed_body:
+                parsed_body.pop("priority")
+                body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
+
         # Sticky routing metadata is backend-independent — parse it once, before
         # the retry loop below.  x-task-id pins all turns of one task to the same
         # vLLM slot for prefix cache reuse; falls back to least-connections.
@@ -3058,7 +3187,7 @@ class DynamicRouter:
                 )
 
             try:
-                return await backend.proxy(request, body)
+                return await backend.proxy(request, body, priority)
             except BackendGoneError as exc:
                 last_gone = exc
                 self.log.warning(
