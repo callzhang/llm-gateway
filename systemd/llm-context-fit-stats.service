@@ -1,0 +1,11 @@
+[Unit]
+Description=LLM Gateway — daily context_fit stage statistics from model_manager.log
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/derek/Projects/llm-gateway
+ExecStartPre=/bin/bash -c 'echo "== $(date -Is) =="'
+ExecStart=/usr/bin/python3 /home/derek/Projects/llm-gateway/scripts/context_fit_stats.py
+# Not logs/*.log: logrotate rotates and expires those, and this is the record of the trend.
+StandardOutput=append:/home/derek/Projects/llm-gateway/logs/context_fit_stats.report
+StandardError=append:/home/derek/Projects/llm-gateway/logs/context_fit_stats.report

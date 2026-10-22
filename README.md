@@ -160,6 +160,18 @@ that one count. A 169k-token request that must be shrunk takes 11 counts ≈ 2 s
 a thread, so the event loop stays responsive (max lag 13 ms during a 2 s fit), but the tokenizer
 is behind a lock: four such overflowing requests at once take ≈ 8 s in total.
 
+**How often it fires.** `scripts/context_fit_stats.py` counts, from `model_manager.log` (from the
+first `context_fit: limits for` line on), the chat requests routed and the requests whose input had
+to shrink, by the furthest stage reached (thinking, dedup, tool-cap, drop-turns), plus output caps
+and requests left to vLLM. The `llm-context-fit-stats.timer` user unit (copy
+`systemd/llm-context-fit-stats.*` to `~/.config/systemd/user/`, then
+`systemctl --user enable --now llm-context-fit-stats.timer`) appends that report daily at 09:00 to
+`logs/context_fit_stats.report`. Before the move to model_manager only 60 WARNING lines survived in
+the LiteLLM log, and SpendLogs truncates stored prompts, so there was no way to measure this.
+Prompt sizes in SpendLogs (qwen3.8-27b, 100,343 requests over 8 days) show it is rare: p99 is 18.9k
+tokens, 0.30% exceed 32k and 0.007% exceed 100.8k, the size at which a 32,768-token output stops
+fitting.
+
 **Callback loading.** LiteLLM execs each callback in `config.yaml` by file path without registering
 it in `sys.modules`, so callback files must not use `@dataclass` or import sibling modules by name
 (`run_litellm.sh` puts nothing on `PYTHONPATH`).

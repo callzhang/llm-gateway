@@ -13,6 +13,10 @@
 - The sticky-routing key is taken from the client's original messages before fitting.
 - `run_litellm.sh` no longer exports `PYTHONPATH`: no remaining callback imports a sibling module.
 
+### Added
+- `scripts/context_fit_stats.py` and the `llm-context-fit-stats` systemd timer: a daily report in
+  `logs/context_fit_stats.report` of how many chat requests context_fit had to shrink, by furthest stage.
+
 ### Removed
 - `trim_hook.py`, its `callbacks` entry in `config.yaml`, and its Responses-shape handling. A native
   `/v1/responses` call sent directly to `model_manager` (not via LiteLLM) is no longer fitted.
