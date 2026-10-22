@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-10-22
+
+### Changed
+- Context-window fitting moved from the LiteLLM `trim_hook` pre-call hook to `model_manager`
+  (`context_fit.py`), the last hop before vLLM. LiteLLM's Responses bridge appends the stored
+  `previous_response_id` history after its pre-call hooks, so the hook could count that history but
+  not trim it, and a long chain still hit vLLM's 400. `model_manager` receives the finished chat body,
+  so the same policy now also covers `previous_response_id` history, Open WebUI and direct callers.
+- The policy itself is unchanged (cap the output if that loses at most ~9%, else drop thinking, stub
+  near-duplicates, cap tool arguments/results, then drop the oldest turns).
+- The sticky-routing key is taken from the client's original messages before fitting.
+- `run_litellm.sh` no longer exports `PYTHONPATH`: no remaining callback imports a sibling module.
+
+### Removed
+- `trim_hook.py`, its `callbacks` entry in `config.yaml`, and its Responses-shape handling. A native
+  `/v1/responses` call sent directly to `model_manager` (not via LiteLLM) is no longer fitted.
+
+### Measured
+- Token counting costs ~1.5-2 µs/token; a 169k-token request that needs shrinking takes ~2 s (11
+  counts), while the event loop lags at most 13 ms. See the README for details.
+
 ## 2026-10-06
 
 ### Fixed
