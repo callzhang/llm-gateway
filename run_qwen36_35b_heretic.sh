@@ -26,7 +26,7 @@ fi
 # see the note in run_qwen38_27b.sh.  warm_jit_cache.sh derives it at runtime.
 GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:?VLLM_GPU_MEM_UTIL is required}
 # Matched to stock 35b's 81920.  config.yaml's max_context_window_tokens must
-# agree — trim_hook caps requests against it, so a config claiming more than
+# agree — context_fit caps requests against it, so a config claiming more than
 # vLLM loaded makes every over-length request fail at the backend.
 # (Was temporarily 32768 while debugging the FlashInfer JIT cold-start hang,
 # while config.yaml still claimed 122880 — that mismatch was live.)

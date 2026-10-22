@@ -17,12 +17,12 @@ model_list:
       stream_timeout: 600
     model_info:
       # Must match --max-model-len in run_qwen36_35b_heretic.sh.  This said
-      # 122880 while vLLM was actually loaded with far less, so trim_hook let
+      # 122880 while vLLM was actually loaded with far less, so context_fit let
       # over-length requests through and they failed at the backend.
       # max_input_tokens is the context window; LiteLLM registers it (and
       # max_output_tokens, which must equal litellm_params.max_tokens above)
-      # into litellm.model_cost.  trim_hook reads these plus the tokenizer and
-      # tool_cap_tokens (cap for tool arguments/results in history, default 2000).
+      # into litellm.model_cost.  model_manager's context_fit reads these plus the
+      # tokenizer and tool_cap_tokens (cap for tool arguments/results in history, default 2000).
       max_input_tokens: 81920
       max_output_tokens: 32768
       tool_cap_tokens: 2000
@@ -106,16 +106,14 @@ litellm_settings:
   drop_params: true
   set_verbose: false
 
-  # Order matters: previous_response_history_hook runs first so the stored
-  # history is waited for (or rejected with 410) before trim_hook counts it.
-  # Files are in the same directory as this config file.
+  # Files are in the same directory as this config file.  Fitting requests into
+  # the context window is not done here: the prompt is only complete once
+  # LiteLLM has appended previous_response_id history, so model_manager (the
+  # next hop) does it — see context_fit.py.
   callbacks:
     # Reject previous_response_id with no stored history instead of letting
     # LiteLLM silently run the request without it.
     - previous_response_hook.previous_response_history_hook
-    # Fit input + output into the context window (shrink the output cap, drop
-    # the oldest turns), instead of returning 400.
-    - trim_hook.context_trim_hook
     # Map reasoning_effort onto what each model's chat template accepts.
     - reasoning_effort_hook.reasoning_effort_hook
 
