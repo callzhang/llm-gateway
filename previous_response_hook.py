@@ -33,8 +33,7 @@ _POLL_SECONDS = 1.0
 
 async def load_session_messages(previous_response_id: str) -> list[dict]:
     """Stored chat messages for a previous_response_id, exactly as the bridge
-    will rebuild them.  Empty when nothing is stored.  trim_hook uses this to
-    count history that never appears in the request body."""
+    will rebuild them.  Empty when nothing is stored."""
     from litellm.proxy.hooks.responses_id_security import ResponsesIDSecurity
     from litellm.responses.litellm_completion_transformation.session_handler import (
         ResponsesSessionHandler,

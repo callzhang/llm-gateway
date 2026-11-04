@@ -1,13 +1,11 @@
-"""LiteLLM pre-call hook: keep input + output within the model's context window.
+"""Fit a /v1/chat/completions request into the model's context window.
 
-Registered in config.yaml:
-    litellm_settings:
-      callbacks:
-        - trim_hook.context_trim_hook
-
-Applies to both /v1/chat/completions and /v1/responses.  vLLM rejects a request
-whose prompt + max output exceeds --max-model-len with a 400, and LiteLLM
-passes that through unchanged, so the gateway has to make the request fit.
+Runs in model_manager, the last hop before vLLM.  vLLM rejects a request whose
+prompt + max output exceeds --max-model-len with a 400, so the gateway has to
+make the request fit.  Doing it here (not in a LiteLLM hook) means it sees the
+final prompt: LiteLLM's Responses bridge appends the stored previous_response_id
+history after its pre-call hooks, so a hook can count that history but never trim
+it, whereas the chat/completions body that arrives here already contains it.
 
 Policy, with R = context_window - input_tokens - SAFETY_MARGIN (room left for
 the answer) and F = requested_output / OUTPUT_TOLERANCE (the least room we
@@ -16,8 +14,8 @@ accept without touching the input):
   * R >= requested_output            nothing to do.
   * F <= R < requested_output        shrink the output cap to R.  The model
                                      stops at the cap with finish_reason
-                                     "length" (Responses: status "incomplete"),
-                                     which is a normal response, not an error.
+                                     "length", which is a normal response, not
+                                     an error.
   * R < F                            shrink the input, least lossy step first,
                                      recounting after each and stopping as soon
                                      as R >= F:
@@ -38,10 +36,10 @@ accept without touching the input):
                                           one, so tool calls stay paired with
                                           their results.
                                      Steps 1-3 only touch turns before the latest
-                                     user message; system/developer messages,
-                                     `instructions` and the latest turn are
-                                     never modified or dropped.  Then the output
-                                     cap shrinks to what is left.
+                                     user message; system/developer messages and
+                                     the latest turn are never modified or
+                                     dropped.  Then the output cap shrinks to what
+                                     is left.
   * F unreachable                    even with only the latest turn left R < F.
                                      Turns are then only dropped when R is below
                                      MIN_OUTPUT (an answer that short is useless,
@@ -59,11 +57,10 @@ prefix-stable, which only costs cache hits on conversations that overflow.
 Input tokens are counted exactly: the model's own tokenizer and chat template
 run on the same messages (and tool definitions) vLLM will render.  Image parts
 only contribute their template placeholder, so a request heavy on images can
-still undercount by up to SAFETY_MARGIN-scale amounts per image.  For
-/v1/responses with previous_response_id, the stored history LiteLLM prepends
-downstream is counted too, but it cannot be trimmed from here.
+still undercount by up to SAFETY_MARGIN-scale amounts per image.
 
-Models without model_info.max_input_tokens (TTS, ASR) are not touched.
+Only bodies with a `messages` list are touched; models without
+model_info.max_input_tokens (TTS, ASR) have no limits and pass through.
 """
 from __future__ import annotations
 
@@ -76,17 +73,15 @@ import threading
 from typing import Any, Callable, NamedTuple
 
 import yaml
-from litellm.integrations.custom_logger import CustomLogger
 
-logger = logging.getLogger("litellm.trim_hook")
+logger = logging.getLogger("mgr.context_fit")
 
-# Single source of truth is config.yaml — the SAME file LiteLLM loads (run_litellm.sh
-# points it at $SCRIPT_DIR/config.yaml and this hook lives in that dir).  Per model:
+# Single source of truth is config.yaml, the same file LiteLLM loads.  Per model:
 #   model_info.max_input_tokens   context window (== vLLM --max-model-len); LiteLLM
 #                                 also registers it into litellm.model_cost
 #   litellm_params.max_tokens     output cap used when the request carries none
 #   model_info.tokenizer(+_revision)  HF repo of the tokenizer vLLM serves with
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 _DEFAULT_OUT = 4096
 
 # Reserve for what the tokenizer cannot see (image tokens expand inside vLLM).
@@ -121,11 +116,10 @@ _DEFAULT_TOOL_CAP_TOKENS = 2000
 
 _THINK_END = "</think>"
 _FIXED_ROLES = ("system", "developer")
-_CHAT_OUTPUT_KEYS = ("max_tokens", "max_completion_tokens")
-_RESPONSES_OUTPUT_KEYS = ("max_output_tokens",)
+_OUTPUT_KEYS = ("max_tokens", "max_completion_tokens")
 
 
-class ModelLimits(NamedTuple):   # not a dataclass: LiteLLM loads this file without registering it in sys.modules
+class ModelLimits(NamedTuple):
     context_window: int
     default_output: int
     tokenizer: Any
@@ -159,20 +153,14 @@ class _Counter:
             return self._tokenizer.decode(ids)
 
 
-def _as_dict(msg: Any) -> dict:
-    return msg if isinstance(msg, dict) else msg.model_dump(exclude_none=True)
-
-
 def _template_messages(messages: list[dict]) -> list[dict]:
     """Messages as vLLM hands them to the chat template: tool-call arguments
     arrive as JSON strings on the wire but the template iterates them as dicts."""
     out = []
-    for raw in messages:
-        msg = _as_dict(raw)
+    for msg in messages:
         if msg.get("tool_calls"):
             calls = []
             for call in msg["tool_calls"]:
-                call = _as_dict(call)
                 fn = dict(call.get("function") or {})
                 if isinstance(fn.get("arguments"), str):
                     try:
@@ -191,8 +179,8 @@ def _load_tokenizer(repo: str, revision: str | None) -> Any:
     return AutoTokenizer.from_pretrained(repo, revision=revision, local_files_only=True)
 
 
-def _load_model_limits(
-    path: str, tokenizer_loader: Callable[[str, str | None], Any]
+def load_model_limits(
+    path: str, tokenizer_loader: Callable[[str, str | None], Any] = _load_tokenizer
 ) -> dict[str, ModelLimits]:
     """Parse config.yaml into {model_name: ModelLimits}.  A model that declares a
     context window must also name its tokenizer; a missing or unloadable
@@ -209,7 +197,7 @@ def _load_model_limits(
             continue
         repo = info.get("tokenizer")
         if not repo:
-            raise ValueError(f"trim_hook: model {name!r} declares max_input_tokens but no model_info.tokenizer")
+            raise ValueError(f"context_fit: model {name!r} declares max_input_tokens but no model_info.tokenizer")
         max_out = (entry.get("litellm_params") or {}).get("max_tokens")
         limits[name] = ModelLimits(
             context_window=int(ctx),
@@ -220,18 +208,22 @@ def _load_model_limits(
     return limits
 
 
-def _has_user_role(items: list) -> bool:
-    return any(isinstance(m, dict) and m.get("role") == "user" for m in items)
+def _role(msg: Any) -> str | None:
+    return msg.get("role") if isinstance(msg, dict) else None
 
 
-def _split_turns(items: list, role_of: Callable[[Any], str | None]) -> list[list[int]]:
-    """Indices of `items` grouped into droppable turns.  A turn opens at each
+def _has_user_role(messages: list) -> bool:
+    return any(_role(m) == "user" for m in messages)
+
+
+def _split_turns(messages: list) -> list[list[int]]:
+    """Indices of `messages` grouped into droppable turns.  A turn opens at each
     user message; everything up to the next one (assistant replies, tool calls
-    and their outputs) belongs to it.  System/developer items are never in a
-    turn.  Items before the first user message form their own leading turn."""
+    and their results) belongs to it.  System/developer messages are never in a
+    turn.  Messages before the first user message form their own leading turn."""
     turns: list[list[int]] = []
-    for i, item in enumerate(items):
-        role = role_of(item)
+    for i, msg in enumerate(messages):
+        role = _role(msg)
         if role in _FIXED_ROLES:
             continue
         if role == "user" or not turns:
@@ -241,27 +233,27 @@ def _split_turns(items: list, role_of: Callable[[Any], str | None]) -> list[list
     return turns
 
 
-def _drop_turns(items: list, turns: list[list[int]], n: int) -> list:
+def _drop_turns(messages: list, turns: list[list[int]], n: int) -> list:
     dropped = {i for turn in turns[:n] for i in turn}
-    return [item for i, item in enumerate(items) if i not in dropped]
+    return [msg for i, msg in enumerate(messages) if i not in dropped]
 
 
 def _fit_input(
-    items: list,
+    messages: list,
     turns: list[list[int]],
     count: Callable[[list], int],
     budget: int,
 ) -> int | None:
-    """Fewest oldest turns to drop so count(items) <= budget, or None when even
+    """Fewest oldest turns to drop so count(messages) <= budget, or None when even
     keeping only the latest turn does not fit.  count() is monotonic in the
     number of dropped turns, so bisect on exact counts."""
     max_drop = len(turns) - 1
-    if max_drop < 1 or count(_drop_turns(items, turns, max_drop)) > budget:
+    if max_drop < 1 or count(_drop_turns(messages, turns, max_drop)) > budget:
         return None
     lo, hi = 1, max_drop
     while lo < hi:
         mid = (lo + hi) // 2
-        if count(_drop_turns(items, turns, mid)) <= budget:
+        if count(_drop_turns(messages, turns, mid)) <= budget:
             hi = mid
         else:
             lo = mid + 1
@@ -269,8 +261,7 @@ def _fit_input(
 
 
 # ── input-shrinking steps ───────────────────────────────────────────────────
-# Items are chat messages ("chat") or Responses input items ("responses").  Both
-# are plain dicts; steps return a new list, or None when nothing changed.
+# Each step returns a new message list, or None when nothing changed.
 
 def _get(item: Any, path: tuple) -> Any:
     for key in path:
@@ -283,51 +274,38 @@ def _set(item: Any, path: tuple, value: Any) -> Any:
     if not path:
         return value
     child = _set(item[path[0]], path[1:], value)
-    if isinstance(item, list):
-        out = list(item)
-    else:
-        out = dict(item)
+    out = list(item) if isinstance(item, list) else dict(item)
     out[path[0]] = child
     return out
 
 
-def _content_paths(item: dict, key: str, kind: str):
-    content = item.get(key)
+def _content_paths(msg: dict, kind: str):
+    content = msg.get("content")
     if isinstance(content, str):
-        yield kind, (key,)
+        yield kind, ("content",)
     elif isinstance(content, list):
         for i, part in enumerate(content):
             if isinstance(part, dict) and isinstance(part.get("text"), str):
-                yield kind, (key, i, "text")
+                yield kind, ("content", i, "text")
 
 
-def _text_paths(item: Any, shape: str):
-    """(kind, path) of every text field in an item: "message" (user/assistant
+def _text_paths(msg: Any):
+    """(kind, path) of every text field in a message: "message" (user/assistant
     text), "result" (tool output) or "args" (tool-call arguments JSON)."""
-    if not isinstance(item, dict) or item.get("role") in _FIXED_ROLES:
+    if not isinstance(msg, dict) or msg.get("role") in _FIXED_ROLES:
         return
-    if shape == "chat":
-        if item.get("role") == "tool":
-            yield from _content_paths(item, "content", "result")
-            return
-        yield from _content_paths(item, "content", "message")
-        for i, call in enumerate(item.get("tool_calls") or []):
-            if isinstance((call.get("function") or {}).get("arguments"), str):
-                yield "args", ("tool_calls", i, "function", "arguments")
+    if msg.get("role") == "tool":
+        yield from _content_paths(msg, "result")
         return
-    kind = item.get("type")
-    if kind == "function_call_output":
-        yield from _content_paths(item, "output", "result")
-    elif kind == "function_call":
-        if isinstance(item.get("arguments"), str):
-            yield "args", ("arguments",)
-    elif kind != "reasoning":
-        yield from _content_paths(item, "content", "message")
+    yield from _content_paths(msg, "message")
+    for i, call in enumerate(msg.get("tool_calls") or []):
+        if isinstance((call.get("function") or {}).get("arguments"), str):
+            yield "args", ("tool_calls", i, "function", "arguments")
 
 
-def _history_end(items: list, role_of: Callable[[Any], str | None]) -> int:
+def _history_end(messages: list) -> int:
     """Index where the latest turn starts; everything before it is history."""
-    turns = _split_turns(items, role_of)
+    turns = _split_turns(messages)
     return turns[-1][0] if turns else 0
 
 
@@ -337,29 +315,24 @@ def _without_thinking(text: str) -> str:
     return text.rsplit(_THINK_END, 1)[1].lstrip() if _THINK_END in text else text
 
 
-def _strip_thinking(items: list, shape: str, role_of, limits: ModelLimits) -> list | None:
-    end = _history_end(items, role_of)
+def _strip_thinking(messages: list, limits: ModelLimits) -> list | None:
+    end = _history_end(messages)
     out: list = []
     changed = False
-    for i, item in enumerate(items):
-        if i >= end or not isinstance(item, dict):
-            out.append(item)
+    for i, msg in enumerate(messages):
+        if i >= end or _role(msg) != "assistant":
+            out.append(msg)
             continue
-        if shape == "responses" and item.get("type") == "reasoning":
-            changed = True
-            continue
-        if shape == "chat" and item.get("role") == "assistant":
-            stripped = {k: v for k, v in item.items() if k not in ("reasoning_content", "thinking_blocks", "reasoning")}
-            changed |= len(stripped) != len(item)
-            item = stripped
-        if item.get("role") == "assistant":
-            for kind, path in _text_paths(item, shape):
-                if kind == "message":
-                    text = _get(item, path)
-                    plain = _without_thinking(text)
-                    if plain != text:
-                        item, changed = _set(item, path, plain), True
-        out.append(item)
+        stripped = {k: v for k, v in msg.items() if k not in ("reasoning_content", "thinking_blocks", "reasoning")}
+        changed |= len(stripped) != len(msg)
+        msg = stripped
+        for kind, path in _text_paths(msg):
+            if kind == "message":
+                text = _get(msg, path)
+                plain = _without_thinking(text)
+                if plain != text:
+                    msg, changed = _set(msg, path, plain), True
+        out.append(msg)
     return out if changed else None
 
 
@@ -370,18 +343,18 @@ def _shingles(text: str) -> set[int]:
     return {hash(tuple(words[i:i + _SHINGLE_WORDS])) for i in range(len(words) - _SHINGLE_WORDS + 1)}
 
 
-def _dedup_similar(items: list, shape: str, role_of, limits: ModelLimits) -> list | None:
+def _dedup_similar(messages: list, limits: ModelLimits) -> list | None:
     """Stub history messages that are >= _DEDUP_SIMILARITY similar to a later one.
     Walks from the end so the latest copy is the one kept."""
-    end = _history_end(items, role_of)
-    out = list(items)
+    end = _history_end(messages)
+    out = list(messages)
     kept: list[tuple[int, set[int]]] = []
     changed = False
-    for idx in range(len(items) - 1, -1, -1):
-        for kind, path in _text_paths(items[idx], shape):
+    for idx in range(len(messages) - 1, -1, -1):
+        for kind, path in _text_paths(messages[idx]):
             if kind == "args":
                 continue
-            text = _get(items[idx], path)
+            text = _get(messages[idx], path)
             if len(text) < _DEDUP_MIN_CHARS:
                 continue
             grams = _shingles(text)
@@ -424,18 +397,18 @@ def _cap_json_strings(value: Any, cap: int, tokenizer: _Counter) -> Any:
     return value
 
 
-def _cap_tool_io(items: list, shape: str, role_of, limits: ModelLimits) -> list | None:
+def _cap_tool_io(messages: list, limits: ModelLimits) -> list | None:
     """Cap history tool results, and the string values inside tool-call
     arguments (which must stay valid JSON, so the raw string is never cut)."""
-    end = _history_end(items, role_of)
+    end = _history_end(messages)
     cap, tokenizer = limits.tool_cap_tokens, limits.tokenizer
-    out = list(items)
+    out = list(messages)
     changed = False
     for idx in range(end):
-        for kind, path in _text_paths(items[idx], shape):
+        for kind, path in _text_paths(messages[idx]):
             if kind == "message":
                 continue
-            text = _get(items[idx], path)
+            text = _get(messages[idx], path)
             if kind == "args":
                 try:
                     capped = json.dumps(_cap_json_strings(json.loads(text), cap, tokenizer), ensure_ascii=False)
@@ -452,164 +425,104 @@ def _cap_tool_io(items: list, shape: str, role_of, limits: ModelLimits) -> list 
     return out if changed else None
 
 
-class ContextTrimHook(CustomLogger):
+class ContextFitter:
     """Fit input + output into the context window: shrink the output cap, and
-    drop the oldest turns when shrinking alone would cut the answer too much."""
+    shrink or drop history when shrinking the cap alone would cut the answer
+    too much."""
 
-    def __init__(
-        self,
-        config_path: str = _CONFIG_PATH,
+    def __init__(self, limits: dict[str, ModelLimits]) -> None:
+        self._limits = limits
+
+    @classmethod
+    def from_config(
+        cls,
+        path: str = CONFIG_PATH,
         tokenizer_loader: Callable[[str, str | None], Any] = _load_tokenizer,
-    ) -> None:
-        super().__init__()
-        self._limits = _load_model_limits(config_path, tokenizer_loader)
-        logger.info("trim_hook: limits for %s", {k: v.context_window for k, v in self._limits.items()})
+    ) -> "ContextFitter":
+        limits = load_model_limits(path, tokenizer_loader)
+        logger.info("context_fit: limits for %s", {k: v.context_window for k, v in limits.items()})
+        return cls(limits)
 
-    async def async_pre_call_hook(
-        self,
-        user_api_key_dict: Any,
-        cache: Any,
-        data: dict,
-        call_type: str,
-    ) -> dict | None:
-        if call_type == "aresponses":
-            return await self._responses(data)
-        if call_type in ("completion", "acompletion"):
-            return await self._chat(data)
-        return None
+    async def fit(self, body: dict, model_name: str) -> bool:
+        """Apply the module-docstring policy to a parsed chat/completions body in
+        place; True if it changed.  Tokenizing and rendering the chat template is
+        CPU work, so it runs in a thread."""
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return False
 
-    # ── chat/completions ────────────────────────────────────────────────────
-
-    async def _chat(self, data: dict) -> dict | None:
-        messages: list[dict] | None = data.get("messages")
-        if not messages:
-            return None
-
-        # Same Qwen "No user query found in messages" guard as the Responses path.
         injected = False
         if not _has_user_role(messages):
-            messages = list(messages) + [{"role": "user", "content": _FILLER_USER}]
-            data["messages"] = messages
+            body["messages"] = messages = messages + [{"role": "user", "content": _FILLER_USER}]
             injected = True
             logger.warning(
-                "trim_hook: chat request for %s had no user turn (%d msgs) — "
+                "context_fit: chat request for %s had no user turn (%d msgs) — "
                 "appended filler user turn to satisfy the chat template",
-                data.get("model"), len(messages) - 1,
+                model_name, len(messages) - 1,
             )
 
-        limits = self._limits.get((data.get("model") or "").rsplit("/", 1)[-1])
+        limits = self._limits.get(model_name)
         if limits is None:
-            return data if injected else None
+            return injected
+        changed = await asyncio.to_thread(self._fit, body, model_name, limits)
+        return changed or injected
 
+    def _fit(self, data: dict, model: str, limits: ModelLimits) -> bool:
         tools = data.get("tools") or None
-        changed = await asyncio.to_thread(
-            self._fit, data, limits, messages, "messages", "chat",
-            _CHAT_OUTPUT_KEYS, lambda m: m.get("role"),
-            lambda items: limits.tokenizer.count(items, tools),
-        )
-        return data if (changed or injected) else None
+        messages = data["messages"]
 
-    # ── responses ───────────────────────────────────────────────────────────
+        def count(items: list) -> int:
+            return limits.tokenizer.count(items, tools)
 
-    async def _responses(self, data: dict) -> dict | None:
-        injected = self._ensure_responses_user_turn(data)
-
-        limits = self._limits.get((data.get("model") or "").rsplit("/", 1)[-1])
-        if limits is None:
-            return data if injected else None
-
-        # Imported here: litellm.responses pulls in the whole proxy stack.
-        from litellm.responses.litellm_completion_transformation.transformation import (
-            LiteLLMCompletionResponsesConfig as Bridge,
-        )
-
-        # LiteLLM prepends the stored conversation for previous_response_id
-        # downstream of this hook.  It cannot be trimmed here, but it occupies
-        # context, so it has to be part of the count.
-        history: list = []
-        if data.get("previous_response_id"):
-            from previous_response_hook import load_session_messages
-
-            history = await load_session_messages(data["previous_response_id"])
-
-        tools, _ = Bridge.transform_responses_api_tools_to_chat_completion_tools(data.get("tools") or [])
-        instructions = {"instructions": data.get("instructions")}
-
-        def count(items: list | str) -> int:
-            messages = Bridge.transform_responses_api_input_to_messages(items, instructions)
-            return limits.tokenizer.count(list(history) + list(messages), tools)
-
-        changed = await asyncio.to_thread(
-            self._fit, data, limits, data.get("input"), "input", "responses",
-            _RESPONSES_OUTPUT_KEYS, lambda item: item.get("role") if isinstance(item, dict) else None,
-            count,
-        )
-        return data if (changed or injected) else None
-
-    # ── shared policy ───────────────────────────────────────────────────────
-
-    def _fit(
-        self,
-        data: dict,
-        limits: ModelLimits,
-        items: Any,
-        items_key: str,
-        shape: str,
-        output_keys: tuple[str, ...],
-        role_of: Callable[[Any], str | None],
-        count: Callable[[Any], int],
-    ) -> bool:
-        """Apply the module-docstring policy to `data` in place; True if changed."""
-        model = data.get("model")
-        requested = next((data[k] for k in output_keys if data.get(k)), None) or limits.default_output
+        requested = next((data[k] for k in _OUTPUT_KEYS if data.get(k)), None) or limits.default_output
         floor = math.ceil(requested / _OUTPUT_TOLERANCE)
         ctx = limits.context_window
 
-        input_tokens = count(items)
+        input_tokens = count(messages)
         room = ctx - input_tokens - _SAFETY_MARGIN
         changed = False
 
-        if room < floor and isinstance(items, list):
+        if room < floor:
             for name, step in (
                 ("thinking", _strip_thinking),
                 ("near-duplicates", _dedup_similar),
                 ("tool arguments/results", _cap_tool_io),
             ):
-                shrunk = step(items, shape, role_of, limits)
+                shrunk = step(messages, limits)
                 if shrunk is None:
                     continue
                 new_tokens = count(shrunk)
                 logger.info(
-                    "trim_hook: shrank %s for %s (input tokens %d → %d, ctx=%d, requested output=%d)",
+                    "context_fit: shrank %s for %s (input tokens %d → %d, ctx=%d, requested output=%d)",
                     name, model, input_tokens, new_tokens, ctx, requested,
                 )
-                items, input_tokens, room, changed = shrunk, new_tokens, ctx - new_tokens - _SAFETY_MARGIN, True
-                data[items_key] = items
+                messages, input_tokens, room, changed = shrunk, new_tokens, ctx - new_tokens - _SAFETY_MARGIN, True
+                data["messages"] = messages
                 if room >= floor:
                     break
 
-        if room < floor and isinstance(items, list):
-            turns = _split_turns(items, role_of)
+        if room < floor:
+            turns = _split_turns(messages)
             for target in (floor, min(_MIN_OUTPUT, floor)):
                 if room >= target:
                     break
-                n_drop = _fit_input(items, turns, count, ctx - _SAFETY_MARGIN - target)
+                n_drop = _fit_input(messages, turns, count, ctx - _SAFETY_MARGIN - target)
                 if n_drop is None:
                     continue
-                trimmed = _drop_turns(items, turns, n_drop)
+                trimmed = _drop_turns(messages, turns, n_drop)
                 new_tokens = count(trimmed)
                 logger.warning(
-                    "trim_hook: dropped %d oldest turn(s) for %s "
-                    "(input tokens %d → %d, items %d → %d, ctx=%d, requested output=%d)",
-                    n_drop, model, input_tokens, new_tokens, len(items), len(trimmed), ctx, requested,
+                    "context_fit: dropped %d oldest turn(s) for %s "
+                    "(input tokens %d → %d, messages %d → %d, ctx=%d, requested output=%d)",
+                    n_drop, model, input_tokens, new_tokens, len(messages), len(trimmed), ctx, requested,
                 )
-                data[items_key] = trimmed
+                data["messages"] = trimmed
                 input_tokens, room, changed = new_tokens, ctx - new_tokens - _SAFETY_MARGIN, True
                 break
 
         if room < 1:
             logger.warning(
-                "trim_hook: %s input is %d tokens, no room left in ctx=%d — "
+                "context_fit: %s input is %d tokens, no room left in ctx=%d — "
                 "leaving the request for vLLM to reject",
                 model, input_tokens, ctx,
             )
@@ -617,46 +530,11 @@ class ContextTrimHook(CustomLogger):
 
         if requested > room:
             logger.info(
-                "trim_hook: capped output %d → %d for %s (input tokens=%d, ctx=%d)",
+                "context_fit: capped output %d → %d for %s (input tokens=%d, ctx=%d)",
                 requested, room, model, input_tokens, ctx,
             )
-            present = [k for k in output_keys if data.get(k)]
-            for key in present or output_keys[:1]:
+            present = [k for k in _OUTPUT_KEYS if data.get(k)]
+            for key in present or _OUTPUT_KEYS[:1]:
                 data[key] = room
             changed = True
         return changed
-
-    def _ensure_responses_user_turn(self, data: dict) -> bool:
-        """Responses API analogue of the chat-path user-turn guard.
-
-        `data["input"]` is either a bare string (already a user turn once
-        non-empty) or a list of role-tagged items.  If no user turn is present,
-        append a filler one so the downstream chat-template conversion doesn't
-        400 with "No user query found in messages."  `instructions` maps to a
-        system message and never counts as the user turn.
-        """
-        input_val = data.get("input")
-
-        if isinstance(input_val, str):
-            if input_val.strip():
-                return False           # non-empty string is the user turn
-            items: list[dict] = []     # empty string → treat as no user turn
-        elif isinstance(input_val, list):
-            if _has_user_role(input_val):
-                return False
-            items = list(input_val)
-        else:
-            items = []                 # None / unexpected shape
-
-        items.append({"role": "user", "content": _FILLER_USER})
-        data["input"] = items
-        logger.warning(
-            "trim_hook: responses request for %s had no user turn — appended "
-            "filler user turn to satisfy the chat template",
-            data.get("model"),
-        )
-        return True
-
-
-# Module-level instance — config.yaml references this via "trim_hook.context_trim_hook"
-context_trim_hook = ContextTrimHook()

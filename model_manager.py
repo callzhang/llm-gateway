@@ -49,6 +49,7 @@ from aiohttp import web
 from asr_adapter import service as asr_service
 from asr_adapter.cpu_pool import CpuAsrWorker, CpuWorkerError
 from asr_adapter.engine import EngineError, pcm16_wav
+from context_fit import ContextFitter
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 # 300→1200 (2026-09-04): real traffic for both chat models arrives in bursts
@@ -2182,9 +2183,17 @@ class DynamicRouter:
     # (e.g. not enough free VRAM because another process is on that GPU).
     SCALE_OUT_COOLDOWN = 600  # 10 minutes — back off longer after a failed scale-out
 
-    def __init__(self, slots: list[GpuSlot], model_configs: dict[str, ModelConfig]):
+    def __init__(
+        self,
+        slots: list[GpuSlot],
+        model_configs: dict[str, ModelConfig],
+        context_fitter: ContextFitter | None = None,
+    ):
         self.slots         = slots
         self.model_configs = model_configs
+        # Fits chat requests into each model's context window before they reach
+        # vLLM; an empty fitter has no model limits and leaves every body alone.
+        self.context_fitter = context_fitter or ContextFitter({})
         self.log           = logging.getLogger("mgr.router")
         self._router_lock  = asyncio.Lock()   # serialises slot claims
         self._scale_tasks: set[asyncio.Task] = set()
@@ -3120,6 +3129,14 @@ class DynamicRouter:
                 for m in msgs if isinstance(m, dict)
             )
 
+        # Fit the prompt into the model's context window.  This runs after the
+        # sticky key above was taken from the original messages: dropping the
+        # oldest turns changes the first user message, which would re-pin the
+        # conversation to another slot and lose its prefix cache.
+        if config.request_kind == "chat" and isinstance(parsed_body, dict):
+            if await self.context_fitter.fit(parsed_body, model_name):
+                body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
+
         # A backend can vanish BEFORE it streams a single byte — a crash-recycle
         # SIGKILL or a reload racing this in-flight request.  That surfaces as
         # BackendGoneError (raised only pre-stream, never mid-body).  Since
@@ -3467,7 +3484,7 @@ async def main() -> None:
     log = logging.getLogger("model_manager")
 
     slots  = [GpuSlot(sid, gid, port) for sid, gid, port in GPU_SLOTS]
-    router = DynamicRouter(slots, MODEL_CONFIGS)
+    router = DynamicRouter(slots, MODEL_CONFIGS, ContextFitter.from_config())
 
     app = web.Application(client_max_size=100 * 1024 * 1024)
     app.router.add_route("*", "/{path_info:.*}", router.handle)
