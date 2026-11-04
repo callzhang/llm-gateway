@@ -1,0 +1,6 @@
+[Unit]
+Description=Capture LiteLLM stacks, DB queries and connections when its memory passes 2G
+
+[Service]
+Type=oneshot
+ExecStart=/home/derek/Projects/llm-gateway/scripts/litellm_mem_watch.sh

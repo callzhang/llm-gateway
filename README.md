@@ -341,6 +341,24 @@ The `llm-litellm` unit sets the same `PRISMA_BINARY_CACHE_DIR` in the drop-in
 `~/.config/systemd/user/llm-litellm.service.d/prisma-cache.conf`, so the startup migration step uses the
 same directory.
 
+#### LiteLLM memory cap and watcher
+
+On 2026-11-01 LiteLLM 1.99.0 grew to 45.8 GB and triggered a global OOM; its normal footprint is about
+1.3 GB. The drop-in `llm-litellm.service.d/memory-cap.conf` sets `MemoryHigh=3G` (throttle) and
+`MemoryMax=4G` (kill and restart only LiteLLM).
+
+`scripts/litellm_mem_watch.sh` runs every minute from the root timer `llm-litellm-mem-watch.timer`
+(units in `systemd/system/`). When LiteLLM's `memory.current` reaches 2 GiB it writes, at most once per
+10 minutes, to `logs/mem-captures/<time>/`: a `py-spy dump` of the Python stacks (no locals, which hold
+request bodies and keys), per-process RSS and `smaps_rollup`, cgroup memory stats, established
+connections on :8900, non-idle Postgres queries, and the last 300 log lines. It runs as root because
+`kernel.yama.ptrace_scope=1` blocks py-spy on a process the caller did not start.
+
+```bash
+sudo install -m 644 systemd/system/llm-litellm-mem-watch.* /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now llm-litellm-mem-watch.timer
+```
+
 ### 5. Run
 
 ```bash

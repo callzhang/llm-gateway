@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-11-03
+
+### Added
+- `scripts/litellm_mem_watch.sh` and the root `llm-litellm-mem-watch` timer: when LiteLLM's memory
+  passes 2 GiB, capture py-spy stacks, process memory, :8900 connections, running Postgres queries and
+  the log tail into `logs/mem-captures/`, so the next spike like 2026-11-01's 45.8 GB has evidence.
+
+### Changed
+- LiteLLM memory cap lowered from `MemoryHigh=6G`/`MemoryMax=8G` to 3G/4G; 2.5 days of samples
+  peaked at 1.33 GB.
+
 ## 2026-11-01
 
 ### Fixed
