@@ -320,6 +320,27 @@ model_list:
 
 > **Important:** Use the `custom_openai/` provider prefix (not `openai/`). The `openai/` prefix causes LiteLLM to pass Responses API calls through to model_manager unchanged. `custom_openai/` makes LiteLLM handle `/v1/responses` itself — converting to chat/completions, storing history in Postgres, and supporting `previous_response_id` and tool use.
 
+#### Prisma query engine location
+
+LiteLLM stores virtual keys and spend in Postgres through Prisma Client Python, which runs a separate
+`query-engine` binary. `prisma generate` writes that binary's absolute path into the installed
+`prisma/client.py`, and by default the binary lives under `~/.cache/prisma-python`. If that cache is
+wiped, the path in `client.py` points at a missing file and the proxy exits 3 on every start with
+`Not connected to the query engine`. The `prisma-query-engine-debian-openssl-3.6.x` path in that error
+is only the last lookup fallback; Prisma ships one engine for all of OpenSSL 3.x, named `3.0.x`.
+
+Keep the engine inside the conda env instead, and regenerate after every LiteLLM upgrade:
+
+```bash
+ENV=~/miniforge3/envs/llm-gateway-vllm
+PRISMA_BINARY_CACHE_DIR=$ENV/share/prisma-python \
+  $ENV/bin/prisma generate --schema $ENV/lib/python3.12/site-packages/litellm_proxy_extras/schema.prisma
+```
+
+The `llm-litellm` unit sets the same `PRISMA_BINARY_CACHE_DIR` in the drop-in
+`~/.config/systemd/user/llm-litellm.service.d/prisma-cache.conf`, so the startup migration step uses the
+same directory.
+
 ### 5. Run
 
 ```bash

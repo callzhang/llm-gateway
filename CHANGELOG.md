@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-01
+
+### Fixed
+- The LiteLLM proxy could not restart after the 01:35 OOM kill: `~/.cache/prisma-python` had been
+  wiped, so the query engine path generated into `prisma/client.py` pointed at a missing file and every
+  start exited 3. The Prisma client is now generated with `PRISMA_BINARY_CACHE_DIR` inside the conda env,
+  and the `llm-litellm` unit sets the same directory. README documents regenerating after upgrades.
+
 ## 2026-10-06
 
 ### Fixed
