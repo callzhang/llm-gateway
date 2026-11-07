@@ -58,7 +58,7 @@ today `qwen3-asr-0.6b`, ~3 GiB) instead shares a GPU with whatever primary owns 
 
 - **Admission by budget.** A request is placed on a GPU whose *current* free VRAM (nvidia-smi),
   minus what co-resident models still starting there will take, covers the model's min-viable
-  `gpu_memory_utilization` (`MODEL_MIN_GPU_MEM_UTIL`) plus `HARD_MARGIN_MIB`.  A GPU without a
+  footprint (`MODEL_MIN_VIABLE_GIB`, in GiB so it holds on any card size) plus `HARD_MARGIN_MIB`.  A GPU without a
   primary is preferred, then the one with the most room.  If none fits the caller gets 503
   `gpu_busy` with each GPU's free GiB.
 - **Lanes.** Each (model, GPU) gets a virtual slot with a fixed port

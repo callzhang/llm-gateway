@@ -162,7 +162,90 @@ class ChatModelUtilCeilingTests(unittest.TestCase):
             with self.subTest(model=name):
                 self.assertGreaterEqual(
                     model_manager.MODEL_GPU_MEM_UTIL[name],
-                    model_manager.MODEL_MIN_GPU_MEM_UTIL[name],
+                    model_manager._min_viable_util(name, self.TOTAL_MIB),
+                )
+
+
+class MinViableFloorInGibTests(unittest.TestCase):
+    """The min-viable floor is GiB, so a bigger card does not demand more.
+
+    Regression: on a 40 GiB A100 the 27B's 0.78 floor (calibrated on a 5090)
+    asked for 31.2 GiB, and GPU 1 with 29.5 GiB free was refused."""
+
+    RTX_5090_MIB = 32607.0
+    A100_40G_MIB = 40960.0
+    # The util floors the GiB values replace, as tuned on GPU4's 5090s.
+    GPU4_FLOORS = {
+        "qwen3.6-35b-a3b-heretic": 0.84,
+        "qwen3.8-27b": 0.78,
+        "qwen3-asr-0.6b": 0.095,
+    }
+
+    def _util(self, model: str, total: float, free: float) -> float:
+        backend = model_manager.GpuBackend(
+            model, "run.sh", model, model_manager.GpuSlot(0, 1, 9010),
+        )
+        with patch.object(model_manager, "_gpu_total_mib", return_value=total), \
+                patch.object(model_manager, "_gpu_free_mib", return_value=free):
+            return backend._gpu_mem_util_for_spawn()
+
+    def test_gib_floors_reproduce_the_gpu4_util_floors(self) -> None:
+        for name, util in self.GPU4_FLOORS.items():
+            with self.subTest(model=name):
+                self.assertEqual(
+                    util, model_manager._min_viable_util(name, self.RTX_5090_MIB),
+                )
+        self.assertEqual(
+            0.78, model_manager._min_viable_util("unlisted-model", self.RTX_5090_MIB),
+        )
+
+    def test_floor_never_reserves_less_than_its_gib(self) -> None:
+        for name, gib in model_manager.MODEL_MIN_VIABLE_GIB.items():
+            for total in (self.RTX_5090_MIB, self.A100_40G_MIB, 81920.0):
+                with self.subTest(model=name, total=total):
+                    util = model_manager._min_viable_util(name, total)
+                    self.assertGreaterEqual(util * total, gib * 1024.0)
+                    self.assertLess(util * total - gib * 1024.0, 0.001 * total)
+
+    def test_a100_with_29_5_gib_free_admits_the_27b(self) -> None:
+        free = 29.5 * 1024.0
+        # The pre-change floor: 0.78 x 40 GiB = 31.2 GiB > 29.5 GiB free.
+        self.assertGreater(0.78 * self.A100_40G_MIB, free)
+        util = self._util("qwen3.8-27b", self.A100_40G_MIB, free)
+        self.assertGreaterEqual(
+            util * self.A100_40G_MIB,
+            model_manager.MODEL_MIN_VIABLE_GIB["qwen3.8-27b"] * 1024.0,
+        )
+        self.assertLess(util * self.A100_40G_MIB, free)
+
+    def test_5090_admission_boundary_is_unchanged(self) -> None:
+        total = self.RTX_5090_MIB
+        for name, floor in self.GPU4_FLOORS.items():
+            if name not in model_manager.MODEL_GPU_MEM_UTIL:
+                continue
+            edge = floor * total + model_manager.HARD_MARGIN_MIB
+            with self.subTest(model=name):
+                self.assertEqual(floor, self._util(name, total, edge))
+                with self.assertRaisesRegex(RuntimeError, "too tight"):
+                    self._util(name, total, edge - 1)
+                # Buffered fit above the floor is passed through as before.
+                fit_free = 0.90 * total + model_manager.GPU_MEM_UTIL_BUFFER_MIB
+                self.assertEqual(
+                    min(0.90, model_manager.MODEL_GPU_MEM_UTIL[name]),
+                    self._util(name, total, fit_free),
+                )
+
+    def test_min_free_gate_covers_the_floor_plus_margin(self) -> None:
+        # MODEL_MIN_FREE_GIB runs first; it must not be looser than the floor
+        # the util calculation enforces, on any card.
+        for name, min_free in model_manager.MODEL_MIN_FREE_GIB.items():
+            if name not in model_manager.MODEL_MIN_VIABLE_GIB:
+                continue
+            with self.subTest(model=name):
+                self.assertGreaterEqual(
+                    min_free,
+                    model_manager.MODEL_MIN_VIABLE_GIB[name]
+                    + model_manager.HARD_MARGIN_MIB / 1024.0,
                 )
 
 

@@ -103,10 +103,13 @@ With four replicas, all four cards averaged 97% utilization, 246–250 W (the ca
 GPU 4 shares the card with a colleague's mmpose and ComfyUI (2.6 GB). model_manager sized that replica
 to util 0.904 from the 36.9 GiB that was free.
 
-A fifth replica on GPU 1 (29.5 GiB free next to NeoHorse) was refused: the 27B's minimum is a
+A fifth replica on GPU 1 (29.5 GiB free next to NeoHorse) was refused: the 27B's minimum was a
 utilization fraction (0.78) calibrated on the 32 GB 5090, which is 31.2 GiB on a 40 GB card even
-though the model's real footprint did not grow. GPU 0 and GPU 2 are full with other teams'
-services. Expressing the minimum in GiB would make GPU 1 usable (5 of 7 cards).
+though the model's real footprint did not grow. The minimum is now in GiB (`MODEL_MIN_VIABLE_GIB`,
+24.83 GiB for the 27B) and is converted to a utilization from each card's total, so on the A100 it
+is 0.621 and GPU 1 qualifies (needs 25.1 GiB free with the margin; 5 of 7 cards). On the 5090 the
+GiB values give back exactly the old 0.84 / 0.78 / 0.095. GPU 0 and GPU 2 are full with other
+teams' services.
 
 MTP stays on: it makes single-stream decode 1.43× faster and is equal at 16 concurrent; it only
 loses at 64 concurrent (−15%), which the 8-seq slot limit never reaches.

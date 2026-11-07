@@ -92,7 +92,7 @@ class ModelConfigTests(unittest.TestCase):
         self.assertEqual(300, cfg.idle_timeout)
         self.assertIn(ASR, model_manager.MODEL_GPU_MEM_UTIL)
         self.assertLess(
-            model_manager.MODEL_MIN_GPU_MEM_UTIL[ASR],
+            model_manager._min_viable_util(ASR, TOTAL_MIB),
             model_manager.MODEL_GPU_MEM_UTIL[ASR],
         )
 
@@ -101,8 +101,7 @@ class BudgetPlacementTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.router = _router()
         self.floor_mib = (
-            model_manager.MODEL_MIN_GPU_MEM_UTIL.get(ASR, model_manager.GPU_MEM_UTIL_FLOOR)
-            * TOTAL_MIB + model_manager.CORESIDENT_OVERHEAD_MIB
+            model_manager._min_viable_util(ASR, TOTAL_MIB) * TOTAL_MIB + model_manager.CORESIDENT_OVERHEAD_MIB
         )
 
     def _pick(self, free, model=ASR):
@@ -166,8 +165,7 @@ class BudgetPlacementTests(unittest.IsolatedAsyncioTestCase):
         _fake_backend(self.router, ASR, lane, ready=False, running=False)
         reserved = model_manager.MODEL_GPU_MEM_UTIL[ASR] * TOTAL_MIB
         need_b = (
-            model_manager.MODEL_MIN_GPU_MEM_UTIL.get(SMALL_B, model_manager.GPU_MEM_UTIL_FLOOR)
-            * TOTAL_MIB + model_manager.CORESIDENT_OVERHEAD_MIB
+            model_manager._min_viable_util(SMALL_B, TOTAL_MIB) * TOTAL_MIB + model_manager.CORESIDENT_OVERHEAD_MIB
         )
         router = _router([GpuSlot(0, 0, 9000)])
         lane = router._lane_slot(ASR, 0)
@@ -273,13 +271,13 @@ class SpawnUtilTests(unittest.TestCase):
             return b._gpu_mem_util_for_spawn()
 
     def test_coresident_never_clamps_up_into_the_context_overhead(self):
-        floor = model_manager.MODEL_MIN_GPU_MEM_UTIL[ASR] * TOTAL_MIB
+        floor = model_manager._min_viable_util(ASR, TOTAL_MIB) * TOTAL_MIB
         # enough for the floor plus the old 256 MiB margin, but not for the context
         with self.assertRaisesRegex(RuntimeError, "too tight"):
             self._util(ASR, floor + model_manager.HARD_MARGIN_MIB + 10, True)
         # with the context overhead available, the floor is granted
         self.assertEqual(
-            model_manager.MODEL_MIN_GPU_MEM_UTIL[ASR],
+            model_manager._min_viable_util(ASR, TOTAL_MIB),
             self._util(ASR, floor + model_manager.CORESIDENT_OVERHEAD_MIB, True),
         )
 
@@ -295,8 +293,7 @@ class PrimaryYieldsTests(unittest.IsolatedAsyncioTestCase):
         self.primary = GpuBackend(CHAT, "run_chat.sh", CHAT, self.router.slots[1])
         self.primary.router = self.router
         need = (
-            model_manager.MODEL_MIN_GPU_MEM_UTIL.get(CHAT, model_manager.GPU_MEM_UTIL_FLOOR)
-            * TOTAL_MIB + model_manager.HARD_MARGIN_MIB
+            model_manager._min_viable_util(CHAT, TOTAL_MIB) * TOTAL_MIB + model_manager.HARD_MARGIN_MIB
         )
         self.need = need
 

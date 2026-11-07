@@ -8,6 +8,12 @@
   for one model. GPU4 has two slots, so its behaviour is unchanged.
 
 ### Fixed
+- A model's minimum viable VRAM is now in GiB (`MODEL_MIN_VIABLE_GIB`, replacing the fraction-of-card
+  `MODEL_MIN_GPU_MEM_UTIL`; the `GPU_MEM_UTIL_FLOOR` env fallback is now `MIN_VIABLE_GIB_FLOOR`) and is
+  turned into a utilization from each GPU's total. The fractions were calibrated on the 32 GB 5090, so
+  on a 40 GB A100 the 27B asked for 31.2 GiB and a card with 29.5 GiB free was refused; it now needs
+  24.83 GiB (util 0.621). The spawn util, co-resident admission and reclaim all use it. On GPU4's cards
+  the thresholds are unchanged (0.84 / 0.78 / 0.095).
 - A second scale-out could start while the first replica was still loading (the guard counted only
   ready replicas). Scale-out and its accrual now wait for in-flight spawns.
 - `/admin/kill|start|switch` answer 403 to non-loopback clients; :8002 is reachable over Tailscale

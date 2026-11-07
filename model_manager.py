@@ -34,6 +34,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -631,16 +632,17 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
 # Rule of thumb: gpu_memory_utilization × GPU_total_GiB + 1 GiB safety buffer.
 # If a model is not listed here no pre-check is performed (may evict & fail).
 MODEL_MIN_FREE_GIB: dict[str, float] = {
-    # Sized off the min-viable floor (0.84), not the preferred util:
+    # Sized off the min-viable floor (26.74 GiB), not the preferred util:
     # this gate runs before the VRAM-aware util calculation, so keying it to the
     # preferred value rejected any card that could still host the model at the
-    # floor.  0.84 × 31.8 GiB = 26.75 GiB, so 27.0 leaves 0.25 GiB of headroom —
+    # floor.  27.0 leaves 0.26 GiB over the floor —
     # deliberately thin, because every extra tenth here is a card this model can
     # no longer land on, and the util calculation downstream still refuses the
     # spawn if the floor genuinely does not fit.  A measured 27.29 GiB free (the
     # real contended-GPU-1 water line) has to pass: at 27.5 it did not.
-    # Keep in step with MODEL_MIN_GPU_MEM_UTIL — if the floor moves and this does
-    # not, the stricter of the two silently wins.
+    # Keep in step with MODEL_MIN_VIABLE_GIB — if the floor moves and this does
+    # not, the stricter of the two silently wins.  Both are GiB, so the pair
+    # holds on any card size.
     "qwen3.6-35b-a3b-heretic": 27.0,
     # Measured 2026-08-27 on a free GPU 1 at util 0.84 / max-model-len 65536:
     #   weights 16.74 GiB + KV 6.65 GiB (149,796 tok, 2.29x concurrency)
@@ -653,11 +655,11 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
     # vLLM's own message gives the rule: it needs free >= util x 31.36 GiB (its
     # view of total) plus ~0.5 GiB already taken by its own CUDA context.  At the
     # 0.78 floor that is 24.96 GiB.  This gate must sit above what the util
-    # calculation downstream will accept, which is 0.78 x 31.84 + 0.75 buffer =
-    # 25.59 GiB — stricter than vLLM's hard limit, so 25.6 is the binding number
+    # calculation downstream will accept, which is the 24.83 GiB floor + 0.75
+    # buffer = 25.58 GiB — stricter than vLLM's hard limit, so 25.6 is the binding number
     # and anything higher only costs placements.  27.5 (copied from 3.6-27b) and
     # 27.0 (reasoned by analogy to the 35B) both rejected cards this model starts
-    # on fine.  Re-measure if --max-model-len or MODEL_MIN_GPU_MEM_UTIL moves.
+    # on fine.  Re-measure if --max-model-len or MODEL_MIN_VIABLE_GIB moves.
     "qwen3.8-27b":     25.6,
     # Measured on an RTX 5090: the two-stage vLLM-Omni process settles at
     # ~29.3 GiB after Code2Wav CUDA-graph capture.  Require another 1 GiB so a
@@ -721,19 +723,28 @@ ASR_CPU_THREADS = os.environ.get("ASR_CPU_THREADS", "8")
 ASR_CPU_IDLE_SECONDS = float(os.environ.get("ASR_CPU_IDLE_SECONDS", "900"))
 ASR_HF_HOME = os.environ.get("ASR_HF_HOME", "/home/derek/models/qwen3-asr")
 
-# Per-model MINIMUM viable gpu_memory_utilization.  vLLM allocates: weights +
-# activations first, then *all remaining* budget (util×total − used) becomes the
-# KV cache.  Lowering util shrinks the KV cache, not the weights.  The 35B models
-# are hybrid Mamba+attention with a tiny KV cache even at 0.93 (~1.8 GiB); drop
-# util a little and KV allocation hits zero → vLLM dies ~40 s into startup with
-# "No available memory for the cache blocks".  So util can only be lowered within
-# a narrow safe band.  Below the floor we DON'T spawn: we raise immediately so the
-# failure is fast and legible (mirroring _check_gpu_free) instead of a slow OOM.
+# Per-model MINIMUM viable vLLM budget (GiB of util×total).  vLLM allocates:
+# weights + activations first, then *all remaining* budget (util×total − used)
+# becomes the KV cache.  Lowering util shrinks the KV cache, not the weights.  The
+# 35B models are hybrid Mamba+attention with a tiny KV cache even at 0.93
+# (~1.8 GiB); drop util a little and KV allocation hits zero → vLLM dies ~40 s
+# into startup with "No available memory for the cache blocks".  So util can only
+# be lowered within a narrow safe band.  Below the floor we DON'T spawn: we raise
+# immediately so the failure is fast and legible (mirroring _check_gpu_free)
+# instead of a slow OOM.
 #
-# Floors are empirical AND they move with --max-model-len.  The 0.90 here was
-# measured when 35B ran at max-model-len 122880, where KV really did collapse
-# just below it.  At the 81920 the run scripts now use it is far too
-# conservative: 0.84 measured on GPU 1 — the contended card — gives 169182 KV
+# The floor is in GiB, not a fraction of the card: weights, activations and the
+# KV a request needs do not grow with the card.  These were util floors
+# calibrated on the 31.84 GiB (32607 MiB) RTX 5090; as fractions they demanded
+# 31.2 GiB of a 40 GiB A100 for the 27B and refused a card with 29.5 GiB free.
+# Each value is the old util × 31.84 GiB rounded down to 0.01 GiB, so
+# _min_viable_util() — which rounds UP to 0.001 — gives back exactly 0.84 / 0.78
+# / 0.095 on a 5090.
+#
+# Floors are empirical AND they move with --max-model-len.  The 35B's 0.90 was
+# measured when it ran at max-model-len 122880, where KV really did collapse just
+# below it.  At the 81920 the run scripts now use it is far too conservative:
+# 0.84 (26.74 GiB) measured on GPU 1 — the contended card — gives 169182 KV
 # tokens, 2.07x a full-length request and ~10x what max-num-seqs 16 needs at the
 # ~6k-token median.  Verified serving a real completion, not merely starting.
 #
@@ -741,21 +752,29 @@ ASR_HF_HOME = os.environ.get("ASR_HF_HOME", "/home/derek/models/qwen3-asr")
 # card.  GPU 1 is shared with video-transcribe-service and an embedding provider
 # (~3-4 GiB between them), leaving ~28 GiB free — just under 0.90's 28.9 GiB, so
 # every spawn there was refused as "too tight" although the model fits fine.
-# 0.84 needs 26.8 GiB and tolerates ~4.8 GiB of neighbours.
+# 26.74 GiB tolerates ~4.8 GiB of neighbours on a 5090.
 #
 # Re-measure if --max-model-len changes again.  27B is dense with a normal KV
 # cache and tolerates more headroom.
-MODEL_MIN_GPU_MEM_UTIL: dict[str, float] = {
-    "qwen3.6-35b-a3b-heretic": 0.84,
-    "qwen3.8-27b":             0.78,
-    # KV at 0.10 is 0.37 GiB and one 1536-token request needs ~0.17 GiB, so the
-    # budget can shrink by ~0.15 GiB (0.005 of 32 GiB) before it starves: 0.095.
-    # 2 GiB (0.06) failed at startup.  Also the co-resident admission floor
-    # (see _pick_coresident_gpu).
-    "qwen3-asr-0.6b":          0.095,
+MODEL_MIN_VIABLE_GIB: dict[str, float] = {
+    "qwen3.6-35b-a3b-heretic": 26.74,   # 0.84 on a 5090
+    "qwen3.8-27b":             24.83,   # 0.78 on a 5090
+    # KV at util 0.10 is 0.37 GiB and one 1536-token request needs ~0.17 GiB, so
+    # the budget can shrink by ~0.15 GiB before it starves: 3.02 GiB (0.095 on a
+    # 5090).  2 GiB (0.06) failed at startup.  Also the co-resident admission
+    # floor (see _pick_coresident_gpu).
+    "qwen3-asr-0.6b":          3.02,
 }
 # Fallback floor for models not listed above (best-effort attempt, not fail-fast).
-GPU_MEM_UTIL_FLOOR = float(os.environ.get("GPU_MEM_UTIL_FLOOR", "0.78"))
+MIN_VIABLE_GIB_FLOOR = float(os.environ.get("MIN_VIABLE_GIB_FLOOR", "24.83"))
+
+
+def _min_viable_util(model_name: str, total_mib: float) -> float:
+    """The model's min-viable budget as a gpu_memory_utilization on a card with
+    total_mib, rounded up to 0.001 so util×total never falls short of it."""
+    gib = MODEL_MIN_VIABLE_GIB.get(model_name, MIN_VIABLE_GIB_FLOOR)
+    # round() first: a value that is exactly on a 0.001 step must not ceil past it.
+    return math.ceil(round(gib * 1024.0 / total_mib * 1000.0, 6)) / 1000.0
 
 # Per-model default --max-model-len — mirrors the run scripts.  Needed so the
 # VRAM-aware max-len fallback knows the baseline before reducing it.  At the
@@ -1427,7 +1446,7 @@ class GpuBackend:
             )
             return default
 
-        min_viable = MODEL_MIN_GPU_MEM_UTIL.get(self.model_name, GPU_MEM_UTIL_FLOOR)
+        min_viable = _min_viable_util(self.model_name, total)
         fit  = (free - GPU_MEM_UTIL_BUFFER_MIB) / total
         util = round(min(default, fit), 3)
 
@@ -2303,7 +2322,7 @@ class DynamicRouter:
 
         The budget is the GPU's *current* free VRAM (nvidia-smi) minus what
         co-resident models still starting there will take, against the model's
-        min-viable util plus CORESIDENT_OVERHEAD_MIB (its CUDA context) — the same
+        min-viable footprint plus CORESIDENT_OVERHEAD_MIB (its CUDA context) — the same
         test the backend applies at spawn.  A GPU without a primary wins over one with more free VRAM, so
         a primary's replica keeps its room.  Raises GPUBusyError if none fits."""
         config = self.model_configs[model_name]
@@ -2311,7 +2330,6 @@ class DynamicRouter:
         gpus = sorted({
             s.gpu_id for s in self.slots if allowed is None or s.gpu_id in allowed
         })
-        min_util = MODEL_MIN_GPU_MEM_UTIL.get(model_name, GPU_MEM_UTIL_FLOOR)
         options: list[tuple[bool, float, int]] = []
         report: list[str] = []
         need_gib = 0.0
@@ -2322,12 +2340,12 @@ class DynamicRouter:
                 continue
             reserved = sum(
                 MODEL_GPU_MEM_UTIL.get(
-                    b.model_name,
-                    MODEL_MIN_GPU_MEM_UTIL.get(b.model_name, GPU_MEM_UTIL_FLOOR),
+                    b.model_name, _min_viable_util(b.model_name, total),
                 ) * total
                 for b in self._coresident_backends_on(gpu) if not b._ready
             )
             avail = free - reserved
+            min_util = _min_viable_util(model_name, total)
             need = min_util * total + CORESIDENT_OVERHEAD_MIB
             need_gib = need / 1024.0
             report.append(f"GPU {gpu}: {avail / 1024.0:.1f} GiB free")
@@ -2339,7 +2357,7 @@ class DynamicRouter:
         if not options:
             raise GPUBusyError(
                 f"No GPU has room for '{model_name}': it needs >={need_gib:.1f} GiB "
-                f"free (min-viable util {min_util}); " + "; ".join(report) + ". "
+                f"free (min-viable {MODEL_MIN_VIABLE_GIB.get(model_name, MIN_VIABLE_GIB_FLOOR)} GiB); " + "; ".join(report) + ". "
                 f"Retry once a GPU frees up."
             )
         return min(options)[2]
@@ -2355,7 +2373,7 @@ class DynamicRouter:
 
     async def reclaim_coresident_for(self, primary: GpuBackend) -> None:
         """Primaries outrank co-resident models for VRAM.  If the primary about
-        to spawn on this GPU would not fit at its min-viable util, stop idle
+        to spawn on this GPU would not fit at its min-viable footprint, stop idle
         co-resident models there until it does.  Busy ones are left running (the
         spawn then fails as "too tight", as it would for any neighbour)."""
         gpu = primary.gpu_id
@@ -2369,8 +2387,7 @@ class DynamicRouter:
         if not total or free is None:
             return
         need = (
-            MODEL_MIN_GPU_MEM_UTIL.get(primary.model_name, GPU_MEM_UTIL_FLOOR) * total
-            + HARD_MARGIN_MIB
+            _min_viable_util(primary.model_name, total) * total + HARD_MARGIN_MIB
         )
         for victim in victims:
             if free >= need:

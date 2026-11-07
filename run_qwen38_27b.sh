@@ -56,8 +56,8 @@
 #
 # --limit-mm-per-prompt video:0 keeps video frames out of the profile too.
 # Floors re-measured with vision on and still valid: at the 0.78 util floor KV
-# is 6.05 GiB / 135,753 tok / 2.07x — no collapse, so MODEL_MIN_GPU_MEM_UTIL
-# and MODEL_MIN_FREE_GIB (25.6) stay as they are.
+# is 6.05 GiB / 135,753 tok / 2.07x — no collapse, so MODEL_MIN_VIABLE_GIB
+# (24.83, i.e. 0.78 on a 5090) and MODEL_MIN_FREE_GIB (25.6) stay as they are.
 # MODEL_HF_HOME / MODEL_CUDA_HOME let another host (the A100 region) point at
 # its own cache and toolkit; a plain HF_HOME is not honoured because the login
 # shell exports one that points at an empty cache.
