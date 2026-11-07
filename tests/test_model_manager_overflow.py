@@ -97,6 +97,41 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([1], self.proxied)
 
 
+class AdminActionsAreLoopbackOnlyTests(unittest.IsolatedAsyncioTestCase):
+    """The peer region reaches :8002 over Tailscale for overflow, and the peer
+    host is shared — its users must not be able to kill or switch our slots."""
+
+    async def asyncSetUp(self):
+        config = mm.ModelConfig(script="unused.sh", served_name="m", max_num_seqs=8)
+        self.router = mm.DynamicRouter([mm.GpuSlot(0, 0, 9000)], {"m": config})
+        self.killed: list[int] = []
+
+        async def admin_kill(slot_id):
+            self.killed.append(slot_id)
+
+        self.router.admin_kill = admin_kill
+        app = web.Application()
+        app.router.add_route("*", "/{path_info:.*}", self.router.handle)
+        self.client = TestClient(TestServer(app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+
+    async def test_remote_client_gets_403(self):
+        with patch.object(web.BaseRequest, "remote", "100.118.88.28"):
+            response = await self.client.post("/admin/kill", json={"slot_id": 0})
+        self.assertEqual(403, response.status)
+        await mm.asyncio.sleep(0)
+        self.assertEqual([], self.killed)
+
+    async def test_loopback_client_is_allowed(self):
+        response = await self.client.post("/admin/kill", json={"slot_id": 0})
+        self.assertEqual(200, response.status)
+        await mm.asyncio.sleep(0)
+        self.assertEqual([0], self.killed)
+
+
 class OverflowQueueSampleTests(unittest.IsolatedAsyncioTestCase):
     """The saturation sampler is what keeps _queue_waiting current."""
 

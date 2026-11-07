@@ -3010,6 +3010,11 @@ class DynamicRouter:
         if request.method == "POST" and request.path in (
             "/admin/kill", "/admin/start", "/admin/switch"
         ):
+            # The peer region reaches this port over Tailscale for overflow,
+            # from a host other people share; slot control stays local.
+            if request.remote not in ("127.0.0.1", "::1"):
+                return web.json_response(
+                    {"error": "admin actions are loopback-only"}, status=403)
             try:
                 data = await request.json()
                 slot_id = int(data["slot_id"])
