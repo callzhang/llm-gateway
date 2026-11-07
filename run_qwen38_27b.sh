@@ -58,14 +58,17 @@
 # Floors re-measured with vision on and still valid: at the 0.78 util floor KV
 # is 6.05 GiB / 135,753 tok / 2.07x — no collapse, so MODEL_MIN_GPU_MEM_UTIL
 # and MODEL_MIN_FREE_GIB (25.6) stay as they are.
-export HF_HOME=/home/stardust/.cache/huggingface
+# MODEL_HF_HOME / MODEL_CUDA_HOME let another host (the A100 region) point at
+# its own cache and toolkit; a plain HF_HOME is not honoured because the login
+# shell exports one that points at an empty cache.
+export HF_HOME=${MODEL_HF_HOME:-/home/stardust/.cache/huggingface}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=${VLLM_CUDA_DEVICE:-1}
 
 # MTP speculative decoding re-enabled 2026-09-11 on vLLM 0.29.0, which carries
 # the fix for vllm#34650 (spec decode desyncing xgrammar at the reasoning
 # boundary) — the bug that forced 490a648 to disable it on 0.25.1.
-export CUDA_HOME=/usr/local/cuda
+export CUDA_HOME=${MODEL_CUDA_HOME:-/usr/local/cuda}
 export PATH="$CUDA_HOME/bin:$PATH"
 export PYTHONNOUSERSITE=1
 VLLM_BIN=${VLLM_BIN:-/home/derek/miniforge3/envs/llm-gateway-vllm/bin/vllm}

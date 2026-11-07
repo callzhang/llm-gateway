@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-07
+
+### Added
+- Cross-region overflow in `model_manager`: with `OVERFLOW_QUEUE_DEPTH=N` (default 0 = off), new chat
+  work for a model whose summed vLLM queue has reached N gets a `503 queue_overflow`, so LiteLLM's
+  order-2 deployment (the other region's gateway) takes it. Sticky hits stay local for their prefix
+  cache, and a request carrying `x-gateway-overflow` (set by the peer's deployment) is always served,
+  so the two regions cannot bounce a request between them.
+
 ## 2026-11-03
 
 ### Added

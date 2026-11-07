@@ -1,0 +1,31 @@
+[Unit]
+Description=LLM Gateway (CN region, A100) — model_manager (spawns/unloads vLLM on demand, :8002)
+# No After=default.target: llm-gateway.target is WantedBy=default.target, so
+# that line closed an ordering cycle which systemd broke by silently deleting
+# this service's start job — the stack came up without model_manager.
+PartOf=llm-gateway.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/derek/llm-gateway
+EnvironmentFile=-/data/derek/llm-gateway/gateway.env
+ExecStart=/data/derek/llm-gateway/run_model_manager.sh
+# process (not control-group): on stop/restart, signal ONLY model_manager, not
+# its vLLM children.  model_manager's SIGTERM handler leaves the vLLM backends
+# running and re-adopts them on next start (adopt_existing_backends), so a
+# restart doesn't force a ~90s cold start.  Trade-off: `systemctl stop` leaves
+# vLLM running until the next start adopts it (or you kill it manually).
+KillMode=process
+KillSignal=SIGTERM
+# A serialized full eval can hold the shared host lock for longer than two
+# minutes. model_manager waits for that lock before stopping so a deployment
+# cannot take the gateway out from under an active eval.
+TimeoutStopSec=7200
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=30
+StandardOutput=append:/data/derek/llm-gateway/logs/model_manager.log
+StandardError=append:/data/derek/llm-gateway/logs/model_manager.log
+
+[Install]
+WantedBy=llm-gateway.target

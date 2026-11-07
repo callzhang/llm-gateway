@@ -1,0 +1,17 @@
+[Unit]
+Description=LiteLLM Postgres for the CN region (A100) over Tailscale only
+# The CN LiteLLM shares this region's database so one virtual key works from
+# both entrances (docs/region-cn.md).  Postgres itself stays on 127.0.0.1:5433;
+# this socket forwards one Tailscale address to it, and the BPF filter below
+# drops every other source — ufw cannot, because tailscale0 traffic is
+# accepted by ts-input before ufw sees it.
+After=tailscaled.service
+
+[Socket]
+ListenStream=100.93.145.69:5433
+FreeBind=true
+IPAddressDeny=any
+IPAddressAllow=100.118.88.28
+
+[Install]
+WantedBy=sockets.target

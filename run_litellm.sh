@@ -2,7 +2,9 @@
 # Run LiteLLM proxy — foreground for systemd
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONNOUSERSITE=1
-export PATH="/home/derek/miniforge3/envs/llm-gateway-vllm/bin:$PATH"   # make prisma CLI visible for schema migration
+# GATEWAY_PY_BIN: the env holding litellm + prisma; another region sets its own.
+GATEWAY_PY_BIN=${GATEWAY_PY_BIN:-/home/derek/miniforge3/envs/llm-gateway-vllm/bin}
+export PATH="$GATEWAY_PY_BIN:$PATH"   # make prisma CLI visible for schema migration
 # No fallback default: the key must come from gateway.env (gitignored).  A
 # hardcoded default here is a tracked file in a PUBLIC repo, so it would be a
 # published credential the moment gateway.env is missing.
@@ -15,7 +17,8 @@ export LITELLM_MASTER_KEY
 # Direct LAN access is closed by ufw (default DROP, no rule for 8900), NOT by
 # the bind address.  Public traffic arrives only via llm-api.preseen.ai through
 # the cloudflared tunnel, authenticated by a LiteLLM virtual key.
-exec "/home/derek/miniforge3/envs/llm-gateway-vllm/bin/litellm" \
-  --config "$SCRIPT_DIR/config.yaml" \
+# LITELLM_CONFIG: each region has its own model list (config.cn.yaml on the A100).
+exec "$GATEWAY_PY_BIN/litellm" \
+  --config "$SCRIPT_DIR/${LITELLM_CONFIG:-config.yaml}" \
   --port 8900 \
   --host 0.0.0.0

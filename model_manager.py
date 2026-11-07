@@ -125,6 +125,15 @@ def _scale_sustain_for(waiting: int) -> "float | None":
         if waiting >= depth:
             return secs
     return None
+# Cross-region overflow.  Each region runs its own gateway stack, and each
+# LiteLLM lists the other region's gateway as an order-2 deployment of the same
+# model; a 503 here is what moves a request across the border.  New chat work
+# is turned away once the model's summed vLLM queue (the saturation sampler's
+# last reading) reaches this depth.  Sticky hits stay to keep their prefix
+# cache, and a request carrying OVERFLOW_HEADER (set by the peer's deployment)
+# already crossed once and is always served.  0 disables it.
+OVERFLOW_QUEUE_DEPTH = int(os.environ.get("OVERFLOW_QUEUE_DEPTH", "0"))
+OVERFLOW_HEADER = "x-gateway-overflow"
 # Extra replicas (a model running on >1 slot) idle out faster than the primary so
 # a borrowed slot is returned to its evicted model promptly (asymmetric scale-in).
 REPLICA_IDLE_TIMEOUT = int(os.environ.get("REPLICA_IDLE_TIMEOUT", "120"))
@@ -2214,6 +2223,8 @@ class DynamicRouter:
         # request across all its instances.  Scale-in reads this so a replica
         # is not reclaimed during a lull between bursts (see _idle_loop).
         self._last_backlog_at: dict[str, float] = {}
+        # Latest summed queue depth per running model, for OVERFLOW_QUEUE_DEPTH.
+        self._queue_waiting: dict[str, int] = {}
         # Monotonic time of the previous saturation sample, for the accrual dt.
         self._sat_last_tick: float = 0.0
         self._sat_task: asyncio.Task | None = None
@@ -2906,6 +2917,7 @@ class DynamicRouter:
                     if not running:
                         self._scale_accrual.pop(model_name, None)
                         self._last_backlog_at.pop(model_name, None)
+                        self._queue_waiting.pop(model_name, None)
                         continue
                     try:
                         depths = await asyncio.gather(
@@ -2914,6 +2926,7 @@ class DynamicRouter:
                     except Exception:
                         continue
                     waiting = sum(depths)
+                    self._queue_waiting[model_name] = waiting
                     # Stamp model-wide backlog on EVERY sample, including while
                     # scaled out — scale-in reads this to avoid reclaiming a
                     # replica during a lull between bursts.
@@ -2997,6 +3010,11 @@ class DynamicRouter:
         if request.method == "POST" and request.path in (
             "/admin/kill", "/admin/start", "/admin/switch"
         ):
+            # The peer region reaches this port over Tailscale for overflow,
+            # from a host other people share; slot control stays local.
+            if request.remote not in ("127.0.0.1", "::1"):
+                return web.json_response(
+                    {"error": "admin actions are loopback-only"}, status=403)
             try:
                 data = await request.json()
                 slot_id = int(data["slot_id"])
@@ -3168,6 +3186,27 @@ class DynamicRouter:
             if sticky_backend is not None:
                 backend = sticky_backend
             else:
+                waiting = self._queue_waiting.get(model_name, 0)
+                if (
+                    OVERFLOW_QUEUE_DEPTH
+                    and config.request_kind == "chat"
+                    and OVERFLOW_HEADER not in request.headers
+                    and waiting >= OVERFLOW_QUEUE_DEPTH
+                ):
+                    self.log.info(
+                        f"Overflow: {model_name} waiting={waiting} ≥ "
+                        f"{OVERFLOW_QUEUE_DEPTH} — 503 so LiteLLM tries the peer region"
+                    )
+                    return web.Response(
+                        status=503, content_type="application/json",
+                        body=json.dumps({"error": {
+                            "message": (
+                                f"'{model_name}' has {waiting} requests queued here; "
+                                "send it to the other region."
+                            ),
+                            "type": "queue_overflow",
+                        }}),
+                    )
                 backend = self._pick(backends)
                 # Scale-out is decided by the background saturation monitor based
                 # on vLLM's sustained real queue — not triggered per request here.

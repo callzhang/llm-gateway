@@ -48,7 +48,11 @@ model_list:
       # drop_params would otherwise drop reasoning_effort for custom_openai, and
       # every request ran at the template default (xhigh) whatever it asked for.
       allowed_openai_params: ["reasoning_effort"]
-    model_info:
+      # Local GPUs first.  model_manager answers 503 queue_overflow once the
+      # local queue reaches OVERFLOW_QUEUE_DEPTH (gateway.env), and only then
+      # does LiteLLM move on to order 2 below — see docs/region-cn.md.
+      order: 1
+    model_info: &qwen38_27b_info
       # Must match --max-model-len in run_qwen38_27b.sh (raised 65536→131072
       # on 2026-09-02; model native is 262144).
       max_input_tokens: 131072
@@ -63,6 +67,24 @@ model_list:
       reasoning_effort:
         levels: [xhigh, medium, low]
         aliases: {high: xhigh, minimal: low}
+
+  # Overflow: the other region's model_manager (A100, China) over Tailscale,
+  # same weights and revision.  Reached only after order 1 answers 503.  The
+  # header tells the peer this request already crossed once, so it is queued
+  # there rather than bounced back.  The peer's context_fit applies the same
+  # limits (model_info is shared through the anchor).
+  - model_name: qwen3.8-27b
+    litellm_params:
+      model: custom_openai/qwen3.8-27b
+      api_base: os.environ/PEER_GATEWAY_API_BASE
+      api_key: local-qwen36
+      max_tokens: 32768
+      timeout: 600
+      stream_timeout: 600
+      allowed_openai_params: ["reasoning_effort"]
+      extra_headers: {x-gateway-overflow: "1"}
+      order: 2
+    model_info: *qwen38_27b_info
 
   # ── Qwen3-TTS 1.7B CustomVoice (preset voices + instructions) ──────────
   # LiteLLM 1.86.2 was verified to preserve model, voice, instructions, and
@@ -101,6 +123,10 @@ router_settings:
   routing_strategy: latency-based-routing   # probes are intercepted by model_manager: cold models → 503 (no spawn), warm models → real latency measured
   num_retries: 0          # cold-starts block in model_manager — retries don't help
   retry_after: 0
+  # A queue_overflow 503 from order 1 is load shedding, not a sick backend.
+  # With cooldowns on, a few of them would bench the local deployment and send
+  # ALL traffic (sticky conversations included) across the border.
+  disable_cooldowns: true
 
 litellm_settings:
   drop_params: true
