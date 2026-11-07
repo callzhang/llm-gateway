@@ -180,7 +180,13 @@ restarting `llm-litellm` after editing one.
 
 ### Scale-out threshold
 
-Scale-out only fires when **total concurrent active requests ≥ 2**. A single background health-check from LiteLLM is not enough to trigger a second GPU spawn. This prevents runaway GPU usage for low-load scenarios.
+Scale-out is driven by vLLM's real queue (`num_requests_waiting`, summed over a model's replicas),
+sampled every 10s into a sliding-window accumulator (`SCALE_OUT_TIERS`, default `4:100,3:200,2:300`
+= depth:seconds, window `SCALE_WINDOW`=900s). Each firing adds **one more replica** on the emptiest
+free slot with room; there is no fixed replica cap, so the 7-GPU A100 region can grow a model past two
+GPUs. Only one spawn is in flight per model: while a replica is still starting there is no accrual.
+Extra replicas (every one but the lowest slot) shed after `REPLICA_IDLE_TIMEOUT` once the model has
+been quiet for `REPLICA_QUIET_BEFORE_RECLAIM`.
 
 ## Public-facing stack (Open WebUI + systemd target + tunnel)
 

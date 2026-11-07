@@ -81,7 +81,7 @@ EVAL_LOCK_FILE = os.environ.get(
 )
 
 # ── Scale-out gating (weighted backlog accumulator) ──────────────────────────────
-# Scale a model onto a 2nd GPU based on its *real* internal queue
+# Scale a model onto one more GPU based on its *real* internal queue
 # (num_requests_waiting, summed across instances).  waiting > 0 already means vLLM
 # can't admit the request into the current batch (max_num_seqs reached or KV full)
 # — the instance is AT CAPACITY — so the depth of the backlog sets the urgency.
@@ -2723,8 +2723,11 @@ class DynamicRouter:
         running = self._running_backends(model_name)
         if not running:
             return
-        if len(running) > 1:
-            return   # already scaled out onto multiple slots
+        # One spawn at a time: a replica still starting is capacity already on
+        # its way, so the backlog that triggered this is not evidence yet.  The
+        # number of replicas is otherwise bounded only by free slots with room.
+        if len(self._claimed_backends(model_name)) > len(running):
+            return
 
         slot:    GpuSlot     | None = None
         new_b:   GpuBackend  | None = None
@@ -2734,8 +2737,8 @@ class DynamicRouter:
             running = self._running_backends(model_name)
             if not running:
                 return
-            if len(running) > 1:
-                return   # another scale-out already completed
+            if len(self._claimed_backends(model_name)) > len(running):
+                return   # another scale-out is mid-spawn
 
             running_slot_ids = {b.slot.slot_id for b in running}
             allowed = self._allowed_gpus(model_name)
@@ -2896,8 +2899,8 @@ class DynamicRouter:
         Time at a shallow depth counts proportionally toward a deeper threshold
         (waiting=2's 1/300-per-sec is 0.66× waiting=3's 1/200), and an oscillating
         backlog accumulates across drain/refill episodes inside the window instead
-        of resetting each time the queue momentarily empties.  Models already on
-        >1 slot, or with nothing running, are skipped.  Decided here on sustained
+        of resetting each time the queue momentarily empties.  Models with a
+        replica still starting, or with nothing running, are skipped.  Decided here on sustained
         real backlog, never on a transient in-flight spike."""
         SAMPLE = 10
         try:
@@ -2933,9 +2936,10 @@ class DynamicRouter:
                     if waiting > 0:
                         self._last_backlog_at[model_name] = now
 
-                    if len(running) != 1:
-                        # Already scaled out: no accrual (the backlog stamp
-                        # above is still what scale-in needs).
+                    if len(self._claimed_backends(model_name)) > len(running):
+                        # A replica is still starting: no accrual until it
+                        # serves (the backlog stamp above is still what
+                        # scale-in needs).
                         self._scale_accrual.pop(model_name, None)
                         continue
 

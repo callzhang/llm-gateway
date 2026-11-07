@@ -2,6 +2,17 @@
 
 ## 2026-11-07
 
+### Changed
+- Scale-out is no longer capped at two replicas. A model under sustained backlog adds one replica
+  per firing while a free slot with room exists, so the 7-GPU A100 region can use more than two GPUs
+  for one model. GPU4 has two slots, so its behaviour is unchanged.
+
+### Fixed
+- A second scale-out could start while the first replica was still loading (the guard counted only
+  ready replicas). Scale-out and its accrual now wait for in-flight spawns.
+- `/admin/kill|start|switch` answer 403 to non-loopback clients; :8002 is reachable over Tailscale
+  and the A100 peer is a shared host.
+
 ### Added
 - Cross-region overflow in `model_manager`: with `OVERFLOW_QUEUE_DEPTH=N` (default 0 = off), new chat
   work for a model whose summed vLLM queue has reached N gets a `503 queue_overflow`, so LiteLLM's
