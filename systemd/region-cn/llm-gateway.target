@@ -1,0 +1,9 @@
+[Unit]
+Description=LLM Gateway (CN region, A100) — model-manager · litellm · cloudflared replica
+# The CN region serves qwen3.8-27b on the shared A100 host and borrows the US
+# region (GPU4) for every other model and for overflow; see docs/region-cn.md.
+Wants=llm-model-manager.service llm-litellm.service llm-cloudflared.service
+After=llm-model-manager.service llm-litellm.service
+
+[Install]
+WantedBy=default.target

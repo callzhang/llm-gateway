@@ -1,0 +1,19 @@
+[Unit]
+Description=LLM Gateway (CN region, A100) — LiteLLM proxy (:8900)
+After=llm-model-manager.service
+PartOf=llm-gateway.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/derek/llm-gateway
+EnvironmentFile=-/data/derek/llm-gateway/gateway.env
+ExecStart=/data/derek/llm-gateway/run_litellm.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=120
+TimeoutStopSec=30
+StandardOutput=append:/data/derek/llm-gateway/logs/litellm.log
+StandardError=append:/data/derek/llm-gateway/logs/litellm.log
+
+[Install]
+WantedBy=llm-gateway.target
