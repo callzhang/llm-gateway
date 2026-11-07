@@ -89,6 +89,25 @@ weight byte. That is why the card hits the power cap before it reaches the bandw
 Getting closer would mean a format Ampere dequantizes cheaply (AWQ/GPTQ INT4 Marlin), which gives
 up byte-identical weights with GPU4.
 
+## Multi-GPU scale-out (2026-11-07, 64 closed-loop clients, 2k-token prompts, 512 out, 25 min)
+
+| replicas | GPUs | out tok/s (30 s windows) |
+|---|---|---|
+| 1 | 3 | 270–340 |
+| 2 | 3, 5 | 580–666 |
+| 3 | 3, 5, 6 | 887–973 |
+| 4 | 3, 4, 5, 6 | 1195–1297 (steady ~1240) |
+
+3050 requests, 0 failures. Each new replica was ready 74 s after its spawn (warm compile cache).
+With four replicas, all four cards averaged 97% utilization, 246–250 W (the cap) and 38–39 GB of VRAM.
+GPU 4 shares the card with a colleague's mmpose and ComfyUI (2.6 GB). model_manager sized that replica
+to util 0.904 from the 36.9 GiB that was free.
+
+A fifth replica on GPU 1 (29.5 GiB free next to NeoHorse) was refused: the 27B's minimum is a
+utilization fraction (0.78) calibrated on the 32 GB 5090, which is 31.2 GiB on a 40 GB card even
+though the model's real footprint did not grow. GPU 0 and GPU 2 are full with other teams'
+services. Expressing the minimum in GiB would make GPU 1 usable (5 of 7 cards).
+
 MTP stays on: it makes single-stream decode 1.43× faster and is equal at 16 concurrent; it only
 loses at 64 concurrent (−15%), which the 8-seq slot limit never reaches.
 
