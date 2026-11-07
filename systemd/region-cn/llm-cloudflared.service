@@ -1,0 +1,20 @@
+[Unit]
+# CN replica of the llm-api-geo tunnel (scripts/llm_api_geo_tunnel.sh); the US
+# replica is llm-api-geo-cloudflared.service on GPU4.  Cloudflare sends each
+# request to the replica nearest the data center that received it.
+Description=LLM Gateway (CN region, A100) — Cloudflare replica of llm-api.preseen.ai
+PartOf=llm-gateway.target
+After=llm-litellm.service
+
+[Service]
+Type=simple
+# Token via env, never argv (other users on this host can read ps).
+EnvironmentFile=/data/derek/llm-gateway/cloudflared.env
+ExecStart=/data/derek/bin/cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:20260 run
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/data/derek/llm-gateway/logs/cloudflared.log
+StandardError=append:/data/derek/llm-gateway/logs/cloudflared.log
+
+[Install]
+WantedBy=llm-gateway.target

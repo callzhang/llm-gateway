@@ -1,0 +1,21 @@
+[Unit]
+# US replica of the llm-api-geo tunnel (scripts/llm_api_geo_tunnel.sh).  The
+# CN replica runs on the A100 host (systemd/region-cn/llm-cloudflared.service).
+# Separate from preseen-gateway on purpose: a replica serves every hostname of
+# its tunnel, and this one must only carry llm-api.
+Description=Cloudflare tunnel (llm-api-geo) — US replica of llm-api.preseen.ai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Token via env (not argv) so other local users cannot read it from ps.
+EnvironmentFile=/etc/cloudflared/llm-api-geo.env
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:20260 run
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=60
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
