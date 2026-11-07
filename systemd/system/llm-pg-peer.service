@@ -1,0 +1,9 @@
+[Unit]
+Description=Forward llm-pg-peer.socket to the local LiteLLM Postgres
+Requires=llm-pg-peer.socket
+After=llm-pg-peer.socket postgresql@16-main.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:5433
+DynamicUser=yes
+PrivateTmp=yes
