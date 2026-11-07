@@ -604,6 +604,24 @@ This requires a Postgres `DATABASE_URL` in the environment. The `custom_openai/`
 
 > **Limitation:** `previous_response_id` (conversation continuity across API calls) is not supported for `custom_openai/` providers in LiteLLM ≤ 1.85.x. The chat-provider bridge ignores it with a debug log. vLLM uses chat/completions natively and has no Responses API session storage. Clients that need multi-turn continuity must send the full conversation history in `messages[]` on each request.
 
+## Tests
+
+Two suites, one per interpreter.  `tests/` covers the gateway (model_manager, hooks, ASR, TTS access)
+and runs in the gateway env:
+
+```bash
+env -u HF_HUB_CACHE -u TRANSFORMERS_CACHE -u HF_HOME \
+  ~/miniforge3/envs/llm-gateway-vllm/bin/python -m unittest discover -s tests -q
+```
+
+`tests_vllm/` covers `patches/qwen3_engine_tool_parser.py`, which is installed into the vLLM that
+serves the models (vLLM 0.29: `llm-gateway-vllm-029` on GPU4, `/data/derek/venv-vllm029` on the A100),
+so it runs with that vLLM's interpreter.  `scripts/install_qwen_parser.sh` runs it before installing:
+
+```bash
+VLLM_BIN=~/miniforge3/envs/llm-gateway-vllm-029/bin/vllm scripts/install_qwen_parser.sh
+```
+
 ## Tested with
 
 - vLLM 0.19.0

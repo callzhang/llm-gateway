@@ -14,6 +14,14 @@
   on a 40 GB A100 the 27B asked for 31.2 GiB and a card with 29.5 GiB free was refused; it now needs
   24.83 GiB (util 0.621). The spawn util, co-resident admission and reclaim all use it. On GPU4's cards
   the thresholds are unchanged (0.84 / 0.78 / 0.095).
+- The CN region's vLLM (`/data/derek/venv-vllm029`) still had the stock Qwen tool parser. For a Responses
+  request with tools, `tool_choice: auto` and a JSON-schema `text.format`, the stock parser adds no tool
+  grammar (it needs `VLLM_ENFORCE_STRICT_TOOL_CALLING`, set in neither region), so the schema alone
+  constrains the output and the model cannot call a tool: told to call `read_source`, A100 answered JSON
+  3/3 times while GPU4 (patched 2026-10-25) called it 3/3. `scripts/install_qwen_parser.sh` installs `patches/qwen3_engine_tool_parser.py`
+  into a given `VLLM_BIN`, after its tests pass under that interpreter, and it is installed on the A100.
+- `test_qwen_native_output_grammar` moved to `tests_vllm/`: it tests a vLLM 0.29 patch and errored
+  under the gateway env's vLLM 0.25.1, so `tests/` is now green in the gateway env.
 - A second scale-out could start while the first replica was still loading (the guard counted only
   ready replicas). Scale-out and its accrual now wait for in-flight spawns.
 - `/admin/kill|start|switch` answer 403 to non-loopback clients; :8002 is reachable over Tailscale

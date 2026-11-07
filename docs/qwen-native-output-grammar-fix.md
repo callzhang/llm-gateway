@@ -15,7 +15,10 @@ JSON after reasoning failed, tools and strict negatives passed. After fix all
 three test methods pass, including positive tool/JSON with and without reasoning,
 wrong JSON value/key and unknown tool negatives.
 
-Source: patches/qwen3_engine_tool_parser.py. Canary uses an isolated package
+Source: patches/qwen3_engine_tool_parser.py. Its test is `tests_vllm/`, run with the serving
+vLLM's interpreter: the patch uses vLLM 0.29's `ResponsesRequest.extract_structured_outputs`, which the
+gateway env's vLLM 0.25.1 does not have. Install with `scripts/install_qwen_parser.sh` (tests first,
+one `.orig` backup, byte compare after); new backends load it, running ones keep the old parser. Canary uses an isolated package
 view under a task-owned /tmp directory: normal vLLM modules link to the installed
 package, while the candidate parser and its bytecode directory are private. The
 current backend's argv/checkpoint/auth are reused in memory, with GPU0/private
@@ -58,3 +61,13 @@ strict no_action, native session01a171f1-acc3-7b62-9074-53cf042d5a75. No inferen
 bounded observation, not an atomic-drain or future-error guarantee. Private
 canary stopped and overlay removed. CEO activation evidence lives in its
 agent-optimization-final-acceptance document.
+
+## CN region (2026-11-07)
+
+The A100's `/data/derek/venv-vllm029` was set up after this release and still carried the stock
+parser (sha256 3cf83a2a…). Without `VLLM_ENFORCE_STRICT_TOOL_CALLING` (unset in both regions) the
+stock `get_structural_tag` returns None, so the request keeps only its `text.format` schema and the
+model cannot emit a tool call at all. Same probe (tools + `tool_choice: auto` + json_schema, prompt
+telling it to call `read_source`): A100 stock answered `{"ok": true}` 3/3, GPU4 patched called
+`read_source` 3/3. A prompt saying no tool is needed got `{"ok": true}` after reasoning on both. It was installed there
+with `scripts/install_qwen_parser.sh` while no 27B backend was running, so the next spawn loads it.

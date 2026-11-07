@@ -122,7 +122,9 @@ ssh a100-1 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user status llm-model
 
 Deploying to the A100: `git archive HEAD | ssh a100-1 'tar -x -C /data/derek/llm-gateway'`, then
 restart the unit. model_manager keeps and re-adopts its vLLM children across a restart, as on GPU4.
-The A100 `gateway.env` is not tracked. Its variables are `GPU_PORT_BASE`,
+After a deploy that changes `patches/qwen3_engine_tool_parser.py`, run
+`VLLM_BIN=/data/derek/venv-vllm029/bin/vllm scripts/install_qwen_parser.sh` there (see
+`docs/qwen-native-output-grammar-fix.md`). The A100 `gateway.env` is not tracked. Its variables are `GPU_PORT_BASE`,
 `GPU_CORESIDENT_PORT_BASE`, `LISTEN_HOST`, `PYTHON_BIN`, `VLLM_BIN`, `MODEL_HF_HOME`,
 `MODEL_CUDA_HOME`, `PATH`, `MAX_JOBS`, `WAKE_TIMEOUT`, `OVERFLOW_QUEUE_DEPTH`, `HF_HOME`,
 `HF_HUB_OFFLINE`, `LITELLM_CONFIG`, `LOCAL_GATEWAY_API_BASE`, `PEER_GATEWAY_API_BASE`,
