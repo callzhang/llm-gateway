@@ -13,12 +13,15 @@ export LITELLM_MASTER_KEY
 # No OPENAI_API_KEY: every model in config.yaml is served locally via
 # model_manager on 127.0.0.1:8002.  There is deliberately no external fallback.
 
-# Binds 0.0.0.0 so the Cloudflare tunnel and loopback clients can both reach it.
-# Direct LAN access is closed by ufw (default DROP, no rule for 8900), NOT by
-# the bind address.  Public traffic arrives only via llm-api.preseen.ai through
-# the cloudflared tunnel, authenticated by a LiteLLM virtual key.
+# GPU4 binds 0.0.0.0 so the Cloudflare tunnel and loopback clients can both
+# reach it.  Direct LAN access is closed by ufw (default DROP, no rule for
+# 8900), NOT by the bind address.  Public traffic arrives only via
+# llm-api.preseen.ai through the cloudflared tunnel, authenticated by a LiteLLM
+# virtual key.  The A100 host has no host firewall and other users on its LAN,
+# so it sets LITELLM_HOST=127.0.0.1; its direct entrance is the TLS proxy
+# (deploy/Caddyfile.cn), which carries the source-IP allowlist.
 # LITELLM_CONFIG: each region has its own model list (config.cn.yaml on the A100).
 exec "$GATEWAY_PY_BIN/litellm" \
   --config "$SCRIPT_DIR/${LITELLM_CONFIG:-config.yaml}" \
   --port 8900 \
-  --host 0.0.0.0
+  --host "${LITELLM_HOST:-0.0.0.0}"

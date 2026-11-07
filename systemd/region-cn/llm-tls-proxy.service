@@ -1,0 +1,21 @@
+[Unit]
+# Direct TLS entrance for CN services (systemd/region-cn/Caddyfile).  LiteLLM
+# itself listens on loopback only on this host.
+Description=LLM Gateway (CN region, A100) — TLS entrance for direct CN clients
+PartOf=llm-gateway.target
+After=llm-litellm.service
+
+[Service]
+Type=simple
+EnvironmentFile=/data/derek/llm-gateway/gateway.env
+# Keep Caddy's autosave and data off the 96%-full root disk, inside the
+# mode-700 checkout (/data has a world-writable default ACL).
+Environment=XDG_CONFIG_HOME=/data/derek/llm-gateway/run XDG_DATA_HOME=/data/derek/llm-gateway/run
+ExecStart=/data/derek/bin/caddy run --adapter caddyfile --config /data/derek/llm-gateway/systemd/region-cn/Caddyfile
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/data/derek/llm-gateway/logs/tls-proxy.log
+StandardError=append:/data/derek/llm-gateway/logs/tls-proxy.log
+
+[Install]
+WantedBy=llm-gateway.target

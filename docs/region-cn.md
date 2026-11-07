@@ -13,7 +13,7 @@ only when its own queue is long.
 | LiteLLM config | `config.yaml` | `config.cn.yaml` (`LITELLM_CONFIG`) |
 | model_manager | `127.0.0.1` + tailnet `:8002` | Tailscale IP only `100.118.88.28:8002` |
 | Database | Postgres `127.0.0.1:5433` (owner) | the same database over `llm-pg-peer.socket`, role `litellm_cn` |
-| Public entrance | `llm-api.preseen.ai` (tunnel `preseen-gateway`) | `llm-api-geo.preseen.ai` (tunnel `llm-api-geo`, CN replica only) |
+| Public entrance | `llm-api.preseen.ai` (tunnel `preseen-gateway`) | `https://llm-cn.preseen.ai:18900` direct (Caddy TLS + source allowlist); `llm-api-geo.preseen.ai` (tunnel, slower, see below) |
 | Units | `systemd/*.service` (user), `systemd/system/llm-pg-peer.*` (root) | `systemd/region-cn/*` (user, linger on) |
 
 ## Request path
@@ -50,6 +50,33 @@ client ─► Cloudflare ─► tunnel ─► LiteLLM :8900 ──order 1──�
   and `llm-api-geo` runs only the CN replica. Deterministic splitting by visitor country needs
   Cloudflare Load Balancing geo steering (a paid add-on), or callers in China use
   `llm-api-geo.preseen.ai` explicitly.
+
+* **Cloudflare is the slow way into the A100.** The A100's overseas traffic leaves through a VPN
+  in Tokyo (egress `18.179.246.86`; domestic egress is the site NAT `27.221.10.54`), and its
+  tunnel connections register at LAX. Measured from the A100 on 2026-11-07, time to first byte
+  of `/health/liveliness` was 0.79–0.83 s via `llm-api` (to GPU4) and 0.96–1.13 s via
+  `llm-api-geo` (to the A100 itself). Geo steering on `llm-api` would make CN callers slower.
+
+## Direct entrance for CN services
+
+CN services call the A100 without Cloudflare or a border crossing:
+
+```
+CN service ─► https://llm-cn.preseen.ai:18900 ─► site NAT 27.221.10.54:18900 ─► A100 172.20.10.41:18900
+             (Caddy: TLS, CN_ALLOW_CIDRS) ─► LiteLLM 127.0.0.1:8900 ─► same routing as above
+```
+
+* LiteLLM on the A100 listens on loopback (`LITELLM_HOST=127.0.0.1`), because the host has no
+  firewall and other users share its LAN. Caddy (`systemd/region-cn/Caddyfile`, unit
+  `llm-tls-proxy`) is the only network-facing gateway port. Sources outside `CN_ALLOW_CIDRS`
+  get 403; callers still need a virtual key.
+* The certificate is issued on GPU4 by DNS-01 and pushed with `scripts/region_cn_tls.sh push`,
+  so the zone-wide Cloudflare token never reaches the shared host.
+* Check the source addresses in `logs/tls-proxy-access.log` once the NAT forward exists. If the
+  NAT rewrites sources to its own LAN address, the allowlist cannot tell callers apart.
+* Still to do: the NAT port forward (site network admin), the `llm-cn.preseen.ai` A record
+  (`scripts/region_cn_tls.sh dns`), a real certificate in place of the temporary self-signed one,
+  and the CN services' source ranges in `CN_ALLOW_CIDRS`.
 
 ## A100 specifics
 
@@ -123,8 +150,8 @@ The A100 `gateway.env` is not tracked. Its variables are `GPU_PORT_BASE`,
 `GPU_CORESIDENT_PORT_BASE`, `LISTEN_HOST`, `PYTHON_BIN`, `VLLM_BIN`, `MODEL_HF_HOME`,
 `MODEL_CUDA_HOME`, `PATH`, `MAX_JOBS`, `WAKE_TIMEOUT`, `OVERFLOW_QUEUE_DEPTH`, `HF_HOME`,
 `HF_HUB_OFFLINE`, `LITELLM_CONFIG`, `LOCAL_GATEWAY_API_BASE`, `PEER_GATEWAY_API_BASE`,
-`DATABASE_URL`, `DISABLE_SCHEMA_UPDATE`, `LITELLM_MASTER_KEY`, `GATEWAY_PY_BIN` and
-`PRISMA_BINARY_CACHE_DIR`.
+`DATABASE_URL`, `DISABLE_SCHEMA_UPDATE`, `LITELLM_MASTER_KEY`, `GATEWAY_PY_BIN`,
+`PRISMA_BINARY_CACHE_DIR`, `LITELLM_HOST`, `CN_TLS_HOST`, `CN_TLS_PORT` and `CN_ALLOW_CIDRS`.
 
 Rollback of overflow on GPU4: remove `OVERFLOW_QUEUE_DEPTH` and `PEER_GATEWAY_API_BASE` from
 `gateway.env` and the order-2 entry from `config.yaml`, then restart `llm-litellm` and
