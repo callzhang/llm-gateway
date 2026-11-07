@@ -33,7 +33,10 @@ from litellm.integrations.custom_logger import CustomLogger
 
 logger = logging.getLogger("litellm.reasoning_effort_hook")
 
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+# Same LITELLM_CONFIG that run_litellm.sh hands to LiteLLM (config.cn.yaml on the A100).
+_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), os.environ.get("LITELLM_CONFIG", "config.yaml")
+)
 
 
 def _load_policies(path: str) -> dict[str, tuple[frozenset[str], dict[str, str]]]:

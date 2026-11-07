@@ -1,0 +1,102 @@
+# LiteLLM config for the CN region (shared A100 host, see docs/region-cn.md).
+#
+# Same public contract as config.yaml: one key, one model list.  This region
+# serves qwen3.8-27b on its own GPUs and hands everything else to the US
+# region's model_manager (GPU4) over Tailscale.  Both LiteLLMs use the same
+# Postgres (on GPU4), so every virtual key, budget and previous_response_id
+# works from either entrance.
+#
+# LOCAL_GATEWAY_API_BASE  this host's model_manager (bound to its Tailscale IP)
+# PEER_GATEWAY_API_BASE   GPU4's model_manager
+# Keep the qwen3.8-27b model_info identical to config.yaml: it is the same
+# checkpoint, and context_fit on either side must cut to the same limits.
+model_list:
+
+  - model_name: qwen3.8-27b
+    litellm_params:
+      model: custom_openai/qwen3.8-27b
+      api_base: os.environ/LOCAL_GATEWAY_API_BASE
+      api_key: local-qwen36
+      max_tokens: 32768
+      timeout: 600
+      stream_timeout: 600
+      allowed_openai_params: ["reasoning_effort"]
+      order: 1
+    model_info: &qwen38_27b_info
+      max_input_tokens: 131072
+      max_output_tokens: 32768
+      tool_cap_tokens: 2000
+      tokenizer: gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090
+      tokenizer_revision: 35fd99fb8434ef70ee61372df3face5174bed2c8   # == --revision in run_qwen38_27b.sh
+      supports_vision: true
+      reasoning_effort:
+        levels: [xhigh, medium, low]
+        aliases: {high: xhigh, minimal: low}
+
+  # Overflow to the US region, reached only after order 1 answers 503
+  # queue_overflow.  The header keeps GPU4 from bouncing it back.
+  - model_name: qwen3.8-27b
+    litellm_params:
+      model: custom_openai/qwen3.8-27b
+      api_base: os.environ/PEER_GATEWAY_API_BASE
+      api_key: local-qwen36
+      max_tokens: 32768
+      timeout: 600
+      stream_timeout: 600
+      allowed_openai_params: ["reasoning_effort"]
+      extra_headers: {x-gateway-overflow: "1"}
+      order: 2
+    model_info: *qwen38_27b_info
+
+  # Served only in the US region.  No max_input_tokens here: GPU4's
+  # model_manager fits these against its own config.yaml, and leaving it out
+  # keeps this host from needing their tokenizers.
+  - model_name: qwen3.6-35b-a3b-heretic
+    litellm_params:
+      model: custom_openai/qwen3.6-35b-a3b-heretic
+      api_base: os.environ/PEER_GATEWAY_API_BASE
+      api_key: local-qwen36
+      max_tokens: 32768
+      timeout: 600
+      stream_timeout: 600
+    model_info:
+      max_output_tokens: 32768
+      supports_vision: true
+
+  - model_name: qwen3-tts-1.7b-customvoice
+    litellm_params:
+      model: hosted_vllm/qwen3-tts-1.7b-customvoice
+      api_base: os.environ/PEER_GATEWAY_API_BASE
+      api_key: local-qwen36
+      timeout: 600
+
+  - model_name: qwen3-asr
+    litellm_params:
+      model: openai/qwen3-asr-0.6b
+      api_base: os.environ/PEER_GATEWAY_API_BASE
+      api_key: local-qwen36
+      timeout: 1800
+    model_info:
+      mode: audio_transcription
+
+router_settings:
+  routing_strategy: latency-based-routing
+  num_retries: 0
+  retry_after: 0
+  # Same reason as config.yaml: a queue_overflow 503 must not bench order 1.
+  disable_cooldowns: true
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  callbacks:
+    - previous_response_hook.previous_response_history_hook
+    - reasoning_effort_hook.reasoning_effort_hook
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  cancel_on_disconnect: true
+  port: 8900
+  health_check_interval: 0
+  store_prompts_in_spend_logs: true
+  # The US LiteLLM runs the retention cleanup for the shared database.

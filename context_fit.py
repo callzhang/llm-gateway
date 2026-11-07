@@ -81,7 +81,11 @@ logger = logging.getLogger("mgr.context_fit")
 #                                 also registers it into litellm.model_cost
 #   litellm_params.max_tokens     output cap used when the request carries none
 #   model_info.tokenizer(+_revision)  HF repo of the tokenizer vLLM serves with
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+# LITELLM_CONFIG is the same variable run_litellm.sh reads, so both hops of a
+# region (config.cn.yaml on the A100) agree on the limits.
+CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), os.environ.get("LITELLM_CONFIG", "config.yaml")
+)
 _DEFAULT_OUT = 4096
 
 # Reserve for what the tokenizer cannot see (image tokens expand inside vLLM).
