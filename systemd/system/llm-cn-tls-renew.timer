@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily renewal check for the CN region's TLS certificate
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

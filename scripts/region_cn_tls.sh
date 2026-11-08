@@ -6,7 +6,10 @@
 # a CN client going through Cloudflare crosses the Pacific twice.
 #
 #   sudo -E scripts/region_cn_tls.sh dns    # once: DNS-only A record -> CN_PUBLIC_IP
+#   sudo scripts/region_cn_tls.sh renew     # issue, or renew within 30 days of expiry; push if changed
 #   scripts/region_cn_tls.sh push           # copy the cert in CERT_DIR to the A100, restart Caddy
+#
+# `renew` runs daily from llm-cn-tls-renew.timer (systemd/system).
 #
 # The certificate is issued here on GPU4, never on the A100: issuing needs the
 # Cloudflare API token (DNS:Edit on the whole zone), and six other users have
@@ -20,8 +23,32 @@ CF_ENV=${CF_ENV:-/home/stardust/preseen-ai-gateway/cf-api.env}
 CERT_DIR=${CERT_DIR:-/etc/llm-cn-tls/current}   # fullchain.pem + privkey.pem
 A100=${A100:-a100-1}
 A100_TLS_DIR=/data/derek/llm-gateway/tls
+LEGO_DIR=${LEGO_DIR:-/etc/llm-cn-tls/lego}
+PUSH_USER=${PUSH_USER:-derek}   # owns the ssh key that reaches the A100
 
 case "${1:-}" in
+  renew)
+    [ "$(id -u)" = 0 ] || { echo "renew runs as root (reads $CF_ENV, writes /etc)" >&2; exit 1; }
+    source "$CF_ENV"
+    : "${CLOUDFLARE_API_TOKEN:?missing in $CF_ENV}"
+    umask 077
+    mkdir -p "$LEGO_DIR" "$CERT_DIR"
+    before=$(sha256sum "$CERT_DIR/fullchain.pem" 2>/dev/null || true)
+    # `run` both issues and renews; it is a no-op until 30 days before expiry.
+    CLOUDFLARE_DNS_API_TOKEN=$CLOUDFLARE_API_TOKEN lego run --path "$LEGO_DIR" \
+      --accept-tos --domains "$HOST" --key-type EC256 --dns cloudflare \
+      --renew-days 30 --no-random-sleep
+    src=$(find "$LEGO_DIR" -name "$HOST.crt" -print -quit)
+    key=${src%.crt}.key
+    [ -s "$src" ] && [ -s "$key" ] || { echo "lego produced no $HOST.crt/.key under $LEGO_DIR" >&2; exit 1; }
+    install -m 600 "$src" "$CERT_DIR/fullchain.pem"
+    install -m 600 "$key" "$CERT_DIR/privkey.pem"
+    if [ "$before" != "$(sha256sum "$CERT_DIR/fullchain.pem")" ] || [ "${FORCE_PUSH:-}" = 1 ]; then
+      runuser -u "$PUSH_USER" -- "$0" push
+    else
+      echo "certificate unchanged; nothing to push"
+    fi
+    ;;
   dns)
     source "$CF_ENV"
     : "${CLOUDFLARE_API_TOKEN:?missing in $CF_ENV}"

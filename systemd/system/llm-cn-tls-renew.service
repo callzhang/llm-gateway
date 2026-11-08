@@ -1,0 +1,11 @@
+[Unit]
+# Renews the llm-cn.preseen.ai certificate (DNS-01 via Cloudflare) and pushes
+# it to the A100's Caddy when it changes.  Runs on GPU4 so the zone token never
+# leaves this host.  See scripts/region_cn_tls.sh.
+Description=Renew the CN region's direct-entrance TLS certificate
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/derek/Projects/llm-gateway/scripts/region_cn_tls.sh renew

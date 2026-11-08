@@ -70,13 +70,17 @@ CN service ─► https://llm-cn.preseen.ai:18900 ─► site NAT 27.221.10.54:1
   firewall and other users share its LAN. Caddy (`systemd/region-cn/Caddyfile`, unit
   `llm-tls-proxy`) is the only network-facing gateway port. Sources outside `CN_ALLOW_CIDRS`
   get 403; callers still need a virtual key.
-* The certificate is issued on GPU4 by DNS-01 and pushed with `scripts/region_cn_tls.sh push`,
+* The certificate (Let's Encrypt, EC256) is issued on GPU4 by DNS-01 with lego and pushed by
+  `sudo scripts/region_cn_tls.sh renew`, which is a no-op until 30 days before expiry. The daily
+  `llm-cn-tls-renew.timer` (`systemd/system`) runs it. It is issued on GPU4
   so the zone-wide Cloudflare token never reaches the shared host.
 * Check the source addresses in `logs/tls-proxy-access.log` once the NAT forward exists. If the
   NAT rewrites sources to its own LAN address, the allowlist cannot tell callers apart.
-* Still to do: the NAT port forward (site network admin), the `llm-cn.preseen.ai` A record
-  (`scripts/region_cn_tls.sh dns`), a real certificate in place of the temporary self-signed one,
-  and the CN services' source ranges in `CN_ALLOW_CIDRS`.
+* Done 2026-11-07: the `llm-cn.preseen.ai` A record (DNS only) and the first certificate,
+  valid to 2027-02-05. Still to do: the NAT port forward `27.221.10.54:18900 -> 172.20.10.41:18900`
+  (site network admin), the CN services' source ranges in `CN_ALLOW_CIDRS`, and installing the
+  renewal timer on GPU4 (`sudo install -m 644 systemd/system/llm-cn-tls-renew.* /etc/systemd/system/`
+  then `sudo systemctl enable --now llm-cn-tls-renew.timer`).
 
 ## A100 specifics
 
