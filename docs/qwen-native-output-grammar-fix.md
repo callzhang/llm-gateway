@@ -71,3 +71,8 @@ model cannot emit a tool call at all. Same probe (tools + `tool_choice: auto` + 
 telling it to call `read_source`): A100 stock answered `{"ok": true}` 3/3, GPU4 patched called
 `read_source` 3/3. A prompt saying no tool is needed got `{"ok": true}` after reasoning on both. It was installed there
 with `scripts/install_qwen_parser.sh` while no 27B backend was running, so the next spawn loads it.
+
+After install, the backend that was up (woken by traffic at 22:57, stock parser) unloaded on its
+normal 1200 s idle at 23:22; the next spawn (PID 1530572, 00:06, ready in 74 s) loaded 9bcfe249. Same
+probes: "call read_source" → `read_source` 3/3 (was 0/3); "no tool needed" → JSON 2/3, tool 1/3,
+matching GPU4's 5/6 JSON, 1/6 tool (the grammar allows either; the model picks).
