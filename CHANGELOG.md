@@ -33,6 +33,10 @@
   order-2 deployment (the other region's gateway) takes it. Sticky hits stay local for their prefix
   cache, and a request carrying `x-gateway-overflow` (set by the peer's deployment) is always served,
   so the two regions cannot bounce a request between them.
+- Direct CN entrance on the A100: Caddy terminates TLS on :18900 with a source-IP allowlist
+  (`systemd/region-cn/Caddyfile`, `llm-tls-proxy.service`), and `LITELLM_HOST` lets the A100 bind
+  LiteLLM to loopback. `scripts/region_cn_tls.sh` creates the DNS-only record and pushes the
+  certificate issued on GPU4. Going through Cloudflare was measured slower for CN callers.
 
 ## 2026-11-03
 
