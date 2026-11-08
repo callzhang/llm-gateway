@@ -148,6 +148,12 @@ SCALE_OUT_BUSY_SUSTAIN = float(os.environ.get("SCALE_OUT_BUSY_SUSTAIN", "120"))
 # another host — see _already_crossed) is always served.  0 disables it.
 OVERFLOW_QUEUE_DEPTH = int(os.environ.get("OVERFLOW_QUEUE_DEPTH", "0"))
 OVERFLOW_HEADER = "x-gateway-overflow"
+# Longest a request with somewhere else to go waits at the priority gate.  Nothing
+# reaches the client during that wait, and Cloudflare ends a response that has sent
+# nothing for 125 s with a 524 that LiteLLM cannot hand over.  Past this limit the
+# request gets 503 queue_overflow while the peer region can still take it.  Applies
+# only when OVERFLOW_QUEUE_DEPTH is set; 0 removes the limit.
+GATE_MAX_WAIT_SECONDS = float(os.environ.get("GATE_MAX_WAIT_SECONDS", "90"))
 # This host's own LiteLLM reaches model_manager over loopback or LISTEN_HOST.
 _LOCAL_CALLERS = frozenset({"127.0.0.1", "::1", LISTEN_HOST})
 
@@ -1091,14 +1097,15 @@ class PriorityGate:
                 counts[priority] = counts.get(priority, 0) + 1
         return counts
 
-    async def acquire(self, priority: int) -> None:
+    async def acquire(self, priority: int, timeout: float | None = None) -> None:
+        """Take a place, waiting at most ``timeout`` seconds (TimeoutError after that)."""
         if self.in_flight < self.capacity:
             self.in_flight += 1
             return
         fut = asyncio.get_running_loop().create_future()
         heapq.heappush(self._waiters, (priority, next(self._arrivals), fut))
         try:
-            await fut
+            await asyncio.wait_for(fut, timeout)
         except asyncio.CancelledError:
             if fut.done() and not fut.cancelled():
                 self.release()  # the slot was granted just as this waiter was cancelled
@@ -1856,7 +1863,18 @@ class GpuBackend:
         if self._gate is None:
             return await self._forward(request, body)
         waited_from = time.monotonic()
-        await self._gate.acquire(priority)
+        limit = (
+            GATE_MAX_WAIT_SECONDS
+            if OVERFLOW_QUEUE_DEPTH and GATE_MAX_WAIT_SECONDS and not _already_crossed(request)
+            else None
+        )
+        try:
+            await self._gate.acquire(priority, timeout=limit)
+        except TimeoutError:
+            raise QueueOverflow(
+                f"waited {limit:.0f}s for a place on slot {self.slot.slot_id}; "
+                "send it to the other region."
+            ) from None
         try:
             waited_ms = int((time.monotonic() - waited_from) * 1000)
             if waited_ms >= 1000:
@@ -3321,6 +3339,9 @@ class DynamicRouter:
 
             try:
                 return await backend.proxy(request, body, priority)
+            except QueueOverflow as exc:
+                self.log.info(f"Overflow: {model_name} {exc}")
+                return self._error_response(503, str(exc), "queue_overflow")
             except BackendGoneError as exc:
                 last_gone = exc
                 self.log.warning(

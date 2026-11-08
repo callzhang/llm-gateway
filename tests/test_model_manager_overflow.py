@@ -61,6 +61,15 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
             "/v1/chat/completions", json=payload, headers=headers or {},
         )
 
+    async def test_a_request_past_the_gate_limit_gets_queue_overflow(self):
+        async def overflowing(request, body, priority=mm.DEFAULT_REQUEST_PRIORITY):
+            raise mm.QueueOverflow("waited 90s for a place on slot 0; send it to the other region.")
+
+        self.backends[0] = type("B", (), {"slot": self.router.slots[0], "proxy": staticmethod(overflowing)})()
+        response = await self._post()
+        self.assertEqual(503, response.status)
+        self.assertEqual("queue_overflow", (await response.json())["error"]["type"])
+
     async def test_long_queue_turns_new_work_away_with_a_503(self):
         self.router._queue_waiting[self.MODEL] = 4
         with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4):

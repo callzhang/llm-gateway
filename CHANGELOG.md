@@ -3,6 +3,13 @@
 ## 2026-11-08
 
 ### Fixed
+- The priority gate no longer holds a request past what Cloudflare allows. The gate waited without a limit and
+  sent the client nothing meanwhile, so a request waiting over 125 s got a 524 that LiteLLM cannot hand over.
+  Between 03:22 and 03:26 on 2026-11-08, slot 0 held 7 requests for 108-264 s while long requests handed over by the
+  A100 region filled it. A local request now waits at most `GATE_MAX_WAIT_SECONDS` (default 90) and then gets 503
+  `queue_overflow`, so LiteLLM tries the peer region. This also covers sticky requests, which skip the
+  `OVERFLOW_QUEUE_DEPTH` check. It applies only when `OVERFLOW_QUEUE_DEPTH` is set, and never to work the peer region
+  already handed over.
 - Scale-out now also fires when every replica is busy, not only when vLLM queues. On 2026-11-07
   qwen3.8-27b ran 4-5 long-context agent requests on slot 1 for half an hour (vLLM waiting mostly 0,
   ~300 tok/s shared) while slot 0 was unloaded and GPU 0 empty; the queue tiers never fired, and
