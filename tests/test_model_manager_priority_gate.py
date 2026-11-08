@@ -4,6 +4,7 @@ import asyncio
 import json
 import unittest
 from contextlib import suppress
+from unittest.mock import patch
 
 import aiohttp
 from aiohttp import web
@@ -103,6 +104,53 @@ class PriorityGateTests(unittest.IsolatedAsyncioTestCase):
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class GateWaitLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_waiter_past_its_limit_leaves_the_queue_and_keeps_no_place(self):
+        gate = mm.PriorityGate(1)
+        await gate.acquire(100)
+        with self.assertRaises(TimeoutError):
+            await gate.acquire(100, timeout=0.01)
+        self.assertEqual(0, gate.waiting)
+        self.assertEqual(1, gate.in_flight)
+        gate.release()
+        self.assertEqual(0, gate.in_flight)
+        await asyncio.wait_for(gate.acquire(100, timeout=0.01), 1)
+        self.assertEqual(1, gate.in_flight)
+
+    async def test_a_later_waiter_is_still_admitted_after_an_earlier_one_expired(self):
+        gate = mm.PriorityGate(1)
+        await gate.acquire(100)
+        expired = asyncio.create_task(gate.acquire(0, timeout=0.01))
+        patient = asyncio.create_task(gate.acquire(100))
+        with self.assertRaises(TimeoutError):
+            await expired
+        gate.release()
+        await asyncio.wait_for(patient, 1)
+        self.assertEqual(1, gate.in_flight)
+
+    async def _gated(self, request, *, depth, limit=0.01):
+        backend = mm.GpuBackend(
+            "qwen3.8-27b", "unused.sh", "qwen3.8-27b", mm.GpuSlot(0, 0, 9000), max_num_seqs=1
+        )
+        await backend._gate.acquire(100)
+        with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", depth), patch.object(mm, "GATE_MAX_WAIT_SECONDS", limit):
+            return await asyncio.wait_for(backend._forward_gated(request, b"{}", 100), 0.2)
+
+    async def test_a_local_request_past_the_limit_overflows_to_the_peer(self):
+        local = type("R", (), {"headers": {}, "remote": "127.0.0.1"})()
+        with self.assertRaisesRegex(mm.QueueOverflow, "other region"):
+            await self._gated(local, depth=4)
+
+    async def test_no_limit_without_a_peer_or_for_work_the_peer_handed_over(self):
+        for request, depth in (
+            (type("R", (), {"headers": {}, "remote": "127.0.0.1"})(), 0),
+            (type("R", (), {"headers": {mm.OVERFLOW_HEADER: "1"}, "remote": "127.0.0.1"})(), 4),
+            (type("R", (), {"headers": {}, "remote": "100.118.88.28"})(), 4),
+        ):
+            with self.assertRaises(asyncio.TimeoutError):  # still waiting when the test's own timeout ends
+                await self._gated(request, depth=depth)
 
 
 class RequestPriorityTests(unittest.TestCase):
