@@ -41,7 +41,7 @@
   finds its deploy config next to itself and takes `MODEL_CUDA_HOME`; `run_qwen3_asr_0_6b.sh`
   takes `ASR_VLLM_DISABLED_KERNELS` (Ampere has no FP8; vLLM 0.29 still picks a CUTLASS FP8
   kernel); `QWEN3_TTS_MIN_FREE_GIB` overrides the TTS VRAM gate (31.2 GiB measured on a 40 GB A100).
-- Direct CN entrance on the A100: Caddy terminates TLS on :18900 with a source-IP allowlist
+- Direct CN entrance on the A100: Caddy terminates TLS on :18900 with an optional source-IP allowlist (open to all sources)
   (`systemd/region-cn/Caddyfile`, `llm-tls-proxy.service`), and `LITELLM_HOST` lets the A100 bind
   LiteLLM to loopback. `scripts/region_cn_tls.sh` creates the DNS-only record and pushes the
   certificate issued on GPU4. Going through Cloudflare was measured slower for CN callers.

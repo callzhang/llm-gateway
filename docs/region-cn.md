@@ -13,7 +13,7 @@ only when its own queue is long.
 | LiteLLM config | `config.yaml` | `config.cn.yaml` (`LITELLM_CONFIG`) |
 | model_manager | `127.0.0.1` + tailnet `:8002` | Tailscale IP only `100.118.88.28:8002` |
 | Database | Postgres `127.0.0.1:5433` (owner) | the same database over `llm-pg-peer.socket`, role `litellm_cn` |
-| Public entrance | `llm-api.preseen.ai` (tunnel `preseen-gateway`) | `https://llm-cn.preseen.ai:18900` direct (Caddy TLS + source allowlist); `llm-api-geo.preseen.ai` (tunnel, slower, see below) |
+| Public entrance | `llm-api.preseen.ai` (tunnel `preseen-gateway`) | `https://llm-cn.preseen.ai:18900` direct (Caddy TLS, virtual-key auth, open to all sources); `llm-api-geo.preseen.ai` (tunnel, slower, see below) |
 | Units | `systemd/*.service` (user), `systemd/system/llm-pg-peer.*` (root) | `systemd/region-cn/*` (user, linger on) |
 
 ## Request path
@@ -76,19 +76,19 @@ CN service ─► https://llm-cn.preseen.ai:18900 ─► site NAT 27.221.10.54:1
 
 * LiteLLM on the A100 listens on loopback (`LITELLM_HOST=127.0.0.1`), because the host has no
   firewall and other users share its LAN. Caddy (`systemd/region-cn/Caddyfile`, unit
-  `llm-tls-proxy`) is the only network-facing gateway port. Sources outside `CN_ALLOW_CIDRS`
-  get 403; callers still need a virtual key.
+  `llm-tls-proxy`) is the only network-facing gateway port. It is open to every source
+  (`CN_ALLOW_CIDRS="0.0.0.0/0 ::/0"`, Derek 2026-11-08: user IPs are not restricted); the
+  virtual key is the access control. A narrower `CN_ALLOW_CIDRS` gives other sources a 403.
 * The certificate (Let's Encrypt, EC256) is issued on GPU4 by DNS-01 with lego and pushed by
   `sudo scripts/region_cn_tls.sh renew`, which is a no-op until 30 days before expiry. The daily
   `llm-cn-tls-renew.timer` (`systemd/system`) runs it. It is issued on GPU4
   so the zone-wide Cloudflare token never reaches the shared host.
-* Check the source addresses in `logs/tls-proxy-access.log` once the NAT forward exists. If the
-  NAT rewrites sources to its own LAN address, the allowlist cannot tell callers apart.
-* Done 2026-11-07: the `llm-cn.preseen.ai` A record (DNS only) and the first certificate,
-  valid to 2027-02-05. Still to do: the NAT port forward `27.221.10.54:18900 -> 172.20.10.41:18900`
-  (site network admin), the CN services' source ranges in `CN_ALLOW_CIDRS`, and installing the
-  renewal timer on GPU4 (`sudo install -m 644 systemd/system/llm-cn-tls-renew.* /etc/systemd/system/`
-  then `sudo systemctl enable --now llm-cn-tls-renew.timer`).
+* Done: the `llm-cn.preseen.ai` A record (DNS only), the first certificate (valid to
+  2027-02-05), and the renewal timer on GPU4 (installed 2026-11-08; a manual run succeeded).
+* Still to do: the NAT port forward `27.221.10.54:18900 -> 172.20.10.41:18900` (site network
+  admin). `27.221.10.54` is the whole site's shared address, not the A100's: from outside,
+  `:18900` answers "connection refused" (2026-11-08, probed from GPU4) while `:443` reaches
+  another team's nginx. Everything behind the NAT is verified from inside the LAN.
 
 ## A100 specifics
 

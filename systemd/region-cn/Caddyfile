@@ -1,8 +1,8 @@
 # TLS entrance for CN services that call the A100 directly (docs/region-cn.md),
 # without Cloudflare: the site's NAT forwards <public ip>:CN_TLS_PORT to this
 # host.  LiteLLM listens on loopback only (LITELLM_HOST=127.0.0.1), so this
-# proxy is the one network-facing gateway port, and it serves only
-# CN_ALLOW_CIDRS.  The certificate is issued on GPU4 and pushed here by
+# proxy is the one network-facing gateway port; CN_ALLOW_CIDRS limits its
+# sources (currently every address: the virtual key is the access control).  The certificate is issued on GPU4 and pushed here by
 # scripts/region_cn_tls.sh, so the Cloudflare API token never lands on this
 # shared host.  Variables come from gateway.env.
 {
