@@ -7,7 +7,7 @@ only when its own queue is long.
 | | US region (GPU4, `stardust-gpu4`) | CN region (A100, `a10041` / Tailscale `a100-1`) |
 |---|---|---|
 | GPUs | 2 × RTX 5090 32 GB | 7 × A100 40 GB, **shared** with other teams |
-| Models served locally | all (27b, 35b heretic, TTS, ASR) | `qwen3.8-27b` only |
+| Models served locally | all (27b, 35b heretic, TTS, ASR) | `qwen3.8-27b`, TTS, ASR (35B goes to GPU4) |
 | Weights | NVFP4 (native FP4) | same NVFP4 checkpoint and revision, Marlin W4A16 kernel |
 | Checkout | `/home/derek/Projects/llm-gateway` | `/data/derek/llm-gateway` (mode 700) |
 | LiteLLM config | `config.yaml` | `config.cn.yaml` (`LITELLM_CONFIG`) |
@@ -31,7 +31,15 @@ client ─► Cloudflare ─► tunnel ─► LiteLLM :8900 ──order 1──�
   two saturated regions cannot bounce it.
 * LiteLLM 1.99 tries `order: 2` only after `order: 1` fails. `disable_cooldowns: true` keeps a
   burst of overflow 503s from benching the local deployment.
-* CN forwards every model other than the 27B straight to GPU4's model_manager.
+* TTS and ASR run in both regions too, each region's own first. TTS needs a whole card, so a
+  region with no free slot answers `503 gpu_busy` and the other region takes it. ASR has no queue
+  to measure: an upload of `ASR_OVERFLOW_MIN_SECONDS` (default 300) or more that would run on the
+  CPU worker because no GPU has room gets `503 queue_overflow` instead; shorter clips stay on the
+  local CPU, which beats a crossing plus the peer lane's possible ~40 s cold start.
+* LiteLLM 1.99 drops a deployment's `extra_headers` on `/audio/speech` and
+  `/audio/transcriptions` (verified with a stub backend), so model_manager also treats any request
+  from another host (not loopback, not `LISTEN_HOST`) as already crossed.
+* CN forwards the 35B straight to GPU4's model_manager.
 * Both LiteLLMs share one Postgres, so keys, budgets, spend logs and `previous_response_id`
   work from either entrance. Only the US LiteLLM migrates the schema
   (`disable_prisma_schema_update` in `config.cn.yaml`) and runs the 7-day spend-log cleanup.
@@ -90,6 +98,15 @@ CN service ─► https://llm-cn.preseen.ai:18900 ─► site NAT 27.221.10.54:1
 * The root disk is 96% full: weights, venvs, the uv cache and logs all live on `/data/derek`.
   `/data` has a default ACL of `other::rwx`, so umask does not protect new files there. The checkout
   is mode 700 with its ACLs stripped; keep secrets inside it.
+* Audio: TTS runs from its own vllm-omni venv `/data/derek/venv-tts` (built with uv from GPU4's
+  `llm-gateway-tts` package set, setuptools unpinned). ASR uses `venv-vllm029`, which got the
+  `vllm[audio]` extras (av, scipy, soundfile, soxr). Weights were downloaded on the A100 at GPU4's
+  revisions; HF_HUB_OFFLINE needs a `refs/main` in each repo, written by hand. Measured: TTS cold
+  start 317 s the first time (torch.compile, no cache yet), 31.2 GiB on a card, ~2 s per sentence
+  warm; ASR cold start ~38 s, 0.5 s for a short clip, 282 s of speech in 21.8 s.
+* vLLM 0.29 picks a CUTLASS FP8 kernel for ASR's online FP8 on Ampere, which has no FP8; the
+  first forward fails in `cutlass_scaled_mm_sm80_epilogue`. `ASR_VLLM_DISABLED_KERNELS` lists
+  the kernels ahead of Marlin so it falls through to Marlin W8A16.
 * Ports: slots start at 9300 (`GPU_PORT_BASE`) and co-resident lanes at 9500, because 9027 and 9100
   are taken on this host.
 * Six other users have sudo on this host. They can read `gateway.env` (LiteLLM master key, the
@@ -160,7 +177,9 @@ After a deploy that changes `patches/qwen3_engine_tool_parser.py`, run
 `MODEL_CUDA_HOME`, `PATH`, `MAX_JOBS`, `WAKE_TIMEOUT`, `OVERFLOW_QUEUE_DEPTH`, `HF_HOME`,
 `HF_HUB_OFFLINE`, `LITELLM_CONFIG`, `LOCAL_GATEWAY_API_BASE`, `PEER_GATEWAY_API_BASE`,
 `DATABASE_URL`, `DISABLE_SCHEMA_UPDATE`, `LITELLM_MASTER_KEY`, `GATEWAY_PY_BIN`,
-`PRISMA_BINARY_CACHE_DIR`, `LITELLM_HOST`, `CN_TLS_HOST`, `CN_TLS_PORT` and `CN_ALLOW_CIDRS`.
+`PRISMA_BINARY_CACHE_DIR`, `LITELLM_HOST`, `CN_TLS_HOST`, `CN_TLS_PORT`, `CN_ALLOW_CIDRS`,
+`VLLM_ASR_BIN`, `VLLM_TTS_BIN`, `ASR_CPU_PYTHON`, `ASR_HF_HOME`, `ASR_VLLM_DISABLED_KERNELS`
+and `QWEN3_TTS_MIN_FREE_GIB` (32.2).
 
 Rollback of overflow on GPU4: remove `OVERFLOW_QUEUE_DEPTH` and `PEER_GATEWAY_API_BASE` from
 `gateway.env` and the order-2 entry from `config.yaml`, then restart `llm-litellm` and

@@ -266,12 +266,15 @@ class LiteLlmConfigTests(unittest.TestCase):
             item for item in self.config["model_list"]
             if item["model_name"] == MODEL_NAME
         ]
-        self.assertEqual(1, len(matches))
-        params = matches[0]["litellm_params"]
-        self.assertEqual(f"hosted_vllm/{MODEL_NAME}", params["model"])
-        self.assertEqual("http://127.0.0.1:8002/v1", params["api_base"])
-        self.assertEqual("local-qwen36", params["api_key"])
-        self.assertEqual(600, params["timeout"])
+        # Local gateway first, the CN region's gateway as the order-2 backup.
+        self.assertEqual(2, len(matches))
+        local, peer = sorted((m["litellm_params"] for m in matches), key=lambda p: p["order"])
+        for params in (local, peer):
+            self.assertEqual(f"hosted_vllm/{MODEL_NAME}", params["model"])
+            self.assertEqual("local-qwen36", params["api_key"])
+            self.assertEqual(600, params["timeout"])
+        self.assertEqual((1, "http://127.0.0.1:8002/v1"), (local["order"], local["api_base"]))
+        self.assertEqual((2, "os.environ/PEER_GATEWAY_API_BASE"), (peer["order"], peer["api_base"]))
 
     def test_voice_design_and_clone_models_are_not_exposed(self):
         names = {item["model_name"].lower() for item in self.config["model_list"]}

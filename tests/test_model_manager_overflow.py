@@ -7,8 +7,8 @@ model_manager is what moves a request across the border.  The rule here:
   * only chat work that has no sticky slot here is turned away — a sticky hit
     keeps its prefix cache local;
   * a request that already crossed (x-gateway-overflow header, set by the
-    peer's LiteLLM deployment) is never turned away again, so the two regions
-    cannot bounce a request between them;
+    peer's LiteLLM deployment, or simply coming from another host) is never
+    turned away again, so the two regions cannot bounce a request between them;
   * OVERFLOW_QUEUE_DEPTH=0 (the default) disables the rule entirely.
 """
 
@@ -86,6 +86,13 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
         self.router._queue_waiting[self.MODEL] = 50
         with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4):
             response = await self._post({mm.OVERFLOW_HEADER: "1"})
+        self.assertEqual(200, response.status)
+
+    async def test_a_request_from_another_host_is_never_sent_back(self):
+        self.router._queue_waiting[self.MODEL] = 50
+        with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4), \
+             patch.object(web.BaseRequest, "remote", "100.118.88.28"):
+            response = await self._post()
         self.assertEqual(200, response.status)
 
     async def test_sticky_hit_stays_local_to_keep_its_prefix_cache(self):

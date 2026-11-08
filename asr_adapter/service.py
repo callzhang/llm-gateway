@@ -11,6 +11,7 @@ import asyncio
 import os
 import re
 from dataclasses import dataclass
+from typing import Awaitable, Callable
 
 import numpy as np
 
@@ -94,11 +95,16 @@ async def decode_audio(payload: bytes) -> np.ndarray:
 
 async def transcribe_upload(
     upload: Upload, *, gpu: Engine | None, cpu: Engine,
+    admit: Callable[[float], Awaitable[None]] | None = None,
 ) -> tuple[float, TranscriptionResult]:
+    """`admit`, if given, is awaited with the duration once the audio is decoded and
+    before any chunk is transcribed; it raises to turn the request away."""
     audio = await decode_audio(upload.audio)
     duration = round(len(audio) / SAMPLE_RATE, 2)
     if duration > MAX_DURATION_SECONDS:
         raise UploadError(f"audio is {duration:.0f}s; the limit is {MAX_DURATION_SECONDS}s", 413)
+    if admit is not None:
+        await admit(duration)
     chunks = await asyncio.to_thread(make_chunks, audio, target_s=CHUNK_SECONDS)
     return duration, await transcribe_chunks(chunks, gpu=gpu, cpu=cpu)
 

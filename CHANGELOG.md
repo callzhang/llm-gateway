@@ -33,6 +33,14 @@
   order-2 deployment (the other region's gateway) takes it. Sticky hits stay local for their prefix
   cache, and a request carrying `x-gateway-overflow` (set by the peer's deployment) is always served,
   so the two regions cannot bounce a request between them.
+- TTS and ASR are served in the CN region too, and each region lists the other as their order-2
+  backup in LiteLLM. TTS fails over when no card is free (`503 gpu_busy`). ASR uploads of
+  `ASR_OVERFLOW_MIN_SECONDS` (300) or more that would run on the CPU worker get `503 queue_overflow`
+  when cross-region overflow is on. Because LiteLLM 1.99 drops `extra_headers` on audio calls, a
+  request from another host now also counts as already crossed. `run_qwen3_tts_1_7b_customvoice.sh`
+  finds its deploy config next to itself and takes `MODEL_CUDA_HOME`; `run_qwen3_asr_0_6b.sh`
+  takes `ASR_VLLM_DISABLED_KERNELS` (Ampere has no FP8; vLLM 0.29 still picks a CUTLASS FP8
+  kernel); `QWEN3_TTS_MIN_FREE_GIB` overrides the TTS VRAM gate (31.2 GiB measured on a 40 GB A100).
 - Direct CN entrance on the A100: Caddy terminates TLS on :18900 with a source-IP allowlist
   (`systemd/region-cn/Caddyfile`, `llm-tls-proxy.service`), and `LITELLM_HOST` lets the A100 bind
   LiteLLM to loopback. `scripts/region_cn_tls.sh` creates the DNS-only record and pushes the

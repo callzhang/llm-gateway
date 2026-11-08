@@ -15,6 +15,13 @@ export VLLM_NO_USAGE_STATS=1
 
 VLLM_BIN=${VLLM_ASR_BIN:-/home/derek/miniforge3/envs/llm-gateway-vllm-029/bin/vllm}
 
+# vLLM 0.29 picks a CUTLASS FP8 kernel on Ampere, which has no FP8, and the first
+# forward fails in cutlass_scaled_mm_sm80_epilogue.  The A100 region lists the
+# kernels ahead of Marlin here (gateway.env) so it falls through to Marlin W8A16.
+if [[ -n ${ASR_VLLM_DISABLED_KERNELS:-} ]]; then
+  export VLLM_DISABLED_KERNELS=$ASR_VLLM_DISABLED_KERNELS
+fi
+
 # --quantization fp8: weights are converted from the official BF16 checkpoint at
 # load (no calibration, dynamic activation scales).  gpu-memory-utilization
 # comes from model_manager (VLLM_GPU_MEM_UTIL): preferred 0.10, lowered to fit the

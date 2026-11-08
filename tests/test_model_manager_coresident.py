@@ -443,11 +443,12 @@ class MultipartRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.client.close()
 
-    async def _post(self, path="/v1/audio/transcriptions", body=None):
+    async def _post(self, path="/v1/audio/transcriptions", body=None, headers=None):
         return await self.client.post(
             path,
             data=body if body is not None else self._multipart(),
-            headers={"Content-Type": f"multipart/form-data; boundary={self.BOUNDARY}"},
+            headers={"Content-Type": f"multipart/form-data; boundary={self.BOUNDARY}",
+                     **(headers or {})},
         )
 
     @staticmethod
@@ -498,6 +499,51 @@ class MultipartRoutingTests(unittest.IsolatedAsyncioTestCase):
         body = await response.json()
         self.assertEqual("gpu+cpu", body["engine"])
         self.assertEqual("一二二", body["text"])
+
+    async def _overflow_case(self, seconds, headers=None):
+        """A busy GPU with cross-region overflow on: returns (response, cpu worker)."""
+        self.router._get_or_start = AsyncMock(side_effect=GPUBusyError("no room"))
+        cpu = SimpleNamespace(transcribe=AsyncMock(return_value="甲"))
+        with patch.object(model_manager, "OVERFLOW_QUEUE_DEPTH", 4), \
+                patch.object(self.router, "_asr_cpu", return_value=cpu), \
+                patch.object(model_manager.asr_service, "decode_audio",
+                             AsyncMock(return_value=self._speech(seconds))):
+            return await self._post(headers=headers), cpu
+
+    async def test_a_long_upload_with_no_gpu_room_goes_to_the_peer_region(self):
+        seconds = model_manager.ASR_OVERFLOW_MIN_SECONDS
+        response, cpu = await self._overflow_case(seconds)
+        self.assertEqual(503, response.status)
+        self.assertEqual("queue_overflow", (await response.json())["error"]["type"])
+        cpu.transcribe.assert_not_awaited()
+
+    async def test_a_short_upload_stays_on_the_local_cpu(self):
+        response, cpu = await self._overflow_case(10)
+        self.assertEqual(200, response.status)
+        self.assertTrue(cpu.transcribe.await_count)
+
+    async def test_an_upload_that_already_crossed_is_never_sent_back(self):
+        seconds = model_manager.ASR_OVERFLOW_MIN_SECONDS
+        response, cpu = await self._overflow_case(seconds, {model_manager.OVERFLOW_HEADER: "1"})
+        self.assertEqual(200, response.status)
+        self.assertTrue(cpu.transcribe.await_count)
+
+    async def test_an_upload_from_the_peer_host_is_never_sent_back(self):
+        # LiteLLM drops extra_headers on audio calls, so the peer is known by address.
+        seconds = model_manager.ASR_OVERFLOW_MIN_SECONDS
+        with patch.object(web.BaseRequest, "remote", "100.93.145.69"):
+            response, cpu = await self._overflow_case(seconds)
+        self.assertEqual(200, response.status)
+        self.assertTrue(cpu.transcribe.await_count)
+
+    async def test_a_long_upload_with_gpu_room_stays_local(self):
+        backend = self._lane()
+        with patch.object(model_manager, "OVERFLOW_QUEUE_DEPTH", 4), \
+                patch.object(model_manager.asr_service, "decode_audio",
+                             AsyncMock(return_value=self._speech(model_manager.ASR_OVERFLOW_MIN_SECONDS))):
+            response = await self._post()
+        self.assertEqual(200, response.status)
+        self.assertTrue(backend.transcribe_chunk.await_count)
 
     async def test_cpu_worker_failure_is_a_503(self):
         self.router._get_or_start = AsyncMock(side_effect=GPUBusyError("no room"))

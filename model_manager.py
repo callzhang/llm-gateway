@@ -131,10 +131,26 @@ def _scale_sustain_for(waiting: int) -> "float | None":
 # model; a 503 here is what moves a request across the border.  New chat work
 # is turned away once the model's summed vLLM queue (the saturation sampler's
 # last reading) reaches this depth.  Sticky hits stay to keep their prefix
-# cache, and a request carrying OVERFLOW_HEADER (set by the peer's deployment)
-# already crossed once and is always served.  0 disables it.
+# cache, and a request that already crossed once (OVERFLOW_HEADER, or from
+# another host — see _already_crossed) is always served.  0 disables it.
 OVERFLOW_QUEUE_DEPTH = int(os.environ.get("OVERFLOW_QUEUE_DEPTH", "0"))
 OVERFLOW_HEADER = "x-gateway-overflow"
+# This host's own LiteLLM reaches model_manager over loopback or LISTEN_HOST.
+_LOCAL_CALLERS = frozenset({"127.0.0.1", "::1", LISTEN_HOST})
+
+
+def _already_crossed(request: web.Request) -> bool:
+    """True for work the peer region handed over, which is never turned away again.
+    LiteLLM 1.99 sends the deployment's extra_headers on chat calls but drops them
+    on /audio/speech and /audio/transcriptions, so a request from another host
+    counts as crossed too."""
+    return OVERFLOW_HEADER in request.headers or request.remote not in _LOCAL_CALLERS
+# Transcription has no queue to measure: when no GPU here has room for the ASR
+# lane, the chunks run on the CPU worker (~6x realtime against ~60x on a GPU).
+# With overflow on, an upload at least this long is turned away instead, so the
+# peer region's GPU takes it.  Shorter clips stay: the CPU finishes them sooner
+# than a crossing plus a possible ~1 min cold start of the peer's lane.
+ASR_OVERFLOW_MIN_SECONDS = float(os.environ.get("ASR_OVERFLOW_MIN_SECONDS", "300"))
 # Extra replicas (a model running on >1 slot) idle out faster than the primary so
 # a borrowed slot is returned to its evicted model promptly (asymmetric scale-in).
 REPLICA_IDLE_TIMEOUT = int(os.environ.get("REPLICA_IDLE_TIMEOUT", "120"))
@@ -664,7 +680,9 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
     # Measured on an RTX 5090: the two-stage vLLM-Omni process settles at
     # ~29.3 GiB after Code2Wav CUDA-graph capture.  Require another 1 GiB so a
     # partially occupied card is rejected before launch instead of failing OOM.
-    "qwen3-tts-1.7b-customvoice": 30.3,
+    # configs/qwen3_tts.yaml sizes the stages as fractions of the card, so a
+    # 40 GB A100 takes more: 31.2 GiB measured, and the CN region sets 32.2.
+    "qwen3-tts-1.7b-customvoice": float(os.environ.get("QWEN3_TTS_MIN_FREE_GIB", "30.3")),
 }
 
 # Per-model preferred (maximum) gpu_memory_utilization — mirrors the run scripts.
@@ -807,6 +825,10 @@ logging.basicConfig(
 # health polling is expected and caught by our code; no need to see it in logs).
 logging.getLogger("aiohttp.client").setLevel(logging.CRITICAL)
 logging.getLogger("aiohttp.connector").setLevel(logging.CRITICAL)
+
+
+class QueueOverflow(Exception):
+    """Work this region should hand to the peer region (503 queue_overflow)."""
 
 
 class GPUBusyError(Exception):
@@ -3211,22 +3233,18 @@ class DynamicRouter:
                 if (
                     OVERFLOW_QUEUE_DEPTH
                     and config.request_kind == "chat"
-                    and OVERFLOW_HEADER not in request.headers
+                    and not _already_crossed(request)
                     and waiting >= OVERFLOW_QUEUE_DEPTH
                 ):
                     self.log.info(
                         f"Overflow: {model_name} waiting={waiting} ≥ "
                         f"{OVERFLOW_QUEUE_DEPTH} — 503 so LiteLLM tries the peer region"
                     )
-                    return web.Response(
-                        status=503, content_type="application/json",
-                        body=json.dumps({"error": {
-                            "message": (
-                                f"'{model_name}' has {waiting} requests queued here; "
-                                "send it to the other region."
-                            ),
-                            "type": "queue_overflow",
-                        }}),
+                    return self._error_response(
+                        503,
+                        f"'{model_name}' has {waiting} requests queued here; "
+                        "send it to the other region.",
+                        "queue_overflow",
                     )
                 backend = self._pick(backends)
                 # Scale-out is decided by the background saturation monitor based
@@ -3322,11 +3340,30 @@ class DynamicRouter:
         async def cpu(chunk) -> str:
             return await self._asr_cpu().transcribe(chunk, upload.language)
 
+        async def admit(duration: float) -> None:
+            if (
+                not OVERFLOW_QUEUE_DEPTH
+                or _already_crossed(request)
+                or duration < ASR_OVERFLOW_MIN_SECONDS
+            ):
+                return
+            try:
+                await self._get_or_start(model_name)
+            except (GPUBusyError, RuntimeError) as exc:
+                raise QueueOverflow(
+                    f"no GPU here can take {duration:.0f}s of audio ({exc}); "
+                    "send it to the other region."
+                ) from exc
+
         started = time.monotonic()
         try:
-            duration, result = await asr_service.transcribe_upload(upload, gpu=gpu, cpu=cpu)
+            duration, result = await asr_service.transcribe_upload(
+                upload, gpu=gpu, cpu=cpu, admit=admit)
         except asr_service.UploadError as exc:
             return self._error_response(exc.status, str(exc), "invalid_request_error")
+        except QueueOverflow as exc:
+            self.log.info(f"Overflow: {model_name} {exc}")
+            return self._error_response(503, str(exc), "queue_overflow")
         except CpuWorkerError as exc:
             self.log.error(f"Transcription failed on CPU: {exc}")
             return self._error_response(503, str(exc), "service_unavailable")

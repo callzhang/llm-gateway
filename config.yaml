@@ -97,6 +97,18 @@ model_list:
       api_base: http://127.0.0.1:8002/v1
       api_key: local-qwen36
       timeout: 600
+      order: 1
+
+  # Backup in the CN region.  TTS needs a whole card here (~29.3 GiB), so while
+  # both slots are busy model_manager answers 503 gpu_busy and LiteLLM moves on.
+  - model_name: qwen3-tts-1.7b-customvoice
+    litellm_params:
+      model: hosted_vllm/qwen3-tts-1.7b-customvoice
+      api_base: os.environ/PEER_GATEWAY_API_BASE
+      api_key: local-qwen36
+      timeout: 600
+      extra_headers: {x-gateway-overflow: "1"}
+      order: 2
 
   # ── Qwen3-ASR 0.6B: the unified speech-to-text service ─────────────────
   # `qwen3-asr` (POST /v1/audio/transcriptions).  model_manager owns the whole
@@ -104,13 +116,26 @@ model_list:
   # skips silence, drops looping output, and sends each chunk to the FP8 GPU lane
   # (co-resident, VRAM budget, ~1 min cold start, then ~60x realtime) or — when no
   # GPU has ~3.7 GiB free — to a CPU worker process running the same model (~6x
-  # realtime).  So LiteLLM needs one entry and no fallback.
+  # realtime).  An upload of ASR_OVERFLOW_MIN_SECONDS or more that would land on
+  # the CPU gets a 503 queue_overflow instead, and goes to the CN region's GPU.
   - model_name: qwen3-asr
     litellm_params:
       model: openai/qwen3-asr-0.6b
       api_base: http://127.0.0.1:8002/v1
       api_key: local-qwen36
       timeout: 1800
+      order: 1
+    model_info:
+      mode: audio_transcription
+
+  - model_name: qwen3-asr
+    litellm_params:
+      model: openai/qwen3-asr-0.6b
+      api_base: os.environ/PEER_GATEWAY_API_BASE
+      api_key: local-qwen36
+      timeout: 1800
+      extra_headers: {x-gateway-overflow: "1"}
+      order: 2
     model_info:
       mode: audio_transcription
 
