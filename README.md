@@ -188,6 +188,12 @@ GPUs. Only one spawn is in flight per model: while a replica is still starting t
 Extra replicas (every one but the lowest slot) shed after `REPLICA_IDLE_TIMEOUT` once the model has
 been quiet for `REPLICA_QUIET_BEFORE_RECLAIM`.
 
+A slot can also be overloaded with an empty queue: vLLM admits every request and serves each one
+slowly. When every running replica has at least `SCALE_OUT_BUSY_REQUESTS` (default 3) requests in
+flight, the model also accrues at `1/SCALE_OUT_BUSY_SUSTAIN` per second (default 120s), in the same
+window. A firing backed only by this busy signal takes a free slot and never evicts another model;
+`SCALE_OUT_BUSY_REQUESTS=0` turns it off. Busy samples also count as backlog for scale-in.
+
 ## Public-facing stack (Open WebUI + systemd target + tunnel)
 
 Beyond the model_manager/LiteLLM/vLLM core, the deployment on this host exposes a

@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-11-08
+
+### Fixed
+- Scale-out now also fires when every replica is busy, not only when vLLM queues. On 2026-11-07
+  qwen3.8-27b ran 4-5 long-context agent requests on slot 1 for half an hour (vLLM waiting mostly 0,
+  ~300 tok/s shared) while slot 0 was unloaded and GPU 0 empty; the queue tiers never fired, and
+  fallback callers hit the 600s deadline and Cloudflare 524s. Every replica with at least
+  `SCALE_OUT_BUSY_REQUESTS` (3) in flight now accrues toward scale-out over
+  `SCALE_OUT_BUSY_SUSTAIN` (120s). A busy-only firing takes a free slot and never evicts another
+  model; queue backlog keeps its eviction behaviour.
+
 ## 2026-11-07
 
 ### Changed

@@ -126,6 +126,19 @@ def _scale_sustain_for(waiting: int) -> "float | None":
         if waiting >= depth:
             return secs
     return None
+
+# Busy scale-out.  The queue signal above misses a slot that admits every
+# request but serves each one slowly: on 2026-11-07 qwen3.8-27b ran 4-5
+# long-context agent requests on one slot (vLLM waiting ~0, ~300 tok/s shared)
+# for half an hour while the other GPU sat empty, and requests ran into the
+# 600s deadline and Cloudflare's 100s first-byte limit.  When every running
+# replica has at least SCALE_OUT_BUSY_REQUESTS requests in flight, the model
+# accrues toward scale-out at 1/SCALE_OUT_BUSY_SUSTAIN per second (in the same
+# window as the queue tiers, whichever is faster).  A busy-only firing takes a
+# free slot only; it never evicts another model.  0 disables it.
+SCALE_OUT_BUSY_REQUESTS = int(os.environ.get("SCALE_OUT_BUSY_REQUESTS", "3"))
+SCALE_OUT_BUSY_SUSTAIN = float(os.environ.get("SCALE_OUT_BUSY_SUSTAIN", "120"))
+
 # Cross-region overflow.  Each region runs its own gateway stack, and each
 # LiteLLM lists the other region's gateway as an order-2 deployment of the same
 # model; a 503 here is what moves a request across the border.  New chat work
@@ -2260,6 +2273,8 @@ class DynamicRouter:
         # P is the sum of increments newer than SCALE_WINDOW; fires at P≥1 (see
         # _saturation_loop / SCALE_OUT_TIERS).  In-memory only — a restart resets it.
         self._scale_accrual: dict[str, deque[tuple[float, float]]] = {}
+        # Models whose current accrual includes real queue backlog (not only busy).
+        self._queue_accrued: set[str] = set()
         # Monotonic time of the last sample where a model had ANY queued
         # request across all its instances.  Scale-in reads this so a replica
         # is not reclaimed during a lull between bursts (see _idle_loop).
@@ -2735,7 +2750,7 @@ class DynamicRouter:
         self._scale_decline_log[model_name] = (reason, now)
         self.log.info(f"Scale-out for {model_name} declined: {reason}")
 
-    async def _maybe_scale_out(self, model_name: str) -> None:
+    async def _maybe_scale_out(self, model_name: str, *, free_only: bool = False) -> None:
         """If all instances are saturated and a slot is available, spawn another.
 
         "Available" means either a truly free slot (no backend) OR a slot whose
@@ -2809,6 +2824,11 @@ class DynamicRouter:
                     return
                 free = viable
 
+            if not free and free_only:
+                self._log_scale_decline(
+                    model_name, "busy but no free slot (busy scale-out never evicts)"
+                )
+                return
             if not free:
                 # No truly free slot — look for a slot whose backend is a
                 # *different* idle model we can evict to make room.
@@ -2916,8 +2936,8 @@ class DynamicRouter:
         """
         return min(backends, key=lambda b: b._active_requests)
 
-    def _trigger_scale_out(self, model_name: str) -> None:
-        task = asyncio.create_task(self._maybe_scale_out(model_name))
+    def _trigger_scale_out(self, model_name: str, *, free_only: bool = False) -> None:
+        task = asyncio.create_task(self._maybe_scale_out(model_name, free_only=free_only))
         self._scale_tasks.add(task)
         task.add_done_callback(self._scale_tasks.discard)
 
@@ -2969,10 +2989,13 @@ class DynamicRouter:
                         continue
                     waiting = sum(depths)
                     self._queue_waiting[model_name] = waiting
+                    busy = SCALE_OUT_BUSY_REQUESTS > 0 and all(
+                        b._active_requests >= SCALE_OUT_BUSY_REQUESTS for b in running
+                    )
                     # Stamp model-wide backlog on EVERY sample, including while
                     # scaled out — scale-in reads this to avoid reclaiming a
                     # replica during a lull between bursts.
-                    if waiting > 0:
+                    if waiting > 0 or busy:
                         self._last_backlog_at[model_name] = now
 
                     if len(self._claimed_backends(model_name)) > len(running):
@@ -2989,20 +3012,29 @@ class DynamicRouter:
                         while window and window[0][0] < cutoff:
                             window.popleft()
 
-                    sustain = _scale_sustain_for(waiting)
+                    queue_sustain = _scale_sustain_for(waiting)
+                    sustain = min(
+                        (t for t in (queue_sustain, SCALE_OUT_BUSY_SUSTAIN if busy else None)
+                         if t is not None),
+                        default=None,
+                    )
+                    if queue_sustain is not None:
+                        self._queue_accrued.add(model_name)
                     if sustain is not None and dt > 0:
                         if window is None:
                             window = self._scale_accrual[model_name] = deque()
                         window.append((now, dt / sustain))
                         if not had_progress:
                             self.log.info(
-                                f"{model_name}: waiting={waiting} backlog — scale-out "
+                                f"{model_name}: waiting={waiting} "
+                                f"{'busy' if queue_sustain is None else 'backlog'} — scale-out "
                                 f"accrual started (tier {int(sustain)}s, "
                                 f"window {int(SCALE_WINDOW)}s)"
                             )
                     elif had_progress and not window:
                         # Last accrual aged past the window with no new backlog.
                         self._scale_accrual.pop(model_name, None)
+                        self._queue_accrued.discard(model_name)
                         self.log.info(
                             f"{model_name}: backlog window drained — accumulator empty"
                         )
@@ -3015,8 +3047,14 @@ class DynamicRouter:
                             f"(windowed P≥1.0 over {int(SCALE_WINDOW)}s) — "
                             f"attempting scale-out"
                         )
-                        self._trigger_scale_out(model_name)
+                        # Only busy evidence since the last firing: take a free
+                        # slot, never evict another model for it.
+                        if model_name in self._queue_accrued:
+                            self._trigger_scale_out(model_name)
+                        else:
+                            self._trigger_scale_out(model_name, free_only=True)
                         self._scale_accrual.pop(model_name, None)   # start fresh
+                        self._queue_accrued.discard(model_name)
         except asyncio.CancelledError:
             pass
 

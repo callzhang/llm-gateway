@@ -148,6 +148,8 @@ class OverflowQueueSampleTests(unittest.IsolatedAsyncioTestCase):
         router = mm.DynamicRouter([mm.GpuSlot(0, 0, 9000)], {model: config})
 
         class Backend:
+            _active_requests = 0
+
             async def queue_depth(self):
                 return 6
 
