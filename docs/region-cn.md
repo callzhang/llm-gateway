@@ -26,8 +26,9 @@ client ─► Cloudflare ─► tunnel ─► LiteLLM :8900 ──order 1──�
 ```
 
 * `OVERFLOW_QUEUE_DEPTH=4` (both `gateway.env`): once a model's summed vLLM queue reaches 4,
-  model_manager answers new chat work with `503 queue_overflow`. Sticky hits stay local (prefix
-  cache). A request carrying `x-gateway-overflow` already crossed once and is always served, so
+  model_manager answers new chat work with `503 queue_overflow`. A sticky hit stays local (prefix
+  cache) unless its own slot already has requests queued at the priority gate, and a binding lapses
+  after `STICKY_IDLE_TTL` (default 300 s) without a request. A request carrying `x-gateway-overflow` already crossed once and is always served, so
   two saturated regions cannot bounce it.
 * LiteLLM 1.99 tries `order: 2` only after `order: 1` fails. `disable_cooldowns: true` keeps a
   burst of overflow 503s from benching the local deployment.

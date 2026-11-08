@@ -26,7 +26,7 @@ GPU 0 :9000    GPU 1 :9010      GPU N :9000+N×10
 - **Scale-out** — ≥2 concurrent requests on an occupied slot → spawn a second instance on the next free slot, round-robin across both
 - **Scale-in** — the extra instance idles out naturally
 - **gpu_busy 503** — all slots occupied by other models → immediate error (no queue)
-- **Sticky routing** — `x-task-id` header pins all turns of a task to the same vLLM slot for KV-cache reuse
+- **Sticky routing** — `x-task-id` header pins all turns of a task to the same vLLM slot for KV-cache reuse; the binding lapses after `STICKY_IDLE_TTL` (300 s) idle, and a sticky request whose slot is queueing may still overflow to the peer region
 
 model_manager does **no data transformation** — it receives standard OpenAI chat/completions requests from LiteLLM and proxies them verbatim to vLLM.
 

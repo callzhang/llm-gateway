@@ -1225,6 +1225,11 @@ class GpuBackend:
         if self._idle_task is None or self._idle_task.done():
             self._idle_task = asyncio.create_task(self._idle_loop())
 
+    @property
+    def local_waiting(self) -> int:
+        """Requests held at this backend's priority gate, not yet admitted to vLLM."""
+        return self._gate.waiting if self._gate is not None else 0
+
     async def queue_depth(self) -> int:
         """vLLM's real internal queue (num_requests_waiting) for this backend.
 
@@ -2106,11 +2111,15 @@ class GpuBackend:
 
 # ── Task-id affinity (for clients that propagate `x-task-id` header) ───────────
 _AFFINITY_MAX = 10000
-_task_affinity: "OrderedDict[str, int]" = OrderedDict()
+# A binding only pays while the slot's prefix cache may still hold the task's
+# history; vLLM evicts it by block recency, so a task idle this long is routed
+# afresh (and may overflow) instead of being pinned to a cold slot.
+STICKY_IDLE_TTL = float(os.environ.get("STICKY_IDLE_TTL", "300"))
+_task_affinity: "OrderedDict[str, tuple[int, float]]" = OrderedDict()   # task -> (slot, last request)
 
 
 def _set_task_affinity(task_id: str, slot_id: int) -> None:
-    _task_affinity[task_id] = slot_id
+    _task_affinity[task_id] = (slot_id, time.monotonic())
     _task_affinity.move_to_end(task_id)
     while len(_task_affinity) > _AFFINITY_MAX:
         _task_affinity.popitem(last=False)
@@ -2226,8 +2235,11 @@ def _sticky_slot_for(parsed_body: dict | None, headers) -> tuple[int | None, str
     """Resolve the preferred slot for this request via x-task-id.
     Returns (slot_id | None, reason)."""
     task_id = _extract_task_id(parsed_body, headers)
-    if task_id and (s := _task_affinity.get(task_id)) is not None:
-        return s, f"task:{task_id}"
+    if task_id and (bound := _task_affinity.get(task_id)) is not None:
+        slot_id, last_request = bound
+        if time.monotonic() - last_request <= STICKY_IDLE_TTL:
+            return slot_id, f"task:{task_id}"
+        del _task_affinity[task_id]
     return None, "none"
 
 
@@ -3264,26 +3276,33 @@ class DynamicRouter:
                 sticky_backend = next(
                     (b for b in backends if b.slot.slot_id == sticky_slot), None
                 )
+            # A sticky hit keeps its prefix cache local, unless its own slot is
+            # already queueing: waiting behind the gate there costs more than
+            # recomputing the history in the other region.
+            waiting = self._queue_waiting.get(model_name, 0)
+            if (
+                OVERFLOW_QUEUE_DEPTH
+                and config.request_kind == "chat"
+                and not _already_crossed(request)
+                and waiting >= OVERFLOW_QUEUE_DEPTH
+                and (sticky_backend is None or sticky_backend.local_waiting > 0)
+            ):
+                self.log.info(
+                    f"Overflow: {model_name} waiting={waiting} ≥ "
+                    f"{OVERFLOW_QUEUE_DEPTH}"
+                    + (f", sticky slot {sticky_backend.slot.slot_id} queueing "
+                       f"{sticky_backend.local_waiting}" if sticky_backend is not None else "")
+                    + " — 503 so LiteLLM tries the peer region"
+                )
+                return self._error_response(
+                    503,
+                    f"'{model_name}' has {waiting} requests queued here; "
+                    "send it to the other region.",
+                    "queue_overflow",
+                )
             if sticky_backend is not None:
                 backend = sticky_backend
             else:
-                waiting = self._queue_waiting.get(model_name, 0)
-                if (
-                    OVERFLOW_QUEUE_DEPTH
-                    and config.request_kind == "chat"
-                    and not _already_crossed(request)
-                    and waiting >= OVERFLOW_QUEUE_DEPTH
-                ):
-                    self.log.info(
-                        f"Overflow: {model_name} waiting={waiting} ≥ "
-                        f"{OVERFLOW_QUEUE_DEPTH} — 503 so LiteLLM tries the peer region"
-                    )
-                    return self._error_response(
-                        503,
-                        f"'{model_name}' has {waiting} requests queued here; "
-                        "send it to the other region.",
-                        "queue_overflow",
-                    )
                 backend = self._pick(backends)
                 # Scale-out is decided by the background saturation monitor based
                 # on vLLM's sustained real queue — not triggered per request here.

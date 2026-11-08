@@ -4,8 +4,11 @@ Each region runs its own gateway stack.  LiteLLM lists the other region's
 gateway as an order-2 deployment of the same model, so a 503 from this
 model_manager is what moves a request across the border.  The rule here:
 
-  * only chat work that has no sticky slot here is turned away — a sticky hit
-    keeps its prefix cache local;
+  * a sticky hit keeps its prefix cache local, unless its own slot already has
+    requests queued behind the gate — then it is turned away like any other, since
+    waiting there costs more than recomputing the history in the other region;
+  * a sticky binding lapses after STICKY_IDLE_TTL without a request, because the
+    prefix cache it protects has long been evicted by then;
   * a request that already crossed (x-gateway-overflow header, set by the
     peer's LiteLLM deployment, or simply coming from another host) is never
     turned away again, so the two regions cannot bounce a request between them;
@@ -38,7 +41,9 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
             async def proxy(request, body, priority=mm.DEFAULT_REQUEST_PRIORITY):
                 self.proxied.append(slot.slot_id)
                 return web.json_response({"ok": True})
-            return type("B", (), {"slot": slot, "proxy": staticmethod(proxy)})()
+            return type(
+                "B", (), {"slot": slot, "proxy": staticmethod(proxy), "local_waiting": 0},
+            )()
 
         self.backends = [backend_on(s) for s in self.router.slots]
 
@@ -95,13 +100,69 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
             response = await self._post()
         self.assertEqual(200, response.status)
 
-    async def test_sticky_hit_stays_local_to_keep_its_prefix_cache(self):
-        self.router._queue_waiting[self.MODEL] = 50
+    async def _post_sticky_to_slot_1(self, headers=None):
         with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4), \
              patch.object(mm, "_sticky_slot_for", lambda body, headers: (1, "task")):
-            response = await self._post()
+            return await self._post(headers)
+
+    async def test_sticky_hit_on_a_free_slot_stays_local_to_keep_its_prefix_cache(self):
+        self.router._queue_waiting[self.MODEL] = 50
+        response = await self._post_sticky_to_slot_1()
         self.assertEqual(200, response.status)
         self.assertEqual([1], self.proxied)
+
+    async def test_sticky_hit_whose_slot_is_queueing_is_turned_away(self):
+        self.router._queue_waiting[self.MODEL] = 50
+        self.backends[1].local_waiting = 3
+        response = await self._post_sticky_to_slot_1()
+        self.assertEqual(503, response.status)
+        self.assertEqual("queue_overflow", (await response.json())["error"]["type"])
+        self.assertEqual([], self.proxied)
+
+    async def test_sticky_hit_stays_when_the_model_queue_is_below_the_depth(self):
+        self.router._queue_waiting[self.MODEL] = 3
+        self.backends[1].local_waiting = 3
+        response = await self._post_sticky_to_slot_1()
+        self.assertEqual(200, response.status)
+        self.assertEqual([1], self.proxied)
+
+    async def test_a_crossed_request_is_served_even_on_a_queueing_sticky_slot(self):
+        self.router._queue_waiting[self.MODEL] = 50
+        self.backends[1].local_waiting = 3
+        response = await self._post_sticky_to_slot_1({mm.OVERFLOW_HEADER: "1"})
+        self.assertEqual(200, response.status)
+        self.assertEqual([1], self.proxied)
+
+
+class StickyAffinityExpiryTests(unittest.TestCase):
+    """A binding is only worth keeping while the prefix cache it protects may survive."""
+
+    def setUp(self):
+        mm._task_affinity.clear()
+        self.addCleanup(mm._task_affinity.clear)
+        self.headers = {"x-task-id": "task-1"}
+
+    def _lookup(self, now):
+        with patch.object(mm.time, "monotonic", return_value=now):
+            return mm._sticky_slot_for(None, self.headers)[0]
+
+    def _bind(self, now, slot_id):
+        with patch.object(mm.time, "monotonic", return_value=now):
+            mm._set_task_affinity("task-1", slot_id)
+
+    def test_binding_is_kept_within_the_idle_ttl(self):
+        self._bind(1000.0, 1)
+        self.assertEqual(1, self._lookup(1000.0 + mm.STICKY_IDLE_TTL))
+
+    def test_binding_lapses_after_the_idle_ttl_and_is_dropped(self):
+        self._bind(1000.0, 1)
+        self.assertIsNone(self._lookup(1000.0 + mm.STICKY_IDLE_TTL + 1))
+        self.assertNotIn("task-1", mm._task_affinity)
+
+    def test_each_request_restarts_the_idle_clock(self):
+        self._bind(1000.0, 1)
+        self._bind(1000.0 + mm.STICKY_IDLE_TTL - 1, 1)
+        self.assertEqual(1, self._lookup(1000.0 + 2 * mm.STICKY_IDLE_TTL - 2))
 
 
 class AdminActionsAreLoopbackOnlyTests(unittest.IsolatedAsyncioTestCase):

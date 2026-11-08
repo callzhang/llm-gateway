@@ -3,6 +3,13 @@
 ## 2026-11-08
 
 ### Fixed
+- Sticky routing no longer pins a conversation to a slot that cannot serve it. A sticky binding
+  lapses after `STICKY_IDLE_TTL` (default 300 s) without a request, and a sticky hit whose own slot
+  has requests queued at the priority gate is turned away with `503 queue_overflow` when the model's
+  queue is at `OVERFLOW_QUEUE_DEPTH`, like any other request. Found on 2026-11-08: a follow-up with
+  `previous_response_id` (110 chars, below the 2096-token prefix-cache block, so nothing to reuse)
+  stayed on slot 0 behind the gate for 167-264 s while the A100 was idle. Requests that already
+  crossed are still always served.
 - Scale-out now also fires when every replica is busy, not only when vLLM queues. On 2026-11-07
   qwen3.8-27b ran 4-5 long-context agent requests on slot 1 for half an hour (vLLM waiting mostly 0,
   ~300 tok/s shared) while slot 0 was unloaded and GPU 0 empty; the queue tiers never fired, and
