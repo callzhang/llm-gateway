@@ -12,7 +12,7 @@ only when its own queue is long.
 | Checkout | `/home/derek/Projects/llm-gateway` | `/data/derek/llm-gateway` (mode 700) |
 | LiteLLM config | `config.yaml` | `config.cn.yaml` (`LITELLM_CONFIG`) |
 | model_manager | `127.0.0.1` + tailnet `:8002` | Tailscale IP only `100.118.88.28:8002` |
-| Database | Postgres `127.0.0.1:5433` (owner) | the same database over `llm-pg-peer.socket`, role `litellm_cn` |
+| Database | Postgres `127.0.0.1:5433` | its own Postgres, Docker container `llm-litellm-pg` on `127.0.0.1:15433`; keys copied from GPU4 |
 | Public entrance | `llm-api.preseen.ai` (tunnel `preseen-gateway`) | `https://llm-cn.preseen.ai:18900` direct (Caddy TLS, virtual-key auth, open to all sources); `llm-api-geo.preseen.ai` (tunnel, slower, see below) |
 | Units | `systemd/*.service` (user), `systemd/system/llm-pg-peer.*` (root) | `systemd/region-cn/*` (user, linger on) |
 
@@ -35,8 +35,11 @@ client ─► Cloudflare ─► tunnel ─► LiteLLM :8900 ──order 1──�
   two saturated regions cannot bounce it.
 * LiteLLM 1.99 tries `order: 2` only after `order: 1` fails. `disable_cooldowns: true` keeps a
   burst of overflow 503s from benching the local deployment.
-* TTS and ASR run in both regions too, each region's own first. TTS needs a whole card, so a
-  region with no free slot answers `503 gpu_busy` and the other region takes it. ASR has no queue
+* TTS and ASR run in both regions too, each region's own first. TTS needs a whole card, so on the
+  A100 `MODEL_GPU_IDS` keeps card 5 for it: the 27B may use only 0-4. Without that the 27B replicas
+  never gave a card back and TTS failed in both regions. Until the CN re-embed ends, card 5 runs a
+  third embedding provider, so TTS has no card on the A100 then. A region with no free slot answers
+  `503 gpu_busy` and the other region takes it. ASR has no queue
   to measure: an upload of `ASR_OVERFLOW_MIN_SECONDS` (default 300) or more that would run on the
   CPU worker because no GPU has room gets `503 queue_overflow` instead; shorter clips stay on the
   local CPU, which beats a crossing plus the peer lane's possible ~40 s cold start.
@@ -44,9 +47,31 @@ client ─► Cloudflare ─► tunnel ─► LiteLLM :8900 ──order 1──�
   `/audio/transcriptions` (verified with a stub backend), so model_manager also treats any request
   from another host (not loopback, not `LISTEN_HOST`) as already crossed.
 * CN forwards the 35B straight to GPU4's model_manager.
-* Both LiteLLMs share one Postgres, so keys, budgets, spend logs and `previous_response_id`
-  work from either entrance. Only the US LiteLLM migrates the schema
-  (`disable_prisma_schema_update` in `config.cn.yaml`) and runs the 7-day spend-log cleanup.
+* Each LiteLLM has its own Postgres, so a CN request never depends on the border crossing for its
+  key check or its `previous_response_id` history. Until 2026-11-09 the A100 used GPU4's database,
+  and a degraded link failed most CN requests for about 40 minutes.
+
+## CN LiteLLM database
+
+* `llm-litellm-pg` runs `postgres:16` with `--restart unless-stopped`, host networking and data in
+  `pgdata/`. Its password is in `pg-local.env` (mode 600). It listens on loopback only.
+* GPU4 is the source of truth for keys. `llm-litellm-key-sync.timer` runs
+  `scripts/sync_cn_litellm_keys.sh` daily at 03:00 Beijing time, from `LITELLM_SYNC_SOURCE_URL` in
+  `gateway.env`, retrying every 5 minutes for about an hour if it fails.
+  It copies keys only, because none of them uses LiteLLM's budget, organization or project tables,
+  and deletes keys that GPU4 no longer has. A key change made on the A100 is overwritten, so make
+  key changes on GPU4. A new, changed or revoked key reaches CN only at the next run, up to a day
+  later, so after any key change, above all a revocation, run
+  `sudo systemctl start llm-litellm-key-sync.service` on the A100; it takes effect within 60 s (key
+  cache). If the sync fails, the A100 keeps serving from its last good copy.
+* Spend is per region: the sync never writes `spend`, `model_spend` or `last_active`. A key's
+  budget is enforced against that region's spend only, and spend logs and daily totals must be
+  read from both databases. The A100 runs its own 7-day spend-log cleanup.
+* `previous_response_id` works only within the region that stored the response.
+* When LiteLLM is upgraded, migrate this database by hand: `disable_prisma_schema_update` stays on
+  so a restart cannot change the schema.
+* Rollback: put GPU4's URL (`LITELLM_SYNC_SOURCE_URL`, with `?connection_limit=10&pool_timeout=60`)
+  back as `DATABASE_URL` and `sudo systemctl restart llm-litellm`. A restart gives about 70 s of 502s.
 
 ## Network facts (measured 2026-11-07)
 
@@ -114,8 +139,8 @@ CN service ─► https://llm-cn.preseen.ai:18900 ─► site NAT 27.221.10.54:1
 * Ports: slots start at 9300 (`GPU_PORT_BASE`) and co-resident lanes at 9500, because 9027 and 9100
   are taken on this host.
 * Six other users have sudo on this host. They can read `gateway.env` (LiteLLM master key, the
-  `litellm_cn` password) and, through the database, every virtual key hash and seven days of stored
-  prompts. Derek accepted this on 2026-11-07. `/admin/kill|start|switch` are loopback-only, so
+  GPU4 database URL), `pg-local.env` and, through the databases, every virtual key hash and seven
+  days of stored prompts. Derek accepted this on 2026-11-07. `/admin/kill|start|switch` are loopback-only, so
   they cannot drive GPU4's slots over Tailscale.
 
 ## Single-card measurements (GPU 3, A100-PCIE-40GB, random 2048 in / 512 out)

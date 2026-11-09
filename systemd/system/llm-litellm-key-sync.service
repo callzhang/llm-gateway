@@ -1,0 +1,15 @@
+[Unit]
+Description=Copy LiteLLM virtual keys from GPU4 to the A100's local database
+After=docker.service network-online.target
+# A daily run must survive a flaky border crossing: retry for about an hour.
+StartLimitIntervalSec=2h
+StartLimitBurst=12
+
+[Service]
+Type=oneshot
+User=derek
+Group=derek
+ExecStart=/data/derek/llm-gateway/sync_cn_litellm_keys.sh
+TimeoutStartSec=50
+Restart=on-failure
+RestartSec=5min
