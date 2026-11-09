@@ -124,6 +124,8 @@ general_settings:
   port: 8900
   health_check_interval: 0
   store_prompts_in_spend_logs: true
-  # The database is GPU4's: only the US LiteLLM migrates its schema and runs
-  # the spend-log retention cleanup.
+  # Rows hold raw prompt/response text, so cap retention, as in config.yaml.
+  maximum_spend_logs_retention_period: "7d"
+  # The local database is loaded from a dump of GPU4's, so migrate it by hand
+  # when LiteLLM is upgraded (docs/region-cn.md).
   disable_prisma_schema_update: true

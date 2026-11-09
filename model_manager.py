@@ -41,7 +41,7 @@ import signal
 import subprocess
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import aiohttp
@@ -659,6 +659,26 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
         idle_timeout=300,
     ),
 }
+
+
+def _pin_model_gpus(configs: dict[str, ModelConfig], spec: str) -> dict[str, ModelConfig]:
+    """Apply MODEL_GPU_IDS ("model=0,2;other=5"), which restricts each named model to those GPUs.
+
+    TTS needs a whole card, and a chat model that keeps its replicas busy never gives one back.
+    Pinning the chat model away from a card keeps that card for TTS.
+    """
+    pinned = dict(configs)
+    for entry in filter(None, (part.strip() for part in spec.split(";"))):
+        name, _, ids = entry.partition("=")
+        name = name.strip()
+        gpu_ids = {int(x) for x in ids.split(",") if x.strip()}
+        if name not in configs or not gpu_ids:
+            raise ValueError(f"MODEL_GPU_IDS entry needs a known model and GPUs: {entry!r}")
+        pinned[name] = replace(configs[name], allowed_gpu_ids=gpu_ids)
+    return pinned
+
+
+MODEL_CONFIGS = _pin_model_gpus(MODEL_CONFIGS, os.environ.get("MODEL_GPU_IDS", ""))
 
 # Minimum free GPU memory (GiB, from nvidia-smi) required to start a model.
 # Used as a pre-eviction guard: before evicting an idle model to free a slot,
