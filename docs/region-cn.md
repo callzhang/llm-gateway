@@ -36,9 +36,8 @@ client ─► Cloudflare ─► tunnel ─► LiteLLM :8900 ──order 1──�
 * LiteLLM 1.99 tries `order: 2` only after `order: 1` fails. `disable_cooldowns: true` keeps a
   burst of overflow 503s from benching the local deployment.
 * TTS and ASR run in both regions too, each region's own first. TTS needs a whole card, so on the
-  A100 `MODEL_GPU_IDS` keeps card 5 for it: the 27B may use only 0-4. Without that the 27B replicas
-  never gave a card back and TTS failed in both regions. Until the CN re-embed ends, card 5 runs a
-  third embedding provider, so TTS has no card on the A100 then. A region with no free slot answers
+  A100 `MODEL_GPU_IDS` keeps card 5 for it: the 27B may use 0-4 and 6. Without that the 27B replicas
+  never gave a card back and TTS failed in both regions. A region with no free slot answers
   `503 gpu_busy` and the other region takes it. ASR has no queue
   to measure: an upload of `ASR_OVERFLOW_MIN_SECONDS` (default 300) or more that would run on the
   CPU worker because no GPU has room gets `503 queue_overflow` instead; shorter clips stay on the
@@ -46,6 +45,13 @@ client ─► Cloudflare ─► tunnel ─► LiteLLM :8900 ──order 1──�
 * LiteLLM 1.99 drops a deployment's `extra_headers` on `/audio/speech` and
   `/audio/transcriptions` (verified with a stub backend), so model_manager also treats any request
   from another host (not loopback, not `LISTEN_HOST`) as already crossed.
+* CN memory embeds through public 41006 → A100 :18101, where Caddy (`llm-embedding-proxy`,
+  `/data/derek/embedding-provider/Caddyfile.embedding`) strips `/retrieval` and forwards to
+  `llm-embedding-provider` (:17997, card 1). It starts on CPU, moves to the GPU on the first request
+  (`CPU_TO_GPU_SCALE_UP_TEXTS=1`) and back to CPU only after 300 s idle; load-based scale-down is off
+  (`GPU_TO_CPU_SCALE_DOWN_TEXTS=0`) because CN sends 1-2 texts per request and the busy host CPU
+  could not keep up (queue stall 2026-11-11 17:16Z). `llm-embedding-provider-2` (card 6) is a
+  disabled spare for the next re-embed.
 * CN forwards the 35B straight to GPU4's model_manager.
 * Each LiteLLM has its own Postgres, so a CN request never depends on the border crossing for its
   key check or its `previous_response_id` history. Until 2026-11-09 the A100 used GPU4's database,
