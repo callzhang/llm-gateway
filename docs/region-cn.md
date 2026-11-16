@@ -142,6 +142,25 @@ CN service ─► https://llm-cn.preseen.ai:18900 ─► site NAT 27.221.10.54:1
 * vLLM 0.29 picks a CUTLASS FP8 kernel for ASR's online FP8 on Ampere, which has no FP8; the
   first forward fails in `cutlass_scaled_mm_sm80_epilogue`. `ASR_VLLM_DISABLED_KERNELS` lists
   the kernels ahead of Marlin so it falls through to Marlin W8A16.
+* qwen3.8-27b runs on SGLang 0.5.17 on the A100 (`QWEN27B_ENGINE=sglang` in `gateway.env`, script
+  `run_qwen38_27b_sglang.sh`, venv `/data/derek/venv-sglang0517`, runtime files in
+  `/data/derek/sglang-runtime`); switched 2026-11-14 08:08Z for finer prefix reuse on the hybrid model:
+  SGLang keeps attention KV per token (`page_size=1`) and a Mamba state every 256 tokens
+  (`mamba_track_interval`), where vLLM aligns hits to 1,584-token blocks. model_manager accepts an
+  SGLang process for a slot only with `--context-length 131072` and no `--speculative-algorithm`.
+* SGLang ignores vLLM's `thinking_token_budget`. model_manager moves it into SGLang's thinking-budget
+  processor (`custom_logit_processor` naming `sglang_plugins/friday_thinking_budget.py`, plus
+  `custom_params.thinking_budget`), which the launch script enables with
+  `--enable-custom-logit-processor` and puts on `PYTHONPATH`. SGLang's own
+  `Qwen3ThinkingBudgetLogitProcessor` does not work here: it hardcodes `<think>`/`</think>` =
+  151667/151668, qwen3.8's are 248068/248069, and it reads `req.output_ids`, which lags a step under
+  the overlap scheduler, so it closes thinking twice and the answer starts with `</think>`. Ours keeps
+  per-request state in `custom_params`. Without the translation CN's memory jobs thought
+  without limit (community summaries hit the 8,192-token output ceiling and the 300 s task timeout,
+  2026-11-14 to 11-16). Check: a request with `thinking_token_budget: 64` returns about 65 reasoning
+  tokens.
+* SGLang's FlashInfer JIT needs `ninja` on `PATH` (it is in `venv-vllm029/bin`, which model_manager's
+  environment provides); a hand-started SGLang without it dies at the first prefill-kernel build.
 * Ports: slots start at 9300 (`GPU_PORT_BASE`) and co-resident lanes at 9500, because 9027 and 9100
   are taken on this host.
 * Six other users have sudo on this host. They can read `gateway.env` (LiteLLM master key, the

@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-11-16
+
+### Fixed
+- The A100's SGLang backend for qwen3.8-27b now honours a thinking budget. SGLang ignores vLLM's
+  `thinking_token_budget`, so since the A100 switched the 27B to SGLang (2026-11-14 08:08Z) CN's memory
+  jobs thought without limit: community summaries returned exactly 8,192 output tokens (5,918-8,192 of
+  them reasoning) or were cut by the client at 300 s. model_manager now turns `thinking_token_budget`
+  into SGLang's thinking-budget processor for an `engine: sglang` model. The processor is our own
+  `sglang_plugins/friday_thinking_budget.py`: SGLang's `Qwen3ThinkingBudgetLogitProcessor` hardcodes
+  Qwen3's think-token ids (151667/151668), and qwen3.8's are 248068/248069, so it never applied
+  (measured on the A100: budget 64 -> 538 reasoning tokens with SGLang's class). It also reads
+  `req.output_ids`, which under SGLang's overlap scheduler lags one step, so it forced `</think>` twice
+  and the second started the answer; ours keeps its own state in the request's `custom_params`.
+  Measured on an A100 test instance started from `run_qwen38_27b_sglang.sh`: budgets 64/256/300 give
+  65/257/301 reasoning tokens, no `</think>` in any answer, with and without a JSON schema.
+
+### Added
+- The A100's SGLang engine support, which had run there uncommitted since 2026-11-14:
+  `ModelConfig.engine`, SGLang process detection and queue metric in model_manager,
+  `QWEN27B_ENGINE=sglang`, and `run_qwen38_27b_sglang.sh` (now with `--enable-custom-logit-processor`).
+
 ## 2026-11-08
 
 ### Fixed
