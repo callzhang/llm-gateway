@@ -345,7 +345,7 @@ def _gpu_vllm_used_mib(gpu_id: int) -> float:
             try:
                 with open(f"/proc/{pid_val}/cmdline", "rb") as f:
                     cmdline = f.read().decode("utf-8", errors="ignore")
-                if "vllm" in cmdline.lower():
+                if any(engine in cmdline.lower() for engine in ("vllm", "sglang")):
                     total += mem_val
             except (FileNotFoundError, PermissionError):
                 pass
@@ -380,7 +380,7 @@ def _gpu_vllm_pids(gpu_id: int) -> "list[tuple[int, str]]":
                 cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
         except (FileNotFoundError, PermissionError):
             continue
-        if "vllm" in cmdline.lower():
+        if any(engine in cmdline.lower() for engine in ("vllm", "sglang")):
             found.append((pid, mem))
     return found
 
@@ -410,7 +410,7 @@ def _find_vllm_pid_for_port(port: int) -> int | None:
         return pid
     try:
         result = subprocess.run(
-            ["pgrep", "-f", f"vllm(-omni)? serve.* --port {port}( |$)"],
+            ["pgrep", "-f", f"(vllm(-omni)? serve|sglang.launch_server).* --port {port}( |$)"],
             capture_output=True, text=True, timeout=2,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -472,8 +472,16 @@ def _adopted_vllm_matches_config(
     if not args:
         return False
 
+    is_sglang = "sglang.launch_server" in args
+    if (config.engine == "sglang") != is_sglang:
+        return False
+    if is_sglang:
+        if _cmdline_option(args, "--context-length") != "131072":
+            return False
+        if "--language-only" in args or "--speculative-algorithm" in args:
+            return False
     if config.max_num_seqs is not None:
-        raw_max_num_seqs = _cmdline_option(args, "--max-num-seqs")
+        raw_max_num_seqs = _cmdline_option(args, "--max-running-requests" if is_sglang else "--max-num-seqs")
         if raw_max_num_seqs is None:
             return False
         try:
@@ -484,7 +492,7 @@ def _adopted_vllm_matches_config(
 
     desired_util = MODEL_GPU_MEM_UTIL.get(model_name)
     if desired_util is not None:
-        raw_util = _cmdline_option(args, "--gpu-memory-utilization")
+        raw_util = _cmdline_option(args, "--mem-fraction-static" if is_sglang else "--gpu-memory-utilization")
         if raw_util is None:
             return False
         try:
@@ -571,6 +579,7 @@ class ModelConfig:
     request_kind: Literal["chat", "speech", "transcription"] = "chat"
     max_input_chars: int | None = None
     max_num_seqs: int | None = None
+    engine: Literal["vllm", "sglang"] = "vllm"
     # Scheduled by VRAM budget instead of taking a GPU slot: a small model that
     # shares a GPU with whichever primary model owns the slot.  It is admitted
     # only where the GPU's current free VRAM covers its min-viable footprint,
@@ -580,6 +589,8 @@ class ModelConfig:
     idle_timeout: int | None = None
 
     def __post_init__(self) -> None:
+        if self.engine not in ("vllm", "sglang"):
+            raise ValueError("engine must be vllm or sglang")
         if self.idle_timeout is not None and (
             type(self.idle_timeout) is not int or self.idle_timeout <= 0
         ):
@@ -636,7 +647,9 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
     #     flat, 72.0 (batch 4) vs 71.0 (batch 8) tok/s, a 1.4% drop.  KV at 8:
     #     254,862/8 = 31.8k tokens per seq vs ~9k p50 requests.
     "qwen3.8-27b": ModelConfig(
-        "run_qwen38_27b.sh", "qwen3.8-27b", max_num_seqs=8
+        ("run_qwen38_27b_sglang.sh" if os.environ.get("QWEN27B_ENGINE") == "sglang" else "run_qwen38_27b.sh"), "qwen3.8-27b",
+        max_num_seqs=(16 if os.environ.get("QWEN27B_ENGINE") == "sglang" else 8),
+        engine=os.environ.get("QWEN27B_ENGINE", "vllm")
     ),
     "qwen3-tts-1.7b-customvoice": ModelConfig(
         "run_qwen3_tts_1_7b_customvoice.sh",
@@ -746,7 +759,7 @@ MODEL_MIN_FREE_GIB: dict[str, float] = {
 CHAT_GPU_MEM_UTIL_CEILING = 0.95
 MODEL_GPU_MEM_UTIL: dict[str, float] = {
     "qwen3.6-35b-a3b-heretic": CHAT_GPU_MEM_UTIL_CEILING,
-    "qwen3.8-27b":             CHAT_GPU_MEM_UTIL_CEILING,
+    "qwen3.8-27b":             (0.82 if os.environ.get("QWEN27B_ENGINE") == "sglang" else CHAT_GPU_MEM_UTIL_CEILING),
     # Measured on an RTX 5090 (2026-09-26, vLLM 0.29 fp8, --enforce-eager,
     # --max-model-len 1536): at 0.10 the weights take 1.44 GiB, the process
     # settles at ~2.7 GiB with the CUDA context, and vLLM reports 0.37 GiB of KV
@@ -1075,6 +1088,35 @@ DEFAULT_REQUEST_PRIORITY = 100
 MAX_REQUEST_PRIORITY = 255
 
 
+# SGLang ignores vLLM's `thinking_token_budget`; it caps thinking only through a custom logit processor
+# (server flag --enable-custom-logit-processor). This is SGLang's serialized reference to
+# sglang_plugins/friday_thinking_budget.py:Qwen38ThinkingBudgetLogitProcessor (a pickle STACK_GLOBAL of
+# that module and class, no code), generated with its own to_str().
+SGLANG_QWEN38_THINKING_BUDGET_PROCESSOR = json.dumps({"callable": (
+    "80049541000000000000008c166672696461795f7468696e6b696e675f627564676574948c22"
+    "5177656e33385468696e6b696e674275646765744c6f67697450726f636573736f729493942e"
+)})
+
+
+def translate_thinking_budget_for_sglang(parsed_body: dict) -> bool:
+    """Move vLLM's `thinking_token_budget` into SGLang's thinking-budget processor; True when the body changed.
+
+    Without this an SGLang backend thinks without limit: on CN (2026-11-14 to 11-16) community summaries ran into the
+    8,192-token output ceiling and 300 s client timeouts although the caller sent a budget of 4096.
+    """
+    if "thinking_token_budget" not in parsed_body:
+        return False
+    budget = parsed_body.pop("thinking_token_budget")
+    if type(budget) is not int or budget < 0:
+        raise ValueError("thinking_token_budget must be a non-negative integer")
+    custom_params = parsed_body.get("custom_params")
+    if not isinstance(custom_params, dict):
+        custom_params = {}
+    parsed_body["custom_params"] = {**custom_params, "thinking_budget": budget}
+    parsed_body["custom_logit_processor"] = SGLANG_QWEN38_THINKING_BUDGET_PROCESSOR
+    return True
+
+
 def request_priority(parsed_body: dict | None) -> int:
     """Priority carried in the request body: an integer 0..255, smaller runs first.
 
@@ -1141,6 +1183,29 @@ class PriorityGate:
             fut.set_result(None)
 
 
+def _engine_waiting_count(text: str, engine: str) -> int:
+    if engine == "vllm":
+        # Preserve the existing vLLM first-series behavior for other models.
+        for line in text.splitlines():
+            if line.startswith("vllm:num_requests_waiting"):
+                try:
+                    return int(float(line.rsplit(" ", 1)[1]))
+                except (ValueError, IndexError):
+                    return 0
+        return 0
+    metric = "sglang:num_queue_reqs"
+    total = 0
+    for line in text.splitlines():
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if name != metric:
+            continue
+        try:
+            total += int(float(line.rsplit(" ", 1)[1]))
+        except (ValueError, IndexError):
+            continue
+    return total
+
+
 class GpuBackend:
     """Manages one vLLM subprocess: a specific model on a specific GPU slot."""
 
@@ -1154,6 +1219,7 @@ class GpuBackend:
         max_num_seqs: int | None = None,
         idle_timeout: int | None = None,
         coresident: bool = False,
+        engine: str = "vllm",
     ):
         self.model_name  = model_name
         self.served_name = served_name
@@ -1163,6 +1229,7 @@ class GpuBackend:
         self.vllm_base   = f"http://127.0.0.1:{slot.port}"
         self.script      = os.path.join(SCRIPT_DIR, script)
         self.max_num_seqs = max_num_seqs
+        self.engine = engine
         self.idle_timeout = idle_timeout
         self.coresident   = coresident
         safe             = model_name.replace(".", "_")
@@ -1281,13 +1348,7 @@ class GpuBackend:
                 text = await r.text()
         except Exception:
             return gate_waiting
-        for line in text.splitlines():
-            if line.startswith("vllm:num_requests_waiting"):
-                try:
-                    return int(float(line.rsplit(" ", 1)[1])) + gate_waiting
-                except (ValueError, IndexError):
-                    return gate_waiting
-        return gate_waiting
+        return _engine_waiting_count(text, self.engine) + gate_waiting
 
     async def stop(self) -> None:
         """Gracefully stop this backend and release its slot."""
@@ -2358,6 +2419,7 @@ class DynamicRouter:
             max_num_seqs=config.max_num_seqs,
             idle_timeout=config.idle_timeout,
             coresident=config.coresident,
+            engine=config.engine,
         )
         b.router = self
         return b
@@ -2577,6 +2639,7 @@ class DynamicRouter:
             else:
                 entry.update(
                     model=b.model_name,
+                    engine=b.engine,
                     ready=b._ready,
                     running=b.is_running,
                     failed=b._failed,
@@ -3251,6 +3314,17 @@ class DynamicRouter:
             if "priority" in parsed_body:
                 parsed_body.pop("priority")
                 body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
+            if config.engine == "sglang":
+                try:
+                    if translate_thinking_budget_for_sglang(parsed_body):
+                        body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
+                except ValueError as exc:
+                    return web.Response(
+                        status=400, content_type="application/json",
+                        body=json.dumps({"error": {
+                            "message": str(exc), "type": "invalid_request_error",
+                        }}),
+                    )
 
         # Sticky routing metadata is backend-independent — parse it once, before
         # the retry loop below.  x-task-id pins all turns of one task to the same
