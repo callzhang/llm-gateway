@@ -92,7 +92,7 @@ class ProcessorReference(unittest.TestCase):
 
     def test_the_plugin_names_qwen38_think_tokens(self):
         source = open("sglang_plugins/friday_thinking_budget.py").read()
-        self.assertIn("class Qwen38ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor)", source)
+        self.assertIn("class Qwen38ThinkingBudgetLogitProcessor(CustomLogitProcessor)", source)
         for token_id in ("248068", "248069", "198"):
             self.assertIn(token_id, source)
 

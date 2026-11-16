@@ -153,7 +153,9 @@ CN service ─► https://llm-cn.preseen.ai:18900 ─► site NAT 27.221.10.54:1
   `custom_params.thinking_budget`), which the launch script enables with
   `--enable-custom-logit-processor` and puts on `PYTHONPATH`. SGLang's own
   `Qwen3ThinkingBudgetLogitProcessor` does not work here: it hardcodes `<think>`/`</think>` =
-  151667/151668, qwen3.8's are 248068/248069. Without the translation CN's memory jobs thought
+  151667/151668, qwen3.8's are 248068/248069, and it reads `req.output_ids`, which lags a step under
+  the overlap scheduler, so it closes thinking twice and the answer starts with `</think>`. Ours keeps
+  per-request state in `custom_params`. Without the translation CN's memory jobs thought
   without limit (community summaries hit the 8,192-token output ceiling and the 300 s task timeout,
   2026-11-14 to 11-16). Check: a request with `thinking_token_budget: 64` returns about 65 reasoning
   tokens.

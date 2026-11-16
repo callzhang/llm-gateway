@@ -10,7 +10,11 @@
   into SGLang's thinking-budget processor for an `engine: sglang` model. The processor is our own
   `sglang_plugins/friday_thinking_budget.py`: SGLang's `Qwen3ThinkingBudgetLogitProcessor` hardcodes
   Qwen3's think-token ids (151667/151668), and qwen3.8's are 248068/248069, so it never applied
-  (measured on the A100: budget 64 -> 538 reasoning tokens with SGLang's class, 65-67 with ours).
+  (measured on the A100: budget 64 -> 538 reasoning tokens with SGLang's class). It also reads
+  `req.output_ids`, which under SGLang's overlap scheduler lags one step, so it forced `</think>` twice
+  and the second started the answer; ours keeps its own state in the request's `custom_params`.
+  Measured on an A100 test instance started from `run_qwen38_27b_sglang.sh`: budgets 64/256/300 give
+  65/257/301 reasoning tokens, no `</think>` in any answer, with and without a JSON schema.
 
 ### Added
 - The A100's SGLang engine support, which had run there uncommitted since 2026-11-14:
