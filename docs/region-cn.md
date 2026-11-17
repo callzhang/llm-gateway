@@ -159,6 +159,18 @@ CN service ─► https://llm-cn.preseen.ai:18900 ─► site NAT 27.221.10.54:1
   without limit (community summaries hit the 8,192-token output ceiling and the 300 s task timeout,
   2026-11-14 to 11-16). Check: a request with `thinking_token_budget: 64` returns about 65 reasoning
   tokens.
+* JSON-schema output on SGLang runs with `--constrained-json-disable-any-whitespace`. xgrammar otherwise allows
+  any amount of whitespace between JSON tokens, and a string the model closed early with a bare `"` left it
+  nothing else to emit: CN memory's judges padded whitespace up to their 16,000-token ceiling (about 575 s each,
+  up to 25 an hour on 2026-11-17).
+* LiteLLM rebuilds a `previous_response_id` conversation from `LiteLLM_SpendLogs` and, by default, cuts every
+  stored string past 2,048 characters, splicing in "(litellm_truncated skipped N chars ...)". The continued
+  request then reaches the model with gutted instructions and earlier answers (CN memory's continued
+  extractions, 2026-11-17: 87 of 142 failed or returned only reasoning). `run_litellm.sh` therefore sets
+  `MAX_STRING_LENGTH_PROMPT_IN_DB` to 10,000,000; retention (`maximum_spend_logs_retention_period: "7d"`) still
+  bounds the table. Rows written before the change stay truncated, so a conversation continued from one of them
+  still gets the cut text. Check: `select count(*) from "LiteLLM_SpendLogs" where "startTime" > <restart> and
+  proxy_server_request::text like '%litellm_truncated%'` is 0.
 * SGLang's FlashInfer JIT needs `ninja` on `PATH` (it is in `venv-vllm029/bin`, which model_manager's
   environment provides); a hand-started SGLang without it dies at the first prefill-kernel build.
 * Ports: slots start at 9300 (`GPU_PORT_BASE`) and co-resident lanes at 9500, because 9027 and 9100

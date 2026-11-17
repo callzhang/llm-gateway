@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-11-17
+
+### Fixed
+- LiteLLM no longer truncates the prompts and responses it stores (`MAX_STRING_LENGTH_PROMPT_IN_DB` set to
+  10,000,000 in `run_litellm.sh`). It rebuilds a `previous_response_id` conversation from those rows, and the
+  default 2,048-character cut sent continued requests with gutted instructions and earlier answers: on the A100,
+  CN memory's continued extractions thought 10-20k tokens and returned no answer or failed in 87 of 142 calls
+  (2026-11-17 00:00-07:00Z). Rows stored before the change stay truncated.
+- SGLang JSON-schema output no longer allows unlimited whitespace (`--constrained-json-disable-any-whitespace`).
+  A string value closed early by a bare `"` left the model only whitespace to emit, and CN memory's judges ran
+  to their 16,000-token ceiling (about 575 s each, up to 25 an hour).
+
 ## 2026-11-16
 
 ### Fixed
