@@ -18,6 +18,10 @@ export SGLANG_PLUGINS=friday_tool_json
 # thinking_token_budget (SGLang ignores that vLLM option); loaded by reference, so it must be importable here.
 export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/sglang_plugins${PYTHONPATH:+:$PYTHONPATH}"
 export SGLANG_IMAGE_MAX_PIXELS=4194304 SGLANG_IMAGE_MIN_PIXELS=65536
+# --constrained-json-disable-any-whitespace: xgrammar otherwise allows unlimited whitespace between JSON tokens.
+# When the model quoted a phrase with a bare `"` inside a string value, the string ended early and the grammar
+# left it nothing but whitespace, so it padded to the output ceiling (CN memory's judges: 16,000 tokens, ~575 s
+# each, up to 25 an hour on 2026-11-17).
 exec /data/derek/venv-sglang0517/bin/python -m sglang.launch_server \
  --model-path /data/zhoujunjie/models/Qwen3.8-27B-NVFP4 \
  --served-model-name qwen3.8-27b --host 127.0.0.1 --port "${VLLM_PORT:?manager port required}" \
@@ -30,5 +34,6 @@ exec /data/derek/venv-sglang0517/bin/python -m sglang.launch_server \
  --context-length "${VLLM_MAX_MODEL_LEN:-131072}" --chunked-prefill-size 4096 \
  --max-running-requests "${VLLM_MAX_NUM_SEQS:?manager capacity required}" \
  --max-queued-requests 128 --cuda-graph-max-bs-decode 32 \
- --grammar-backend xgrammar --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
+ --grammar-backend xgrammar --constrained-json-disable-any-whitespace \
+ --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
  --enable-custom-logit-processor --enable-cache-report --enable-metrics --api-key "${SGLANG_UPSTREAM_API_KEY:?gateway upstream auth required}"

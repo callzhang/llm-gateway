@@ -20,6 +20,13 @@ export LITELLM_MASTER_KEY
 # virtual key.  The A100 host has no host firewall and other users on its LAN,
 # so it sets LITELLM_HOST=127.0.0.1; its direct entrance is the TLS proxy
 # (deploy/Caddyfile.cn), which carries the source-IP allowlist.
+# Store prompts and responses in the spend logs whole. LiteLLM rebuilds a `previous_response_id`
+# conversation from those rows (responses/.../session_handler.py), and by default it cuts every
+# string past 2,048 characters and splices in "(litellm_truncated skipped N chars ...)", so a
+# continued request reached the model with gutted instructions and earlier answers. On the A100
+# (2026-11-17) CN memory's continued extractions thought 10-20k tokens and returned no answer in
+# 87 of 142 calls. Retention (maximum_spend_logs_retention_period) still bounds the table.
+export MAX_STRING_LENGTH_PROMPT_IN_DB="${MAX_STRING_LENGTH_PROMPT_IN_DB:-10000000}"
 # LITELLM_CONFIG: each region has its own model list (config.cn.yaml on the A100).
 exec "$GATEWAY_PY_BIN/litellm" \
   --config "$SCRIPT_DIR/${LITELLM_CONFIG:-config.yaml}" \
