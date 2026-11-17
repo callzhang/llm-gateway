@@ -73,6 +73,14 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export PYTHONNOUSERSITE=1
 VLLM_BIN=${VLLM_BIN:-/home/derek/miniforge3/envs/llm-gateway-vllm/bin/vllm}
 
+# See the structured-outputs note above the exec.
+export VLLM_JSON_MAX_WHITESPACE=${VLLM_JSON_MAX_WHITESPACE:-20}
+if [[ ! $VLLM_JSON_MAX_WHITESPACE =~ ^[1-9][0-9]*$ ]]; then
+  echo "VLLM_JSON_MAX_WHITESPACE must be a positive integer" >&2
+  exit 1
+fi
+export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/vllm_plugins${PYTHONPATH:+:$PYTHONPATH}"
+
 HF_TOKEN_FILE=/home/stardust/.cache/huggingface/token
 if [[ -f "$HF_TOKEN_FILE" ]]; then
   export HF_TOKEN="$(cat "$HF_TOKEN_FILE")"
@@ -98,9 +106,15 @@ MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:?VLLM_MAX_NUM_SEQS is required}
 # the parser alone it rejects any request carrying tools.  Keep comments out
 # of the exec's line continuation below — a '#' line there ends the command
 # early.
-# Compact JSON for structured outputs: pretty-printing was ~37% of the answer
-# tokens of memory extraction.  disable_any_whitespace needs an explicit
-# xgrammar/guidance backend (vLLM rejects it with backend=auto).
+# JSON whitespace in structured outputs: neither of vLLM's two modes works.
+# Compact (disable_any_whitespace, 2026-09-24 to 11-17) saved ~37% of
+# extraction answer tokens, but with thinking off the model puts 44-99% on "\n"
+# after `"entities": [`, the grammar masks it, and the leftover choice lands on
+# `]` often enough to empty the extraction (CN set: 16 of 48; allowing
+# whitespace: 1 of 48).  Unbounded whitespace lets a string closed early with a
+# bare `"` pad to the output ceiling (CN judges on SGLang: 16,000 tokens).
+# vllm_plugins/sitecustomize.py caps each whitespace run at
+# VLLM_JSON_MAX_WHITESPACE characters through xgrammar's max_whitespace_cnt.
 exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
@@ -114,7 +128,7 @@ exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --enable-prefix-caching \
   --enable-chunked-prefill \
   --speculative-config '{"method":"mtp","num_speculative_tokens":1,"revision":"35fd99fb8434ef70ee61372df3face5174bed2c8"}' \
-  --structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}' \
+  --structured-outputs-config '{"backend":"xgrammar"}' \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --enable-auto-tool-choice \
