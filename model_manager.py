@@ -769,6 +769,43 @@ MODEL_GPU_MEM_UTIL: dict[str, float] = {
 # Margin (MiB) held back from current free VRAM when computing util — absorbs
 # nvidia-smi jitter and small growth by other GPU processes during vLLM startup.
 GPU_MEM_UTIL_BUFFER_MIB = float(os.environ.get("GPU_MEM_UTIL_BUFFER_MIB", "768"))
+# A vLLM process's footprint beyond util x total (CUDA context + non-torch
+# memory), measured 2026-09-26 on a 32607 MiB RTX 5090: 30108 MiB used at 0.90.
+VLLM_PROCESS_OVERHEAD_MIB = 30108.0 - 0.90 * 32607.0
+
+
+def _parse_gpu_reserve(spec: str) -> dict[int, float]:
+    """Parse GPU_NEIGHBOUR_RESERVE_MIB ("1=4096;0=512") into {gpu_id: MiB}."""
+    reserve: dict[int, float] = {}
+    for entry in filter(None, (part.strip() for part in spec.split(";"))):
+        gpu, _, mib = entry.partition("=")
+        value = float(mib) if mib.strip() else -1.0
+        if value < 0:
+            raise ValueError(f"GPU_NEIGHBOUR_RESERVE_MIB entry needs <gpu>=<MiB>: {entry!r}")
+        reserve[int(gpu)] = value
+    return reserve
+
+
+# VRAM (MiB) per GPU that vLLM never plans into, for a neighbour that needs a
+# fixed slice to leave its CPU path: the embedding-provider scales up to CUDA for
+# bulk batches and fails with OOM when a chat model has taken the card to 0.95
+# (2026-11-17: 0.9 GiB left on both 5090s).  Unlike the 0.88 cap this replaced
+# (bd8998f, a reserve on every replica), it applies only to the GPUs listed, and
+# it holds whether or not the neighbour is on the GPU right now: it is counted
+# against the card's total, so a neighbour already using its slice is not counted
+# twice.  Size it from the neighbour's measured peak; see docs/gpu-neighbour-reserve.md.
+GPU_NEIGHBOUR_RESERVE_MIB: dict[int, float] = _parse_gpu_reserve(
+    os.environ.get("GPU_NEIGHBOUR_RESERVE_MIB", "")
+)
+
+
+def _vllm_room_mib(gpu_id: int, total_mib: float) -> float | None:
+    """MiB a new vLLM process may plan (util x total) on this GPU without
+    entering its neighbour reserve, or None when the GPU has no reserve."""
+    reserve = GPU_NEIGHBOUR_RESERVE_MIB.get(gpu_id)
+    if not reserve:
+        return None
+    return total_mib - reserve - _gpu_vllm_used_mib(gpu_id) - VLLM_PROCESS_OVERHEAD_MIB
 # Slack insisted on between a model's min-viable reservation and free VRAM, so
 # nvidia-smi jitter cannot turn a fitting spawn into a startup OOM.
 HARD_MARGIN_MIB = 256.0
@@ -1576,6 +1613,10 @@ class GpuBackend:
 
         min_viable = _min_viable_util(self.model_name, total)
         fit  = (free - GPU_MEM_UTIL_BUFFER_MIB) / total
+        room = _vllm_room_mib(self.gpu_id, total)
+        if room is not None:
+            # Round down: rounding up could reach into the reserve.
+            fit = min(fit, math.floor(room / total * 1000.0) / 1000.0)
         util = round(min(default, fit), 3)
 
         if util < min_viable:
@@ -1596,6 +1637,15 @@ class GpuBackend:
             # reservation and free VRAM, so a tiny nvidia-smi jitter doesn't OOM us.
             floor_needs_mib = min_viable * total
             margin_mib = CORESIDENT_OVERHEAD_MIB if self.coresident else HARD_MARGIN_MIB
+            if room is not None and floor_needs_mib > room:
+                msg = (
+                    f"GPU {self.gpu_id}: {self.model_name}'s min-viable util {min_viable} "
+                    f"({floor_needs_mib/1024:.1f} GiB) does not fit beside the "
+                    f"{GPU_NEIGHBOUR_RESERVE_MIB[self.gpu_id]/1024:.1f} GiB neighbour reserve "
+                    f"({room/1024:.1f} GiB left for vLLM). Not spawning here."
+                )
+                self.log.error(msg)
+                raise RuntimeError(msg)
             if free >= floor_needs_mib + margin_mib:
                 self.log.warning(
                     f"VRAM-aware util for {self.model_name}: GPU {self.gpu_id} "
@@ -2497,6 +2547,10 @@ class DynamicRouter:
             min_util = _min_viable_util(model_name, total)
             need = min_util * total + CORESIDENT_OVERHEAD_MIB
             need_gib = need / 1024.0
+            room = _vllm_room_mib(gpu, total)
+            if room is not None and min_util * total > room - reserved:
+                report.append(f"GPU {gpu}: {avail / 1024.0:.1f} GiB free but reserved for a neighbour")
+                continue
             report.append(f"GPU {gpu}: {avail / 1024.0:.1f} GiB free")
             if avail >= need:
                 has_primary = any(
