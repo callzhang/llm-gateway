@@ -2,6 +2,16 @@
 
 ## 2026-11-17
 
+### Added
+- `GPU_NEIGHBOUR_RESERVE_MIB` ("<gpu>=<MiB>;…", unset by default) keeps that much of a GPU out of every vLLM
+  spawn's plan, counted against the card's total so it holds whether or not the neighbour is on the GPU. With both
+  5090s at util 0.950 (about 0.9 GiB left each) the embedding-provider's CUDA scale-up failed with OOM on every try
+  on 2026-11-17, and long documents on its CPU queue made recall embeddings take 60-130 s. A spawn that cannot fit
+  its min-viable floor beside the reserve is refused rather than clamped into it; co-resident models skip a reserved
+  GPU without room. Sizing (from the embedder's measured footprint at `CUDA_MAX_FORWARD_TOKENS=8192`: 3,438 MiB) and
+  the KV cost (`1=4096` caps the 27B on GPU 1 at util 0.851, about 3.2 GiB less KV there):
+  `docs/gpu-neighbour-reserve.md`.
+
 ### Fixed
 - LiteLLM no longer truncates the prompts and responses it stores (`MAX_STRING_LENGTH_PROMPT_IN_DB` set to
   10,000,000 in `run_litellm.sh`). It rebuilds a `previous_response_id` conversation from those rows, and the
