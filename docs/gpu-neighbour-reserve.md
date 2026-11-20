@@ -3,8 +3,10 @@
 `GPU_NEIGHBOUR_RESERVE_MIB` keeps part of one GPU out of every vLLM spawn's plan, so that a neighbour process with a fixed footprint can always start there. The neighbour today is the embedding-provider (`embed.preseen.ai`, stardust's `embedding-provider.service`).
 
 ```
-GPU_NEIGHBOUR_RESERVE_MIB=1=4096      # gateway.env; "<gpu>=<MiB>", several joined by ";"
+GPU_NEIGHBOUR_RESERVE_MIB=1=3900      # gateway.env; "<gpu>=<MiB>", several joined by ";"
 ```
+
+gpu4 runs `1=3900` since 2026-11-20 (Derek): the largest round value under the 35B heretic's limit on GPU 1 (about 3,935 MiB), 336 MiB above the embedder's live peak of 3,564 MiB. With it the 27B on GPU 1 gets util 0.842 (0.842 × 32,149 + 1,176 = 28,246 MiB, 3,903 MiB free). The numbers below for `1=4096` show the formula.
 
 Unset, nothing changes: chat models take whatever is free at spawn, up to `CHAT_GPU_MEM_UTIL_CEILING` (0.95).
 
