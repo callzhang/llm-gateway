@@ -819,14 +819,33 @@ GPU_NEIGHBOUR_RESERVE_MIB: dict[int, float] = _parse_gpu_reserve(
 )
 
 
-def _vllm_room(gpu_id: int, total_mib: float) -> tuple[float, float] | None:
-    """(room, cuda_total): room is the MiB a new vLLM process may plan
-    (util x cuda_total) on this GPU while nvidia-smi still shows the neighbour
-    reserve free beside it, and cuda_total is what vLLM multiplies util by.  None
-    when the GPU has no reserve.  Raises RuntimeError when the driver-reserved
+def _parse_model_names(spec: str) -> frozenset[str]:
+    """Parse a comma-separated list of models whose util the manager sets."""
+    names = frozenset(filter(None, (part.strip() for part in spec.split(","))))
+    unknown = sorted(names - MODEL_GPU_MEM_UTIL.keys())
+    if unknown:
+        raise ValueError(f"unknown model(s) {unknown}; known: {sorted(MODEL_GPU_MEM_UTIL)}")
+    return names
+
+
+# Models that ignore GPU_NEIGHBOUR_RESERVE_MIB and plan as on any other GPU.  The
+# 35B heretic's KV collapses near its floor: held to GPU 1's 3,900 MiB slice it
+# starts at about 0.84 (169k KV tokens) instead of 0.95 (454k), so on 2026-11-20
+# Derek exempted it.  While it holds the card the neighbour has no slice there and
+# stays on its CPU path (the embedder's scale-up fails and it retries later).
+GPU_NEIGHBOUR_RESERVE_EXEMPT_MODELS: frozenset[str] = _parse_model_names(
+    os.environ.get("GPU_NEIGHBOUR_RESERVE_EXEMPT_MODELS", "")
+)
+
+
+def _vllm_room(gpu_id: int, total_mib: float, model_name: str) -> tuple[float, float] | None:
+    """(room, cuda_total): room is the MiB a new vLLM process of model_name may
+    plan (util x cuda_total) on this GPU while nvidia-smi still shows the
+    neighbour reserve free beside it, and cuda_total is what vLLM multiplies util
+    by.  None when the GPU has no reserve or the model is exempt from it.  Raises RuntimeError when the driver-reserved
     memory cannot be read: without it the slice would come out short."""
     reserve = GPU_NEIGHBOUR_RESERVE_MIB.get(gpu_id)
-    if not reserve:
+    if not reserve or model_name in GPU_NEIGHBOUR_RESERVE_EXEMPT_MODELS:
         return None
     driver_reserved = _gpu_driver_reserved_mib(gpu_id)
     if driver_reserved is None:
@@ -1644,7 +1663,7 @@ class GpuBackend:
 
         min_viable = _min_viable_util(self.model_name, total)
         fit  = (free - GPU_MEM_UTIL_BUFFER_MIB) / total
-        room = _vllm_room(self.gpu_id, total)
+        room = _vllm_room(self.gpu_id, total, self.model_name)
         if room is not None:
             room_mib, cuda_total = room
             # Round down: rounding up could reach into the reserve.
@@ -2580,7 +2599,7 @@ class DynamicRouter:
             need = min_util * total + CORESIDENT_OVERHEAD_MIB
             need_gib = need / 1024.0
             try:
-                room = _vllm_room(gpu, total)
+                room = _vllm_room(gpu, total, model_name)
             except RuntimeError as exc:
                 report.append(str(exc))
                 continue

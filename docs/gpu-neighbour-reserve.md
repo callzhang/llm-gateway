@@ -31,7 +31,17 @@ Until 2026-11-20 the formula used `memory.total` and an overhead of 762 MiB meas
 
 On GPU 1 (32,607 MiB, 458 reserved, cuda_total 32,149) with `1=4096`, the 27B gets util 0.836 instead of 0.950. Its footprint is 0.836 × 32,149 + 1,176 = 28,053 MiB, leaving 4,096 MiB free, and its KV cache is about 7.1 GiB instead of 10.6 GiB (about 196k tokens instead of 293k; 1.5 instead of 2.2 requests of 131,072 tokens at once). Its context length per request is unchanged.
 
-The largest reserve a model can start beside is `cuda_total − 1,176 − min_viable × cuda_total`, where `min_viable` is the model's floor in GiB divided by `memory.total`, rounded up to 0.001, and rounding of the capped util costs up to 0.001 × cuda_total more. On GPU 1: the 27B (floor 24.83 GiB, util 0.780) can start beside up to about 5,860 MiB; the 35B heretic (floor 26.74 GiB, util 0.840) up to about 3,935 MiB, so with `1=4096` it no longer starts on GPU 1.
+The largest reserve a model can start beside is `cuda_total − 1,176 − min_viable × cuda_total`, where `min_viable` is the model's floor in GiB divided by `memory.total`, rounded up to 0.001, and rounding of the capped util costs up to 0.001 × cuda_total more. On GPU 1: the 27B (floor 24.83 GiB, util 0.780) can start beside up to about 5,860 MiB; the 35B heretic (floor 26.74 GiB, util 0.840) up to about 3,935 MiB, so with `1=4096` it would no longer start on GPU 1 unless exempt (see below).
+
+## Exempt models
+
+```
+GPU_NEIGHBOUR_RESERVE_EXEMPT_MODELS=qwen3.6-35b-a3b-heretic   # gateway.env; comma-separated
+```
+
+Listed models ignore the reserve and plan as on any other GPU. An unknown name stops model_manager at startup. gpu4 exempts the 35B heretic since 2026-11-20 (Derek): its KV collapses near its floor, and held to GPU 1's 3,900 MiB slice it would start at about util 0.84 (169,182 KV tokens, measured 2026-08-27) instead of 0.95 (454,121). While it holds GPU 1 the embedder has no slice there: its CUDA scale-up fails, it keeps serving on CPU, and it retries after `CUDA_RETRY_SECONDS`. The 27B and co-resident models keep the reserve.
+
+The heretic's floor itself is right. `MODEL_MIN_VIABLE_GIB` labels each measured util floor in GiB of the 5090's `memory.total` (0.84 × 31.84 GiB = 26.74), and `_min_viable_util` turns it back into the same 0.84, which is the util that was measured to work; vLLM applies it to CUDA's total as it did then.
 
 ## Sizing
 
