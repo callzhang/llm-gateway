@@ -17,12 +17,19 @@ The embedding-provider serves from CPU and moves bulk batches to a GPU worker. O
 For a GPU with a reserve, a vLLM process may plan at most
 
 ```
-room = total − reserve − (vLLM memory already on the GPU) − VLLM_PROCESS_OVERHEAD_MIB (762)
+cuda_total = memory.total − memory.reserved           # what vLLM multiplies util by
+room       = cuda_total − reserve − (vLLM memory already on the GPU) − VLLM_PROCESS_OVERHEAD_MIB (1,176)
 ```
 
-and `_gpu_mem_util_for_spawn` caps util at `floor(room / total, 0.001)`. The reserve is counted against the card's total, not its free memory, so it holds whether or not the neighbour is on the GPU, and a neighbour already using its slice is not counted twice. Spawns are refused rather than clamped up into the reserve: if the model's min-viable floor exceeds `room`, the spawn fails with "does not fit beside the … neighbour reserve". Co-resident models (ASR) skip a GPU whose room is reserved. GPUs without a reserve are unaffected.
+and `_gpu_mem_util_for_spawn` caps util at `floor(room / cuda_total, 0.001)`. `memory.reserved` is the memory the NVIDIA driver and firmware hold (458 MiB on gpu4's GPU 1, 491 MiB on GPU 0); no process can allocate it, CUDA leaves it out of the card's total, and vLLM's startup log shows that total ("Free memory on device (30.9/31.4 GiB)"). If it cannot be read, a spawn on the reserved GPU is refused. The reserve is counted against the card's total, not its free memory, so it holds whether or not the neighbour is on the GPU, and a neighbour already using its slice is not counted twice. Spawns are refused rather than clamped up into the reserve: if the model's min-viable floor exceeds `room`, the spawn fails with "does not fit beside the … neighbour reserve". Co-resident models (ASR) skip a GPU whose room is reserved. GPUs without a reserve are unaffected.
 
-On a 32,607 MiB RTX 5090 with `1=4096`, the 27B on GPU 1 gets util 0.851 instead of 0.950. Its footprint is 0.851 × 32,607 + 762 = 28,511 MiB, leaving 4,096 MiB free. That is about 3.2 GiB less KV cache on that replica only. The 27B floor is 24.83 GiB, so a reserve of up to 6,419 MiB still lets it start there; for the 35B heretic (floor 26.74 GiB) the limit is 4,463 MiB.
+`VLLM_PROCESS_OVERHEAD_MIB` is the vLLM process's nvidia-smi footprint beyond util × cuda_total, measured on the 27B after warm-up: 1,176 MiB at 0.95 on GPU 0, 1,142 at 0.95 on GPU 1, 1,165 at 0.851 on GPU 1 (2026-11-17 to 11-20). The largest is used.
+
+Until 2026-11-20 the formula used `memory.total` and an overhead of 762 MiB measured against it, which left the driver's memory inside the slice: with `1=4096` the 27B started at util 0.851 and, once warm, left 3,657 MiB free on GPU 1, 93 MiB above the embedder's 3,564 MiB peak.
+
+On GPU 1 (32,607 MiB, 458 reserved, cuda_total 32,149) with `1=4096`, the 27B gets util 0.836 instead of 0.950. Its footprint is 0.836 × 32,149 + 1,176 = 28,053 MiB, leaving 4,096 MiB free, and its KV cache is about 7.1 GiB instead of 10.6 GiB (about 196k tokens instead of 293k; 1.5 instead of 2.2 requests of 131,072 tokens at once). Its context length per request is unchanged.
+
+The largest reserve a model can start beside is `cuda_total − 1,176 − min_viable × cuda_total`, where `min_viable` is the model's floor in GiB divided by `memory.total`, rounded up to 0.001, and rounding of the capped util costs up to 0.001 × cuda_total more. On GPU 1: the 27B (floor 24.83 GiB, util 0.780) can start beside up to about 5,860 MiB; the 35B heretic (floor 26.74 GiB, util 0.840) up to about 3,935 MiB, so with `1=4096` it no longer starts on GPU 1.
 
 ## Sizing
 
@@ -36,7 +43,7 @@ Size the reserve from the neighbour's measured peak footprint, not from a guess,
 | 32,768 | 8,048 MiB |
 | 65,536 | 14,448 MiB |
 
-With `CUDA_MAX_FORWARD_TOKENS=8192`, the reserve of 4,096 MiB is the 3,438 MiB peak plus 658 MiB of headroom for allocator fragmentation. The embedder must be pinned to the reserved card (`CUDA_VISIBLE_DEVICES=1` in its env); otherwise it picks the card with the most free VRAM.
+With `CUDA_MAX_FORWARD_TOKENS=8192`, the reserve of 4,096 MiB is the 3,438 MiB peak plus 658 MiB of headroom for allocator fragmentation. The live worker peaked at 3,564 MiB on 2026-11-18 (8 texts of 8,192 tokens, one per forward). The embedder must be pinned to the reserved card (`CUDA_VISIBLE_DEVICES=1` in its env); otherwise it picks the card with the most free VRAM.
 
 ## Verify
 
