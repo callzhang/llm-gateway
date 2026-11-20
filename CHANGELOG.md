@@ -2,6 +2,11 @@
 
 ## 2026-11-20
 
+### Added
+- `GPU_NEIGHBOUR_RESERVE_EXEMPT_MODELS` (comma-separated, unset by default) lets listed models ignore
+  `GPU_NEIGHBOUR_RESERVE_MIB`. gpu4 lists the 35B heretic: held to GPU 1's 3,900 MiB slice it would start at about
+  util 0.84 (169k KV tokens) instead of 0.95 (454k). While it holds GPU 1 the embedder stays on CPU.
+
 ### Fixed
 - `GPU_NEIGHBOUR_RESERVE_MIB` now leaves the full reserve free in nvidia-smi. vLLM multiplies util by CUDA's total,
   which is `memory.total` minus the memory the driver and firmware reserve (458 MiB on gpu4's GPU 1), but the room

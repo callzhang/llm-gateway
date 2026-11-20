@@ -15,6 +15,7 @@ import model_manager
 from model_manager import GPUBusyError, GpuBackend, GpuSlot
 
 CHAT = "qwen3.8-27b"
+HERETIC = "qwen3.6-35b-a3b-heretic"
 ASR = "qwen3-asr-0.6b"
 TOTAL_MIB = 32607.0
 # nvidia-smi memory.reserved on gpu4's GPU 1: the driver and firmware hold it, no process can
@@ -91,6 +92,26 @@ class ReservedSpawnUtilTests(unittest.TestCase):
         primary = _footprint(0.836)
         with self.assertRaisesRegex(RuntimeError, "reserve"):
             _util(1, free=CUDA_TOTAL_MIB - primary, vllm_used=primary, model=ASR, coresident=True)
+
+
+class ReserveExemptModelTests(unittest.TestCase):
+    def test_exempt_model_ignores_the_reserve(self):
+        # 2026-11-20 (Derek): the 35B heretic is not held to GPU 1's slice.  Held to it, it starts at its
+        # 0.840 floor (about 169k KV tokens) instead of 0.95 (454k); the embedder stays on CPU meanwhile.
+        with patch.object(model_manager, "GPU_NEIGHBOUR_RESERVE_EXEMPT_MODELS", frozenset({HERETIC})):
+            self.assertEqual(model_manager.CHAT_GPU_MEM_UTIL_CEILING, _util(1, free=CUDA_TOTAL_MIB, model=HERETIC))
+            # Models not listed keep the reserve.
+            self.assertEqual(0.836, _util(1, free=CUDA_TOTAL_MIB))
+
+    def test_parses_exempt_model_names(self):
+        self.assertEqual(
+            frozenset({HERETIC, CHAT}), model_manager._parse_model_names(f" {HERETIC} , {CHAT} ")
+        )
+        self.assertEqual(frozenset(), model_manager._parse_model_names(""))
+
+    def test_unknown_exempt_model_name_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "qwen-typo"):
+            model_manager._parse_model_names("qwen-typo")
 
 
 class ReservedCoresidentPlacementTests(unittest.TestCase):
