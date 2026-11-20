@@ -322,6 +322,21 @@ def _gpu_total_mib(gpu_id: int) -> float | None:
         return None
 
 
+def _gpu_driver_reserved_mib(gpu_id: int) -> float | None:
+    """Return the GPU memory in MiB the NVIDIA driver and firmware reserve, or None on error.
+    No process can allocate it, and CUDA leaves it out of the card's total, so vLLM's
+    util x total is a fraction of memory.total minus this (gpu4: 458 MiB on GPU 1)."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--id={gpu_id}",
+             "--query-gpu=memory.reserved", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return float(out.splitlines()[0]) if out else None
+    except Exception:
+        return None
+
+
 def _gpu_vllm_used_mib(gpu_id: int) -> float:
     """Return total GPU memory (MiB) used by all vLLM processes on the given GPU.
     Includes EngineCore subprocesses which hold most of the VRAM.  Returns 0 on
@@ -769,9 +784,14 @@ MODEL_GPU_MEM_UTIL: dict[str, float] = {
 # Margin (MiB) held back from current free VRAM when computing util — absorbs
 # nvidia-smi jitter and small growth by other GPU processes during vLLM startup.
 GPU_MEM_UTIL_BUFFER_MIB = float(os.environ.get("GPU_MEM_UTIL_BUFFER_MIB", "768"))
-# A vLLM process's footprint beyond util x total (CUDA context + non-torch
-# memory), measured 2026-09-26 on a 32607 MiB RTX 5090: 30108 MiB used at 0.90.
-VLLM_PROCESS_OVERHEAD_MIB = 30108.0 - 0.90 * 32607.0
+# A vLLM process's footprint beyond util x CUDA total (CUDA context + non-torch
+# memory).  vLLM multiplies util by CUDA's total, which is nvidia-smi memory.total
+# minus the driver-reserved memory (its startup log: "Free memory on device
+# (30.9/31.4 GiB)" on a 32607 MiB card with 458 MiB reserved).  Measured on gpu4's
+# RTX 5090s with vLLM's 27B after warm-up: 31686 MiB at 0.95 on GPU 0 (491 MiB
+# reserved) on 2026-11-20 = 1176; 31684 MiB at 0.95 on GPU 1 = 1142; 28524 MiB at
+# 0.851 on GPU 1 = 1165.  The largest is used so a neighbour's slice is never short.
+VLLM_PROCESS_OVERHEAD_MIB = 31686.0 - 0.95 * (32607.0 - 491.0)
 
 
 def _parse_gpu_reserve(spec: str) -> dict[int, float]:
@@ -799,13 +819,24 @@ GPU_NEIGHBOUR_RESERVE_MIB: dict[int, float] = _parse_gpu_reserve(
 )
 
 
-def _vllm_room_mib(gpu_id: int, total_mib: float) -> float | None:
-    """MiB a new vLLM process may plan (util x total) on this GPU without
-    entering its neighbour reserve, or None when the GPU has no reserve."""
+def _vllm_room(gpu_id: int, total_mib: float) -> tuple[float, float] | None:
+    """(room, cuda_total): room is the MiB a new vLLM process may plan
+    (util x cuda_total) on this GPU while nvidia-smi still shows the neighbour
+    reserve free beside it, and cuda_total is what vLLM multiplies util by.  None
+    when the GPU has no reserve.  Raises RuntimeError when the driver-reserved
+    memory cannot be read: without it the slice would come out short."""
     reserve = GPU_NEIGHBOUR_RESERVE_MIB.get(gpu_id)
     if not reserve:
         return None
-    return total_mib - reserve - _gpu_vllm_used_mib(gpu_id) - VLLM_PROCESS_OVERHEAD_MIB
+    driver_reserved = _gpu_driver_reserved_mib(gpu_id)
+    if driver_reserved is None:
+        raise RuntimeError(
+            f"GPU {gpu_id}: cannot read the driver-reserved memory, so the "
+            f"{reserve / 1024:.1f} GiB neighbour reserve cannot be sized. Not spawning here."
+        )
+    cuda_total = total_mib - driver_reserved
+    room = cuda_total - reserve - _gpu_vllm_used_mib(gpu_id) - VLLM_PROCESS_OVERHEAD_MIB
+    return room, cuda_total
 # Slack insisted on between a model's min-viable reservation and free VRAM, so
 # nvidia-smi jitter cannot turn a fitting spawn into a startup OOM.
 HARD_MARGIN_MIB = 256.0
@@ -1613,10 +1644,11 @@ class GpuBackend:
 
         min_viable = _min_viable_util(self.model_name, total)
         fit  = (free - GPU_MEM_UTIL_BUFFER_MIB) / total
-        room = _vllm_room_mib(self.gpu_id, total)
+        room = _vllm_room(self.gpu_id, total)
         if room is not None:
+            room_mib, cuda_total = room
             # Round down: rounding up could reach into the reserve.
-            fit = min(fit, math.floor(room / total * 1000.0) / 1000.0)
+            fit = min(fit, math.floor(room_mib / cuda_total * 1000.0) / 1000.0)
         util = round(min(default, fit), 3)
 
         if util < min_viable:
@@ -1637,12 +1669,12 @@ class GpuBackend:
             # reservation and free VRAM, so a tiny nvidia-smi jitter doesn't OOM us.
             floor_needs_mib = min_viable * total
             margin_mib = CORESIDENT_OVERHEAD_MIB if self.coresident else HARD_MARGIN_MIB
-            if room is not None and floor_needs_mib > room:
+            if room is not None and min_viable * room[1] > room[0]:
                 msg = (
                     f"GPU {self.gpu_id}: {self.model_name}'s min-viable util {min_viable} "
-                    f"({floor_needs_mib/1024:.1f} GiB) does not fit beside the "
+                    f"({min_viable * room[1]/1024:.1f} GiB) does not fit beside the "
                     f"{GPU_NEIGHBOUR_RESERVE_MIB[self.gpu_id]/1024:.1f} GiB neighbour reserve "
-                    f"({room/1024:.1f} GiB left for vLLM). Not spawning here."
+                    f"({room[0]/1024:.1f} GiB left for vLLM). Not spawning here."
                 )
                 self.log.error(msg)
                 raise RuntimeError(msg)
@@ -2547,8 +2579,12 @@ class DynamicRouter:
             min_util = _min_viable_util(model_name, total)
             need = min_util * total + CORESIDENT_OVERHEAD_MIB
             need_gib = need / 1024.0
-            room = _vllm_room_mib(gpu, total)
-            if room is not None and min_util * total > room - reserved:
+            try:
+                room = _vllm_room(gpu, total)
+            except RuntimeError as exc:
+                report.append(str(exc))
+                continue
+            if room is not None and min_util * room[1] > room[0] - reserved:
                 report.append(f"GPU {gpu}: {avail / 1024.0:.1f} GiB free but reserved for a neighbour")
                 continue
             report.append(f"GPU {gpu}: {avail / 1024.0:.1f} GiB free")

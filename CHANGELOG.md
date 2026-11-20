@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-11-20
+
+### Fixed
+- `GPU_NEIGHBOUR_RESERVE_MIB` now leaves the full reserve free in nvidia-smi. vLLM multiplies util by CUDA's total,
+  which is `memory.total` minus the memory the driver and firmware reserve (458 MiB on gpu4's GPU 1), but the room
+  was computed against `memory.total` with an overhead calibrated the same way. With `1=4096` the 27B started at
+  0.851 and, once warm, left 3,657 MiB free on GPU 1, 93 MiB above the embedder's 3,564 MiB peak. The room is now
+  `memory.total − memory.reserved − reserve − other vLLM − 1,176 MiB` (overhead re-measured against CUDA's total,
+  the largest of three 27B readings), so the 27B gets 0.836. A spawn on a reserved GPU is refused if
+  `memory.reserved` cannot be read. With `1=4096` the 35B heretic (floor 0.840) no longer fits on GPU 1; see
+  docs/gpu-neighbour-reserve.md for each model's largest reserve.
+
 ## 2026-11-17
 
 ### Added
