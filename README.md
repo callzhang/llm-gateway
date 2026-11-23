@@ -211,6 +211,9 @@ Priority 0 is a grant held by a LiteLLM virtual key, not something a client can 
 - The peer region's requests reach model_manager from another host without passing that hook, so
   model_manager raises their priority to `PEER_PRIORITY_FLOOR` (1). Only this host's LiteLLM
   (a loopback caller) can deliver a 0.
+- Cross-region overflow (`OVERFLOW_QUEUE_DEPTH`) counts only the requests queued ahead of the
+  incoming one (priority number <= its own). A granted request is not sent to the peer region for a
+  queue it would jump; it waits at the head of the gate, up to `GATE_MAX_WAIT_SECONDS`.
 
 Grant a key (master key from `gateway.env`):
 
