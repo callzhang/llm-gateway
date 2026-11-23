@@ -9,6 +9,11 @@
   `PEER_PRIORITY_FLOOR` = 1. Before this, any client could claim 0: on 2026-11-22, 76 requests from the A100 and
   122 on the shared `memory-ci-controller` key did. New key `friday-memory-us-prod` (US production friday-memory)
   holds `gateway_priority: 0`; it is stored on GPU4 in `~/.config/llm-gateway/keys/`.
+- Cross-region overflow counts only the requests queued ahead of the incoming one: gate waiters with a larger
+  priority number are left out of the queue compared with `OVERFLOW_QUEUE_DEPTH`. The A100's requests are never
+  turned away here, so while they queued on GPU4 every local request, a prod priority-0 one included, was sent
+  across at once instead of jumping the queue. A normal (100) request also stays local while only evals (200) wait.
+  The depth itself is unchanged.
 - Streaming requests no longer 524 while queued. Cloudflare gives up after ~100 s without response bytes, and
   LiteLLM wrote nothing until model_manager's first chunk, so a streaming request held at the gate for minutes
   failed. `sse_keepalive_ping_interval_seconds: 10` turns on LiteLLM 1.99's TTFT keepalive: after 10 s of silence

@@ -25,6 +25,24 @@ from aiohttp.test_utils import TestClient, TestServer
 import model_manager as mm
 
 
+class FakeBackend:
+    """A running backend with requests queued at its gate, as {priority: count}."""
+
+    def __init__(self, slot, proxy):
+        self.slot, self.proxy, self.queued = slot, proxy, {}
+
+    @property
+    def local_waiting(self) -> int:
+        return sum(self.queued.values())
+
+    @local_waiting.setter
+    def local_waiting(self, n: int) -> None:
+        self.queued = {mm.DEFAULT_REQUEST_PRIORITY: n}
+
+    def waiting_behind(self, priority: int) -> int:
+        return sum(n for p, n in self.queued.items() if p > priority)
+
+
 class OverflowTests(unittest.IsolatedAsyncioTestCase):
     MODEL = "qwen3.8-27b"
 
@@ -41,9 +59,7 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
             async def proxy(request, body, priority=mm.DEFAULT_REQUEST_PRIORITY):
                 self.proxied.append(slot.slot_id)
                 return web.json_response({"ok": True})
-            return type(
-                "B", (), {"slot": slot, "proxy": staticmethod(proxy), "local_waiting": 0},
-            )()
+            return FakeBackend(slot, proxy)
 
         self.backends = [backend_on(s) for s in self.router.slots]
 
@@ -60,8 +76,8 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.client.close()
 
-    async def _post(self, headers=None):
-        payload = {"model": self.MODEL, "messages": [{"role": "user", "content": "hi"}]}
+    async def _post(self, headers=None, **extra):
+        payload = {"model": self.MODEL, "messages": [{"role": "user", "content": "hi"}], **extra}
         return await self.client.post(
             "/v1/chat/completions", json=payload, headers=headers or {},
         )
@@ -89,6 +105,32 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
             response = await self._post()
         self.assertEqual(200, response.status)
         self.assertEqual([0], self.proxied)
+
+    async def test_only_requests_queued_ahead_count_toward_overflow(self):
+        """A request is not sent across for a queue it would jump: the gate admits it
+        before every waiter with a larger priority number."""
+        self.router._queue_waiting[self.MODEL] = 8  # depth 4 (flat on this deploy branch)
+        self.backends[0].queued = {100: 2, 200: 2}
+        self.backends[1].queued = {100: 1, 200: 3}
+        cases = (
+            (0, 200, [0]),      # granted: all 8 queued are behind it
+            (100, 200, [0]),    # normal: 5 at 200 behind it, 3 at 100 ahead (< 4) -> local
+            (200, 503, []),     # eval: all 8 are ahead of it (equal priority is FIFO)
+        )
+        with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4):
+            for priority, status, proxied in cases:
+                with self.subTest(priority=priority):
+                    self.proxied.clear()
+                    response = await self._post(priority=priority)
+                    self.assertEqual(status, response.status)
+                    self.assertEqual(proxied, self.proxied)
+
+    async def test_a_request_without_priority_counts_waiters_at_200_as_behind(self):
+        self.router._queue_waiting[self.MODEL] = 8
+        self.backends[0].queued = {200: 8}
+        with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4):
+            response = await self._post()
+        self.assertEqual(200, response.status)
 
     async def test_disabled_by_default(self):
         self.router._queue_waiting[self.MODEL] = 1000
@@ -132,6 +174,15 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
         self.router._queue_waiting[self.MODEL] = 3
         self.backends[1].local_waiting = 3
         response = await self._post_sticky_to_slot_1()
+        self.assertEqual(200, response.status)
+        self.assertEqual([1], self.proxied)
+
+    async def test_sticky_hit_stays_when_its_slot_queues_only_behind_it(self):
+        self.router._queue_waiting[self.MODEL] = 8
+        self.backends[1].queued = {200: 3}
+        with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4), \
+             patch.object(mm, "_sticky_slot_for", lambda body, headers: (1, "task")):
+            response = await self._post(priority=0)
         self.assertEqual(200, response.status)
         self.assertEqual([1], self.proxied)
 

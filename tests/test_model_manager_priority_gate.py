@@ -101,6 +101,9 @@ class PriorityGateTests(unittest.IsolatedAsyncioTestCase):
         tasks = [asyncio.create_task(gate.acquire(p)) for p in (200, 200, 0)]
         await _settle()
         self.assertEqual({0: 1, 200: 2}, gate.waiting_by_priority())
+        self.assertEqual(2, gate.waiting_behind(0))
+        self.assertEqual(2, gate.waiting_behind(100))
+        self.assertEqual(0, gate.waiting_behind(200))
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
