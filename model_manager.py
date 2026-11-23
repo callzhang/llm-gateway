@@ -143,10 +143,7 @@ SCALE_OUT_BUSY_SUSTAIN = float(os.environ.get("SCALE_OUT_BUSY_SUSTAIN", "120"))
 # LiteLLM lists the other region's gateway as an order-2 deployment of the same
 # model; a 503 here is what moves a request across the border.  New chat work
 # is turned away once the model's summed vLLM queue (the saturation sampler's
-# last reading) reaches this depth times its running instances: the depth is per
-# instance, so scaling out does not make overflow easier (2026-11-22: on four A100
-# replicas a flat 4 sent ~40 requests a minute across while each replica queued
-# about one and had room to spare).  Sticky hits stay to keep their prefix
+# last reading) reaches this depth.  Sticky hits stay to keep their prefix
 # cache, and a request that already crossed once (OVERFLOW_HEADER, or from
 # another host — see _already_crossed) is always served.  0 disables it.
 OVERFLOW_QUEUE_DEPTH = int(os.environ.get("OVERFLOW_QUEUE_DEPTH", "0"))
@@ -3511,26 +3508,24 @@ class DynamicRouter:
             # already queueing: waiting behind the gate there costs more than
             # recomputing the history in the other region.
             waiting = self._queue_waiting.get(model_name, 0)
-            instances = max(len(backends), 1)
-            overflow_at = OVERFLOW_QUEUE_DEPTH * instances
             if (
                 OVERFLOW_QUEUE_DEPTH
                 and config.request_kind == "chat"
                 and not _already_crossed(request)
-                and waiting >= overflow_at
+                and waiting >= OVERFLOW_QUEUE_DEPTH
                 and (sticky_backend is None or sticky_backend.local_waiting > 0)
             ):
                 self.log.info(
                     f"Overflow: {model_name} waiting={waiting} ≥ "
-                    f"{OVERFLOW_QUEUE_DEPTH}x{instances}"
+                    f"{OVERFLOW_QUEUE_DEPTH}"
                     + (f", sticky slot {sticky_backend.slot.slot_id} queueing "
                        f"{sticky_backend.local_waiting}" if sticky_backend is not None else "")
                     + " — 503 so LiteLLM tries the peer region"
                 )
                 return self._error_response(
                     503,
-                    f"'{model_name}' has {waiting} requests queued on {instances} "
-                    "instances here; send it to the other region.",
+                    f"'{model_name}' has {waiting} requests queued here; "
+                    "send it to the other region.",
                     "queue_overflow",
                 )
             if sticky_backend is not None:
