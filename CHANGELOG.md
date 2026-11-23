@@ -2,6 +2,20 @@
 
 ## 2026-11-22
 
+### Fixed
+- `previous_response_hook` answers before the first SSE keepalive, so its 410 stays a real HTTP status. It waited up
+  to 30 s for history inside LiteLLM's keepalive wrapper; with pings at 10 s, US prod Memory's streaming
+  continuations got a 200, pings and a generic stream error, and its extraction jobs failed for good. An id this
+  proxy never issued (it must decrypt with this proxy's key to a managed id naming one of its deployments) is now
+  410 at once without a lookup; its own ids wait at most 12 s (`PREVIOUS_RESPONSE_WAIT_SECONDS`), the keepalive
+  starts at 15 s, and `proxy_batch_write_at: 2` writes spend-log rows every 2-7 s instead of 10-15 s so the history
+  lands inside the wait.
+
+### Known
+- A streamed Responses answer cannot be continued with `previous_response_id` on LiteLLM 1.99's `custom_openai`
+  bridge: its final id points at the stream's placeholder `resp_<uuid>`, which no spend-log row records, so the
+  continuation gets 410. Non-streamed answers continue normally. Streaming clients must resend the conversation.
+
 ### Added
 - Priority 0 at model_manager's gate is now a grant held by a LiteLLM virtual key. `request_priority_hook.py`
   runs a key whose metadata has `gateway_priority: P` at P when the request sends none and never better than P;
@@ -16,8 +30,8 @@
   The depth itself is unchanged.
 - Streaming requests no longer 524 while queued. Cloudflare gives up after ~100 s without response bytes, and
   LiteLLM wrote nothing until model_manager's first chunk, so a streaming request held at the gate for minutes
-  failed. `sse_keepalive_ping_interval_seconds: 10` turns on LiteLLM 1.99's TTFT keepalive: after 10 s of silence
-  the client gets 200 SSE headers and a `: ping` comment every 10 s (also in gaps mid-stream). A failure found after
+  failed. `sse_keepalive_ping_interval_seconds: 15` turns on LiteLLM 1.99's TTFT keepalive: after 15 s of silence
+  the client gets 200 SSE headers and a `: ping` comment every 15 s (also in gaps mid-stream). A failure found after
   the first ping arrives as a `data: {"error": ...}` frame under the 200. Non-streaming requests are unchanged.
 
 ### Fixed

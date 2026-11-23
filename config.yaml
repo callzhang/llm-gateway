@@ -179,8 +179,10 @@ litellm_settings:
   # mid-stream get the same comment.  Faster requests are byte-identical.  The
   # cost: an error found after the first ping reaches the client as a
   # `data: {"error": ...}` frame under that 200, not as an HTTP status.
-  # Non-streaming requests are unaffected.
-  sse_keepalive_ping_interval_seconds: 10
+  # Non-streaming requests are unaffected.  Pre-call hooks run inside this
+  # wrapper, so each must answer within one interval to keep a real HTTP error
+  # status (previous_response_hook waits at most 12 s).
+  sse_keepalive_ping_interval_seconds: 15
 
 general_settings:
   cancel_on_disconnect: true
@@ -194,4 +196,8 @@ general_settings:
   # (memory-connector extraction threads ran fresh, 2026-09-20..26).
   # Rows hold raw prompt/response text, so cap retention.
   store_prompts_in_spend_logs: true
+  # Spend-log rows (the previous_response_id history) are written every
+  # proxy_batch_write_at + 0-5 s (default 10).  previous_response_hook can only
+  # wait for a row until the first SSE keepalive, so write them sooner.
+  proxy_batch_write_at: 2
   maximum_spend_logs_retention_period: "7d"

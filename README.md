@@ -240,10 +240,10 @@ with `stream: true`. Keepalives from model_manager would not help: LiteLLM's Ope
 comments, and LiteLLM still buffers its first real chunk before writing headers.
 
 The bytes therefore come from LiteLLM itself. `litellm_settings.sse_keepalive_ping_interval_seconds:
-10` turns on LiteLLM 1.99's TTFT keepalive (`open_sse_before_first_byte`). A streaming chat or
-Responses request still silent after 10 s gets 200 `text/event-stream` headers and a `: ping\n\n`
-comment every 10 s until the real stream starts. Gaps mid-stream get the same comment. Requests
-that answer within 10 s are byte-identical to before, and non-streaming requests are unaffected.
+15` turns on LiteLLM 1.99's TTFT keepalive (`open_sse_before_first_byte`). A streaming chat or
+Responses request still silent after 15 s gets 200 `text/event-stream` headers and a `: ping\n\n`
+comment every 15 s until the real stream starts. Gaps mid-stream get the same comment. Requests
+that answer within 15 s are byte-identical to before, and non-streaming requests are unaffected.
 SSE comments are ignored by spec; openai-python 1.109.1 and 2.30.0 were checked with
 `responses.create(stream=True)` and `chat.completions.create(stream=True)`.
 
@@ -254,6 +254,24 @@ raises `APIError` for it, not the status-specific subclass, and LiteLLM 1.99 rep
 with "Error processing stream start". A 503 `queue_overflow` from the gate still moves the request
 to the peer region inside LiteLLM, behind the pings. `tests/test_litellm_proxy_stream.py` runs the
 real proxy with this repo's `litellm_settings` against a slow fake upstream to pin this behaviour.
+
+Pre-call hooks run inside that wrapper, so a hook must answer within one interval for its error
+to keep a real HTTP status. On 2026-11-22 `previous_response_hook` waited up to 30 s for history,
+so US prod Memory's streaming continuations got a 200, pings and a generic stream error instead of
+a 410, and its jobs failed for good. The hook now answers 410 at once for an id this proxy never
+issued (it must decrypt with this proxy's key to LiteLLM's managed id naming one of its
+deployments), and waits at most 12 s for its own ids. Spend-log rows are written every
+`general_settings.proxy_batch_write_at` (2) + 0-5 s, so a row lands inside that wait.
+`tests/test_previous_response_hook.py` checks both numbers against `config.yaml`.
+
+**Streamed responses cannot be continued with `previous_response_id`** (LiteLLM 1.99,
+`custom_openai` Responses bridge, measured 2026-11-22). The final id of a streamed response points
+at the stream's placeholder (`resp_<uuid>`), but its spend-log row is keyed by the upstream
+`chatcmpl-…` id, and the uuid is stored nowhere, so the lookup finds nothing and the answer is 410.
+A non-streamed response continues normally. `response.created` / `response.in_progress` carry a
+different placeholder id that is never continuable either; only `response.completed` (or
+`stream.get_final_response()`) carries the final id. A client that streams must resend the
+conversation in `input` instead of using `previous_response_id`.
 
 ## Public-facing stack (Open WebUI + systemd target + tunnel)
 
