@@ -10,10 +10,21 @@ turns that silent no-op into a 410 (Gone) so clients can key on the status inste
 It reuses LiteLLM's own reconstruction, so "history exists" here means exactly
 what the bridge will later see.
 
-Spend-log rows are written in batches, so the previous response becomes visible
-7-12 s after it was returned (measured on LiteLLM 1.99.0).  A follow-up sent
-inside that window would silently lose its history, so the hook waits up to
-PREVIOUS_RESPONSE_WAIT_SECONDS for the row before answering 410.
+It must answer before LiteLLM's first SSE keepalive (config.yaml,
+sse_keepalive_ping_interval_seconds): pre-call hooks run inside that wrapper, so
+once a `: ping` is sent the 200 is on the wire and a 410 can only reach a
+streaming client as a generic in-stream error.  Hence:
+
+  - An id this proxy could never have issued is 410 at once, without a lookup.
+    The proxy hands out `resp_<encrypted>` (LiteLLM's ResponsesIDSecurity, with the
+    master key), which decrypts to LiteLLM's managed id naming one of this proxy's
+    deployments (`model_id`).  Anything else is not ours: a made-up id, a bare
+    inner id, another proxy's id, or the placeholder id of `response.created` /
+    `response.in_progress` (it decrypts to an id with no deployment).
+  - For its own ids it waits for the spend-log row, which is written in batches
+    (general_settings.proxy_batch_write_at + 0-5 s), at most
+    PREVIOUS_RESPONSE_WAIT_SECONDS, kept below the keepalive interval
+    (tests/test_previous_response_hook.py checks both against config.yaml).
 """
 
 from __future__ import annotations
@@ -27,25 +38,41 @@ from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
 
 
-_WAIT_SECONDS = float(os.environ.get("PREVIOUS_RESPONSE_WAIT_SECONDS", "30"))
+_WAIT_SECONDS = float(os.environ.get("PREVIOUS_RESPONSE_WAIT_SECONDS", "12"))
 _POLL_SECONDS = 1.0
+
+
+def _inner_response_id(previous_response_id: str) -> str:
+    """The managed id inside what the client sent.  Hook order against LiteLLM's own
+    ResponsesIDSecurity is not fixed, so accept the encrypted id and the decrypted one."""
+    from litellm.proxy.hooks.responses_id_security import ResponsesIDSecurity
+
+    security = ResponsesIDSecurity()
+    if security._is_encrypted_response_id(previous_response_id):
+        previous_response_id, _, _ = security._decrypt_response_id(previous_response_id)
+    return previous_response_id
+
+
+def issued_here(previous_response_id: str) -> bool:
+    """True when the id names one of this proxy's deployments, i.e. this proxy issued it."""
+    from litellm.proxy import proxy_server
+    from litellm.responses.utils import ResponsesAPIRequestUtils
+
+    decoded = ResponsesAPIRequestUtils._decode_responses_api_response_id(_inner_response_id(previous_response_id))
+    model_id = decoded.get("model_id")
+    router = proxy_server.llm_router
+    return bool(model_id) and router is not None and router.get_deployment(model_id=model_id) is not None
 
 
 async def load_session_messages(previous_response_id: str) -> list[dict]:
     """Stored chat messages for a previous_response_id, exactly as the bridge
     will rebuild them.  Empty when nothing is stored."""
-    from litellm.proxy.hooks.responses_id_security import ResponsesIDSecurity
     from litellm.responses.litellm_completion_transformation.session_handler import (
         ResponsesSessionHandler,
     )
 
-    # Hook order against LiteLLM's own ResponsesIDSecurity is not fixed, so
-    # accept both the encrypted id and the already-decrypted one.
-    security = ResponsesIDSecurity()
-    if security._is_encrypted_response_id(previous_response_id):
-        previous_response_id, _, _ = security._decrypt_response_id(previous_response_id)
     session = await ResponsesSessionHandler.get_chat_completion_message_history_for_previous_response_id(
-        previous_response_id=previous_response_id
+        previous_response_id=_inner_response_id(previous_response_id)
     )
     return session.get("messages") or []
 
@@ -63,6 +90,15 @@ class PreviousResponseHistoryHook(CustomLogger):
         previous_response_id = data.get("previous_response_id")
         if not previous_response_id:
             return data
+        if not issued_here(str(previous_response_id)):
+            raise HTTPException(
+                status_code=410,
+                detail=(
+                    "previous_response_id was not issued by this gateway. Continue from the id of "
+                    "the finished response (response.completed, or the non-streaming response), "
+                    "or send a request without previous_response_id to start a new thread."
+                ),
+            )
 
         deadline = time.monotonic() + _WAIT_SECONDS
         while True:

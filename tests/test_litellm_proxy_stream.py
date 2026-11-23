@@ -179,6 +179,17 @@ class LiteLLMProxyStreamTests(unittest.TestCase):
         self.assert_pings_then_stream(events, b'"content":"hello"')
         self.assertEqual(1, self.last_body()["priority"], "the master key holds no grant, so 0 becomes 1")
 
+    def test_a_bogus_previous_response_id_is_a_real_410_not_an_in_stream_error(self) -> None:
+        """previous_response_hook must decide before the first keepalive commits a 200."""
+        events = post(self.proxy_port, "/v1/responses", {
+            "model": "qwen3.8-27b", "input": "hi", "stream": True, "previous_response_id": "resp_bogus_123"})
+        header_at, status = events[0]
+        self.assertEqual(b"HTTP 410", status)
+        self.assertLess(header_at, INTERVAL)
+        body = b"".join(chunk for _, chunk in events[1:])
+        self.assertNotIn(b": ping", body)
+        self.assertIn(b"previous_response_id", body)
+
     def test_non_streaming_requests_wait_for_the_whole_answer_as_before(self) -> None:
         events = post(self.proxy_port, "/v1/chat/completions", {
             "model": "qwen3.8-27b", "messages": [{"role": "user", "content": "hi"}]})
