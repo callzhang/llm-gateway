@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-22
+
+### Fixed
+- `OVERFLOW_QUEUE_DEPTH` is now per running instance: model_manager sends new chat work to the peer region once the
+  model's summed queue reaches the depth times its instances, not the depth itself. On the A100, after scale-out to
+  four 27B replicas (cards 0/1/2/6), the flat 4 still sent ~40 requests a minute to GPU4 while each replica ran
+  10-12 of 16 and queued about one. GPU4 (two instances) now overflows at 8 instead of 4 once restarted.
+
 ## 2026-11-20
 
 ### Added
