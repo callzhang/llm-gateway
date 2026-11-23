@@ -28,8 +28,10 @@ client ─► Cloudflare ─► tunnel ─► LiteLLM :8900 ──order 1──�
 * `GATE_MAX_WAIT_SECONDS` (default 90, 0 removes it): a local request that has waited this long at the priority gate
   gets the same 503 `queue_overflow`, including a sticky request. Cloudflare ends a response that has sent nothing for
   125 s, so the wait must end first. Work the peer region handed over keeps waiting.
-* `OVERFLOW_QUEUE_DEPTH=4` (both `gateway.env`): once a model's summed vLLM queue reaches 4,
-  model_manager answers new chat work with `503 queue_overflow`. A sticky hit stays local (prefix
+* `OVERFLOW_QUEUE_DEPTH=4` (both `gateway.env`), per running instance: once a model's vLLM queue,
+  summed over its instances, reaches 4 x instances (4 on one card, 16 on four), model_manager answers
+  new chat work with `503 queue_overflow`. Until 2026-11-22 the 4 was flat, so four A100 replicas each
+  queueing about one request already sent ~40 requests a minute across while they had room. A sticky hit stays local (prefix
   cache) unless its own slot already has requests queued at the priority gate, and a binding lapses
   after `STICKY_IDLE_TTL` (default 300 s) without a request. A request carrying `x-gateway-overflow` already crossed once and is always served, so
   two saturated regions cannot bounce it.
