@@ -194,6 +194,64 @@ flight, the model also accrues at `1/SCALE_OUT_BUSY_SUSTAIN` per second (default
 window. A firing backed only by this busy signal takes a free slot and never evicts another model;
 `SCALE_OUT_BUSY_REQUESTS=0` turns it off. Busy samples also count as backlog for scale-in.
 
+### Request priority: granted by virtual key
+
+model_manager's per-backend priority gate admits queued chat requests by the body field
+`priority` (0-255, smaller first, missing = 100; design in `docs/request-priority-gate.md`).
+Clients send it as a nested `extra_body: {extra_body: {priority: N}}` in the OpenAI SDK, which
+LiteLLM forwards as a top-level field (a top-level `priority` is dropped by LiteLLM on chat and
+answered 500 on Responses).
+
+Priority 0 is a grant held by a LiteLLM virtual key, not something a client can claim:
+
+- `request_priority_hook.py` (a LiteLLM callback) reads the key's metadata. A key with
+  `gateway_priority: P` runs at P when the request sends no priority, and may only send a larger
+  number. Any other key may send 1-255 as before; a 0 it sends becomes 1. Malformed values are left
+  for model_manager to reject with 400.
+- The peer region's requests reach model_manager from another host without passing that hook, so
+  model_manager raises their priority to `PEER_PRIORITY_FLOOR` (1). Only this host's LiteLLM
+  (a loopback caller) can deliver a 0.
+
+Grant a key (master key from `gateway.env`):
+
+```bash
+curl -sS -X POST http://127.0.0.1:8900/key/update -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"key": "<key or its hash>", "metadata": {"purpose": "...", "gateway_priority": 0}}'
+```
+
+`/key/update` replaces the whole metadata object, so resend the existing fields. Keys on GPU4
+(2026-11-22): only `friday-memory-us-prod` (US production friday-memory, created 2026-11-22, value
+in `~/.config/llm-gateway/keys/friday-memory-us-prod.key`, mode 600) holds `gateway_priority: 0`.
+`memory-ci-controller` is shared by prod cosens-rsi's `recipe_fallback`, US live Memory, the GPU4
+test stack and CI, so it holds no grant; its clients' priority-0 requests now run at 1. A key
+synced to the A100 (`scripts/sync_cn_litellm_keys.sh`) carries its metadata, but the A100's
+LiteLLM does not load the hook.
+
+### Streaming through Cloudflare: keepalive before the first token
+
+Cloudflare answers 524 when the origin sends no response bytes for about 100 s. LiteLLM writes
+nothing until model_manager's first chunk arrives, and model_manager sends nothing while a request
+waits at the priority gate or in prefill. So a streaming request queued for minutes 524'd even
+with `stream: true`. Keepalives from model_manager would not help: LiteLLM's OpenAI client drops SSE
+comments, and LiteLLM still buffers its first real chunk before writing headers.
+
+The bytes therefore come from LiteLLM itself. `litellm_settings.sse_keepalive_ping_interval_seconds:
+10` turns on LiteLLM 1.99's TTFT keepalive (`open_sse_before_first_byte`). A streaming chat or
+Responses request still silent after 10 s gets 200 `text/event-stream` headers and a `: ping\n\n`
+comment every 10 s until the real stream starts. Gaps mid-stream get the same comment. Requests
+that answer within 10 s are byte-identical to before, and non-streaming requests are unaffected.
+SSE comments are ignored by spec; openai-python 1.109.1 and 2.30.0 were checked with
+`responses.create(stream=True)` and `chat.completions.create(stream=True)`.
+
+The trade-off: once a ping is sent, the status line is committed. A failure found later (an
+upstream 4xx/5xx after the gate, or the peer region also failing) reaches the client as
+`data: {"error": {..., "code": "<status>"}}` and `data: [DONE]` under the 200. The OpenAI SDK
+raises `APIError` for it, not the status-specific subclass, and LiteLLM 1.99 replaces the message
+with "Error processing stream start". A 503 `queue_overflow` from the gate still moves the request
+to the peer region inside LiteLLM, behind the pings. `tests/test_litellm_proxy_stream.py` runs the
+real proxy with this repo's `litellm_settings` against a slow fake upstream to pin this behaviour.
+
 ## Public-facing stack (Open WebUI + systemd target + tunnel)
 
 Beyond the model_manager/LiteLLM/vLLM core, the deployment on this host exposes a

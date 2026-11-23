@@ -167,6 +167,20 @@ litellm_settings:
     - previous_response_hook.previous_response_history_hook
     # Map reasoning_effort onto what each model's chat template accepts.
     - reasoning_effort_hook.reasoning_effort_hook
+    # Priority 0 at model_manager's gate is a grant held by a virtual key
+    # (metadata gateway_priority), not something any client can ask for.
+    - request_priority_hook.request_priority_hook
+
+  # Cloudflare ends a request with 524 when the origin sends nothing for ~100 s,
+  # and LiteLLM sends nothing until model_manager's first chunk, so a streaming
+  # request held at the priority gate or in a long prefill used to 524.  A
+  # streaming request still silent after this many seconds gets its 200 SSE
+  # headers and a `: ping` comment every interval until the stream starts; gaps
+  # mid-stream get the same comment.  Faster requests are byte-identical.  The
+  # cost: an error found after the first ping reaches the client as a
+  # `data: {"error": ...}` frame under that 200, not as an HTTP status.
+  # Non-streaming requests are unaffected.
+  sse_keepalive_ping_interval_seconds: 10
 
 general_settings:
   cancel_on_disconnect: true

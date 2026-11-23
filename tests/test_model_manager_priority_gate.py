@@ -287,6 +287,26 @@ class HandlePriorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200, response.status)
         self.assertEqual(mm.DEFAULT_REQUEST_PRIORITY, self.proxied[0][1])
 
+    async def test_a_local_caller_keeps_priority_zero(self):
+        response = await self._post(priority=0)
+        self.assertEqual(200, response.status)
+        self.assertEqual(0, self.proxied[0][1])
+
+    async def test_a_peer_cannot_claim_priority_zero(self):
+        """Priority 0 is for this host's LiteLLM, which grants it by virtual key; the
+        peer region's requests arrive straight from another host with whatever their
+        clients asked for."""
+        with patch.object(web.BaseRequest, "remote", "100.118.88.28"):
+            for sent, admitted in ((0, mm.PEER_PRIORITY_FLOOR), (200, 200), (None, 100)):
+                with self.subTest(sent=sent):
+                    self.proxied.clear()
+                    response = await (self._post() if sent is None else self._post(priority=sent))
+                    self.assertEqual(200, response.status)
+                    body, priority = self.proxied[0]
+                    self.assertEqual(admitted, priority)
+                    self.assertNotIn("priority", body)
+        self.assertEqual(1, mm.PEER_PRIORITY_FLOOR)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,19 @@
 
 ## 2026-11-22
 
+### Added
+- Priority 0 at model_manager's gate is now a grant held by a LiteLLM virtual key. `request_priority_hook.py`
+  runs a key whose metadata has `gateway_priority: P` at P when the request sends none and never better than P;
+  any other key's 0 becomes 1. model_manager raises the peer region's requests (which skip GPU4's LiteLLM) to
+  `PEER_PRIORITY_FLOOR` = 1. Before this, any client could claim 0: on 2026-11-22, 76 requests from the A100 and
+  122 on the shared `memory-ci-controller` key did. New key `friday-memory-us-prod` (US production friday-memory)
+  holds `gateway_priority: 0`; it is stored on GPU4 in `~/.config/llm-gateway/keys/`.
+- Streaming requests no longer 524 while queued. Cloudflare gives up after ~100 s without response bytes, and
+  LiteLLM wrote nothing until model_manager's first chunk, so a streaming request held at the gate for minutes
+  failed. `sse_keepalive_ping_interval_seconds: 10` turns on LiteLLM 1.99's TTFT keepalive: after 10 s of silence
+  the client gets 200 SSE headers and a `: ping` comment every 10 s (also in gaps mid-stream). A failure found after
+  the first ping arrives as a `data: {"error": ...}` frame under the 200. Non-streaming requests are unchanged.
+
 ### Fixed
 - `OVERFLOW_QUEUE_DEPTH` is now per running instance: model_manager sends new chat work to the peer region once the
   model's summed queue reaches the depth times its instances, not the depth itself. On the A100, after scale-out to

@@ -1,4 +1,4 @@
-# 请求优先级闸门（已实现，未部署）
+# 请求优先级闸门
 
 ## 问题
 
@@ -30,6 +30,14 @@ LiteLLM 会丢弃客户端 header（见 `_extract_task_id` 的注释），所以
 - 客户端怎么把字段送到这里：LiteLLM 对 Responses API 的顶层 `priority` 返回 500（`unexpected keyword argument 'priority'`，2026-10-17 实测）；嵌套的 `extra_body.priority` 返回 200，并被合并成下游 chat 请求的顶层字段。所以 memory-connector 的 provider profile 要写成 `extra_body: {extra_body: {priority: N}}`（OpenAI SDK 会把外层 `extra_body` 展开成顶层字段，内层才会作为嵌套字段到达 LiteLLM）。实现时需要在 gateway 侧用同样的小请求再验证一次。
 
 约定的取值：生产 0，debug 100，评测 200（只是使用方的配置，gateway 不认识这些名字）。
+
+### 优先级 0 由 key 授予（2026-11-22）
+
+原来任何客户端都能发 `priority: 0`：2026-11-22 当天，A100 转来的请求里有 76 个、共用的 `memory-ci-controller` key 上有 122 个带 0，和 US 生产 Memory 抢同一档。现在：
+
+- GPU4 的 LiteLLM 回调 `request_priority_hook.py` 读 virtual key 的 metadata。带 `gateway_priority: P`（0..255 的整数）的 key：请求没带 priority 时按 P；带了更大的数照用（自愿降级）；带更小的数提到 P。其他 key：带 1..255 照旧，带 0 改成 1；不合法的值不改，交给 model_manager 返回 400。
+- 对端区域的请求从另一台主机直接到 model_manager，不经过这个回调，所以 model_manager 把非本机来源（`request.remote` 不在 `_LOCAL_CALLERS`）的 priority 提到 `PEER_PRIORITY_FLOOR`（1）。只有本机 LiteLLM 能送来 0。
+- 目前只有 `friday-memory-us-prod`（US 生产 friday-memory）带 `gateway_priority: 0`。生产 cosens-rsi、US live Memory、GPU4 测试栈和 CI 共用 `memory-ci-controller`，无法区分，所以它不带授权。
 
 ## 为什么不用别的办法
 

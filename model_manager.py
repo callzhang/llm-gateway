@@ -1176,6 +1176,11 @@ class GpuSlot:
 
 DEFAULT_REQUEST_PRIORITY = 100
 MAX_REQUEST_PRIORITY = 255
+# Priorities below this are granted by this host's LiteLLM per virtual key
+# (request_priority_hook.py, which raises an ungranted 0 to the same floor).  The peer
+# region's requests come straight from another host carrying whatever its clients sent,
+# so their priority is raised to this floor.  Equal to UNGRANTED_PRIORITY_FLOOR there.
+PEER_PRIORITY_FLOOR = 1
 
 
 # SGLang ignores vLLM's `thinking_token_budget`; it caps thinking only through a custom logit processor
@@ -3423,6 +3428,8 @@ class DynamicRouter:
                         "message": str(exc), "type": "invalid_request_error",
                     }}),
                 )
+            if request.remote not in _LOCAL_CALLERS:
+                priority = max(priority, PEER_PRIORITY_FLOOR)
             if "priority" in parsed_body:
                 parsed_body.pop("priority")
                 body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
