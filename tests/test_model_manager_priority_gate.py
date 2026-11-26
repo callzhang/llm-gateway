@@ -142,15 +142,15 @@ class GateWaitLimitTests(unittest.IsolatedAsyncioTestCase):
             return await asyncio.wait_for(backend._forward_gated(request, b"{}", 100), 0.2)
 
     async def test_a_local_request_past_the_limit_overflows_to_the_peer(self):
-        local = type("R", (), {"headers": {}, "remote": "127.0.0.1"})()
+        local = type("R", (dict,), {"headers": {}, "remote": "127.0.0.1"})()
         with self.assertRaisesRegex(mm.QueueOverflow, "other region"):
             await self._gated(local, depth=4)
 
     async def test_no_limit_without_a_peer_or_for_work_the_peer_handed_over(self):
         for request, depth in (
-            (type("R", (), {"headers": {}, "remote": "127.0.0.1"})(), 0),
-            (type("R", (), {"headers": {mm.OVERFLOW_HEADER: "1"}, "remote": "127.0.0.1"})(), 4),
-            (type("R", (), {"headers": {}, "remote": "100.118.88.28"})(), 4),
+            (type("R", (dict,), {"headers": {}, "remote": "127.0.0.1"})(), 0),
+            (type("R", (dict,), {"headers": {mm.OVERFLOW_HEADER: "1"}, "remote": "127.0.0.1"})(), 4),
+            (type("R", (dict,), {"headers": {}, "remote": "100.118.88.28"})(), 4),
         ):
             with self.assertRaises(asyncio.TimeoutError):  # still waiting when the test's own timeout ends
                 await self._gated(request, depth=depth)

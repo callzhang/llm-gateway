@@ -101,6 +101,14 @@ MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:?VLLM_MAX_NUM_SEQS is required}
 # Compact JSON for structured outputs: pretty-printing was ~37% of the answer
 # tokens of memory extraction.  disable_any_whitespace needs an explicit
 # xgrammar/guidance backend (vLLM rejects it with backend=auto).
+# model_manager sets QWEN_VISION=0 for instances that take no images (VISION_GPU_IDS).
+if [[ "${QWEN_VISION:-1}" == 0 ]]; then
+  MM_ARGS=(--language-model-only)
+else
+  MM_ARGS=(--limit-mm-per-prompt '{"image":1,"video":0}'
+           --mm-processor-kwargs '{"size":{"longest_edge":4194304,"shortest_edge":65536}}')
+fi
+
 exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
@@ -118,6 +126,5 @@ exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --enable-auto-tool-choice \
-  --limit-mm-per-prompt '{"image":1,"video":0}' \
-  --mm-processor-kwargs '{"size":{"longest_edge":4194304,"shortest_edge":65536}}' \
+  "${MM_ARGS[@]}" \
   --trust-remote-code

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `qwen3.8-27b`: model_manager shrinks inline (data: URL) images over 4,194,304 pixels on the CPU before forwarding
+  (`image_fit.py`). The engine caps images there anyway but resized them on the GPU, where very large sources (up to
+  128 megapixels on the CN key) ran the A100's SGLang out of memory and killed the instance. Images by http URL pass
+  through unchanged; one Pillow refuses to decode (over ~179 megapixels) is a 400.
+- `VISION_GPU_IDS`: only the listed GPUs' `qwen3.8-27b` instance takes images (`none`: the host takes none). Image
+  requests go to those instances and never overflow to the other region; see `docs/vision.md`.
+- `GUARANTEED_GPU_UUIDS`: cards cleared of foreign processes before a primary model starts there; see
+  `docs/gpu-guaranteed.md`.
+
+### Changed
+- Engines start with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so a GPU id means the nvidia-smi index. On the A100 this needs
+  the pins renumbered in the same deployment (`docs/gpu-guaranteed.md`).
+
 ## 2026-11-22
 
 ### Fixed

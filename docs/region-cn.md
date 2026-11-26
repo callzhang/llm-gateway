@@ -44,7 +44,7 @@ client ─► Cloudflare ─► tunnel ─► LiteLLM :8900 ──order 1──�
 * LiteLLM 1.99 tries `order: 2` only after `order: 1` fails. `disable_cooldowns: true` keeps a
   burst of overflow 503s from benching the local deployment.
 * TTS and ASR run in both regions too, each region's own first. TTS needs a whole card, so on the
-  A100 `MODEL_GPU_IDS` keeps card 5 for it: the 27B may use 0-4 and 6. Without that the 27B replicas
+  A100 `MODEL_GPU_IDS` keeps one card for it (numbers here predate the PCI-order renumbering in [gpu-guaranteed.md](gpu-guaranteed.md); card 5 then is 6 now): the 27B may use 0-4 and 6. Without that the 27B replicas
   never gave a card back and TTS failed in both regions. A region with no free slot answers
   `503 gpu_busy` and the other region takes it. ASR has no queue
   to measure: an upload of `ASR_OVERFLOW_MIN_SECONDS` (default 300) or more that would run on the
@@ -243,7 +243,7 @@ ssh a100-1 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user status llm-model
 ```
 
 Deploying to the A100: `git archive HEAD | ssh a100-1 'tar -x -C /data/derek/llm-gateway'`, then
-restart the unit. model_manager keeps and re-adopts its vLLM children across a restart, as on GPU4.
+restart the unit. model_manager keeps and re-adopts its vLLM children across a restart, as on GPU4. The one exception is the deployment that renumbers the GPUs ([gpu-guaranteed.md](gpu-guaranteed.md)): stop the engines there.
 After a deploy that changes `patches/qwen3_engine_tool_parser.py`, run
 `VLLM_BIN=/data/derek/venv-vllm029/bin/vllm scripts/install_qwen_parser.sh` there (see
 `docs/qwen-native-output-grammar-fix.md`). The A100 `gateway.env` is not tracked. Its variables are `GPU_PORT_BASE`,

@@ -36,6 +36,7 @@ import json
 import logging
 import math
 import os
+import pwd
 import re
 import signal
 import subprocess
@@ -51,6 +52,7 @@ from asr_adapter import service as asr_service
 from asr_adapter.cpu_pool import CpuAsrWorker, CpuWorkerError
 from asr_adapter.engine import EngineError, pcm16_wav
 from context_fit import ContextFitter
+from image_fit import ImageTooLarge, fit_images, has_images
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 # 300→1200 (2026-09-04): real traffic for both chat models arrives in bursts
@@ -164,6 +166,15 @@ def _already_crossed(request: web.Request) -> bool:
     on /audio/speech and /audio/transcriptions, so a request from another host
     counts as crossed too."""
     return OVERFLOW_HEADER in request.headers or request.remote not in _LOCAL_CALLERS
+
+
+# Set on a request only this host can serve (an image, with vision instances
+# here): it is never turned away with queue_overflow.
+KEEP_LOCAL = "keep_local"
+
+
+def _may_overflow(request: web.Request) -> bool:
+    return not (request.get(KEEP_LOCAL) or _already_crossed(request))
 # Transcription has no queue to measure: when no GPU here has room for the ASR
 # lane, the chunks run on the CPU worker (~6x realtime against ~60x on a GPU).
 # With overflow on, an upload at least this long is turned away instead, so the
@@ -369,6 +380,93 @@ def _gpu_vllm_used_mib(gpu_id: int) -> float:
         return 0.0
 
 
+# ── Guaranteed GPUs ────────────────────────────────────────────────────────────
+# GUARANTEED_GPU_UUIDS="GPU-…,GPU-…" names cards this gateway must always be able
+# to start on.  Before a primary model spawns there, every process on the card
+# that is not one of this gateway's backends is stopped (SIGTERM, then SIGKILL),
+# whoever owns it.  Unset (the default), nothing is ever stopped.  Idle unload is
+# unchanged: an unloaded card can be borrowed until the next spawn clears it.
+# See docs/gpu-guaranteed.md.
+GPU_CLEAR_TERM_SECONDS = float(os.environ.get("GPU_CLEAR_TERM_SECONDS", "20"))
+GPU_CLEAR_KILL_SECONDS = float(os.environ.get("GPU_CLEAR_KILL_SECONDS", "15"))
+# How long a card that could not be cleared or started on stops being preferred,
+# so a broken card or a supervised process cannot pin every start to it.  Longer
+# than the 600 s scale-out cooldown, or each retry would pick the same card again.
+GPU_CLEAR_RETRY_SECONDS = 3600.0
+_gpu_clear_failed_at: "dict[int, float]" = {}
+
+
+def _parse_gpu_uuid_table(csv_text: str) -> dict[str, int]:
+    """{uuid: nvidia-smi index} from `--query-gpu=index,uuid --format=csv`."""
+    table: dict[str, int] = {}
+    for line in csv_text.splitlines():
+        index, _, uuid = line.partition(",")
+        if index.strip().isdigit():
+            table[uuid.strip()] = int(index)
+    return table
+
+
+def _resolve_guaranteed_gpus(spec: str, table: dict[str, int]) -> frozenset[int]:
+    uuids = [u.strip() for u in spec.split(",") if u.strip()]
+    unknown = [u for u in uuids if u not in table]
+    if unknown:
+        raise ValueError(f"GUARANTEED_GPU_UUIDS: no such GPU {unknown}; this host has {sorted(table)}")
+    return frozenset(table[u] for u in uuids)
+
+
+def _load_guaranteed_gpus() -> frozenset[int]:
+    spec = os.environ.get("GUARANTEED_GPU_UUIDS", "").strip()
+    if not spec:
+        return frozenset()
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=10, check=True,
+    ).stdout
+    return _resolve_guaranteed_gpus(spec, _parse_gpu_uuid_table(out))
+
+
+GUARANTEED_GPU_IDS: frozenset[int] = _load_guaranteed_gpus()
+
+
+def _gpu_guaranteed(gpu_id: int) -> bool:
+    """True for a guaranteed card that has not recently resisted clearing."""
+    if gpu_id not in GUARANTEED_GPU_IDS:
+        return False
+    failed_at = _gpu_clear_failed_at.get(gpu_id)
+    return failed_at is None or time.monotonic() - failed_at >= GPU_CLEAR_RETRY_SECONDS
+
+
+def _gpu_compute_pids(gpu_id: int) -> list[int]:
+    """Every process computing on the GPU.  Raises if nvidia-smi cannot say."""
+    out = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader", f"--id={gpu_id}"],
+        capture_output=True, text=True, timeout=5, check=True,
+    ).stdout
+    return [int(line) for line in map(str.strip, out.splitlines()) if line.isdigit()]
+
+
+def _describe_pid(pid: int) -> str:
+    """"<user>: <command>" for the log; arguments are cut off, they can hold secrets."""
+    try:
+        user = pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_name
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = f.read().decode("utf-8", errors="ignore").split("\0")
+        return f"{user}: {' '.join(argv[:3])[:160]}"
+    except (OSError, KeyError):
+        return "unknown process"
+
+
+def _signal_pid(pid: int, sig: int) -> None:
+    """Signal one process, through passwordless sudo if another user owns it."""
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        subprocess.run(["sudo", "-n", "kill", f"-{int(sig)}", str(pid)],
+                       capture_output=True, timeout=10)
+
+
 def _gpu_vllm_pids(gpu_id: int) -> "list[tuple[int, str]]":
     """[(pid, "<n> MiB")] for every vLLM process on the GPU (cmdline contains
     'vllm').  Unreadable / vanished processes and non-vLLM GPU users (embedding
@@ -474,6 +572,7 @@ def _adopted_vllm_matches_config(
     pid: int,
     model_name: str,
     config: "ModelConfig",
+    gpu_id: int | None = None,
 ) -> bool:
     """Return whether an existing vLLM is safe to adopt for current config.
 
@@ -494,6 +593,14 @@ def _adopted_vllm_matches_config(
         if _cmdline_option(args, "--context-length") != "131072":
             return False
         if "--language-only" in args or "--speculative-algorithm" in args:
+            return False
+    # A vLLM instance with the wrong vision mode for its card would either refuse
+    # the images routed to it or hold vision no request will use.  SGLang has no
+    # text-only mode that frees memory (--language-only loaded the same weights
+    # and KV on the A100), so there images are only refused by the router.
+    if not is_sglang:
+        text_only = "--language-model-only" in args
+        if text_only != (config.vision_gpu_ids is not None and gpu_id not in config.vision_gpu_ids):
             return False
     if config.max_num_seqs is not None:
         raw_max_num_seqs = _cmdline_option(args, "--max-running-requests" if is_sglang else "--max-num-seqs")
@@ -584,6 +691,17 @@ async def _wait_for_eval_lock_release(
                 log.info("Eval lock released; continuing model_manager shutdown")
             return
 
+def _parse_vision_gpus(spec: str) -> "frozenset[int] | None":
+    """VISION_GPU_IDS: unset = no restriction, "none" = no vision on this host,
+    "0" or "0,2" = only those GPUs."""
+    spec = spec.strip().lower()
+    if not spec:
+        return None
+    if spec == "none":
+        return frozenset()
+    return frozenset(int(x) for x in spec.split(",") if x.strip())
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     """Runtime and request contract for one dynamically scheduled model."""
@@ -595,6 +713,14 @@ class ModelConfig:
     max_input_chars: int | None = None
     max_num_seqs: int | None = None
     engine: Literal["vllm", "sglang"] = "vllm"
+    # Inline images above this are shrunk on the CPU before forwarding (see
+    # image_fit.py).  Set it to the engine's own cap, so nothing it would have
+    # seen is lost; None leaves images alone.
+    max_image_pixels: int | None = None
+    # GPUs whose instance loads vision; every other instance starts text-only.
+    # None: no restriction (every instance as its run script has it).  Empty:
+    # this host takes no images for the model.  From VISION_GPU_IDS.
+    vision_gpu_ids: frozenset[int] | None = None
     # Scheduled by VRAM budget instead of taking a GPU slot: a small model that
     # shares a GPU with whichever primary model owns the slot.  It is admitted
     # only where the GPU's current free VRAM covers its min-viable footprint,
@@ -664,7 +790,10 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
     "qwen3.8-27b": ModelConfig(
         ("run_qwen38_27b_sglang.sh" if os.environ.get("QWEN27B_ENGINE") == "sglang" else "run_qwen38_27b.sh"), "qwen3.8-27b",
         max_num_seqs=(16 if os.environ.get("QWEN27B_ENGINE") == "sglang" else 8),
-        engine=os.environ.get("QWEN27B_ENGINE", "vllm")
+        engine=os.environ.get("QWEN27B_ENGINE", "vllm"),
+        # == longest_edge in run_qwen38_27b.sh and SGLANG_IMAGE_MAX_PIXELS.
+        max_image_pixels=4_194_304,
+        vision_gpu_ids=_parse_vision_gpus(os.environ.get("VISION_GPU_IDS", "")),
     ),
     "qwen3-tts-1.7b-customvoice": ModelConfig(
         "run_qwen3_tts_1_7b_customvoice.sh",
@@ -1328,6 +1457,8 @@ class GpuBackend:
         self.engine = engine
         self.idle_timeout = idle_timeout
         self.coresident   = coresident
+        # True/False: start with/without vision; None: no restriction.
+        self.vision: bool | None = None
         safe             = model_name.replace(".", "_")
         self.log_path    = os.path.join(LOG_DIR, f"{safe}_slot{slot.slot_id}.log")
         self.log         = logging.getLogger(f"mgr.s{slot.slot_id}.{model_name}")
@@ -1639,6 +1770,54 @@ class GpuBackend:
         self.log.error(msg)
         raise RuntimeError(msg)
 
+    def _foreign_gpu_pids(self) -> list[int]:
+        """Processes on this card that belong to no running backend of ours."""
+        ours = self.router.live_pgids()
+        found = []
+        for pid in _gpu_compute_pids(self.gpu_id):
+            pgid = self._pgid_of(pid)
+            if pid > 1 and pid != os.getpid() and pgid is not None and pgid not in ours:
+                found.append(pid)
+        return found
+
+    async def _clear_guaranteed_gpu(self) -> None:
+        """Stop everything that is not ours on a guaranteed card before a primary
+        spawn.  Raises if something is still there afterwards.  Without a router
+        there is no way to tell our processes apart, so nothing is touched."""
+        if self.gpu_id not in GUARANTEED_GPU_IDS or self.coresident or self.router is None:
+            return
+        try:
+            pids = self._foreign_gpu_pids()
+            for sig, grace in ((signal.SIGTERM, GPU_CLEAR_TERM_SECONDS),
+                               (signal.SIGKILL, GPU_CLEAR_KILL_SECONDS)):
+                if not pids:
+                    break
+                for pid in pids:
+                    self.log.warning(
+                        f"Guaranteed GPU {self.gpu_id}: {signal.Signals(sig).name} "
+                        f"PID {pid} ({_describe_pid(pid)})"
+                    )
+                    _signal_pid(pid, sig)
+                deadline = time.monotonic() + grace
+                while True:
+                    pids = self._foreign_gpu_pids()
+                    if not pids or time.monotonic() >= deadline:
+                        break
+                    await asyncio.sleep(1)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _gpu_clear_failed_at[self.gpu_id] = time.monotonic()
+            self.log.warning(f"Guaranteed GPU {self.gpu_id}: could not clear it: {exc}")
+            return
+        if pids:
+            _gpu_clear_failed_at[self.gpu_id] = time.monotonic()
+            msg = (
+                f"Guaranteed GPU {self.gpu_id} still holds "
+                + ", ".join(f"PID {pid} ({_describe_pid(pid)})" for pid in pids)
+                + " after SIGKILL; a supervisor may be restarting it. Stop that service."
+            )
+            self.log.error(msg)
+            raise RuntimeError(msg)
+
     def _gpu_mem_util_for_spawn(self) -> float | None:
         """Compute a gpu_memory_utilization that fits this GPU's *current* free VRAM.
 
@@ -1764,6 +1943,18 @@ class GpuBackend:
         return int(m[-1])
 
     async def _spawn_locked(self) -> None:
+        """Start the engine.  A primary start on a guaranteed card that fails
+        costs the card its preference, whatever the cause; a good one restores it."""
+        try:
+            await self._start_engine_locked()
+        except Exception:
+            if not self.coresident and self.gpu_id in GUARANTEED_GPU_IDS:
+                _gpu_clear_failed_at[self.gpu_id] = time.monotonic()
+            raise
+        if not self.coresident:
+            _gpu_clear_failed_at.pop(self.gpu_id, None)
+
+    async def _start_engine_locked(self) -> None:
         """Spawn vLLM subprocess and wait for /health.  Caller must hold self._lock.
 
         On a tight GPU the model may load but fail because the KV cache can't hold
@@ -1783,6 +1974,7 @@ class GpuBackend:
         self._ensure_idle_task()
         if self.slot.backend is None:
             self.slot.backend = self
+        await self._clear_guaranteed_gpu()
         # Primaries outrank co-resident models for VRAM: stop an idle one on this
         # GPU if the primary would otherwise be too tight.
         if not self.coresident and self.router is not None:
@@ -1848,6 +2040,10 @@ class GpuBackend:
             spawn_env = {
                 **os.environ,
                 "VLLM_CUDA_DEVICE": str(self.gpu_id),
+                # gpu_id is an nvidia-smi index.  CUDA's default order is
+                # fastest-first, which on the mixed A100 host put every spawn on
+                # a different card than the one nvidia-smi had just checked.
+                "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
                 "VLLM_PORT":        str(self.vllm_port),
                 # Cap ninja parallelism for FlashInfer's JIT.  Unset it runs
                 # `ninja -j $(nproc)` = 32 nvcc/cicc peaking near 50 GiB RSS,
@@ -1857,6 +2053,8 @@ class GpuBackend:
                 # a fresh deploy can't silently lose it.
                 "MAX_JOBS": os.environ.get("MAX_JOBS", "4"),
             }
+            if self.vision is not None:
+                spawn_env["QWEN_VISION"] = "1" if self.vision else "0"
             if self.max_num_seqs is not None:
                 spawn_env["VLLM_MAX_NUM_SEQS"] = str(self.max_num_seqs)
             # VRAM-aware gpu_memory_utilization: lower it to fit current free VRAM
@@ -2065,7 +2263,7 @@ class GpuBackend:
         waited_from = time.monotonic()
         limit = (
             GATE_MAX_WAIT_SECONDS
-            if OVERFLOW_QUEUE_DEPTH and GATE_MAX_WAIT_SECONDS and not _already_crossed(request)
+            if OVERFLOW_QUEUE_DEPTH and GATE_MAX_WAIT_SECONDS and _may_overflow(request)
             else None
         )
         try:
@@ -2482,6 +2680,7 @@ class DynamicRouter:
         # Fits chat requests into each model's context window before they reach
         # vLLM; an empty fitter has no model limits and leaves every body alone.
         self.context_fitter = context_fitter or ContextFitter({})
+        self._image_fit_slots = asyncio.Semaphore(2)
         self.log           = logging.getLogger("mgr.router")
         self._router_lock  = asyncio.Lock()   # serialises slot claims
         self._scale_tasks: set[asyncio.Task] = set()
@@ -2535,6 +2734,8 @@ class DynamicRouter:
             coresident=config.coresident,
             engine=config.engine,
         )
+        if config.vision_gpu_ids is not None:
+            b.vision = slot.gpu_id in config.vision_gpu_ids
         b.router = self
         return b
 
@@ -2724,9 +2925,16 @@ class DynamicRouter:
         whose GPU cannot be read sort last rather than blocking selection."""
         return sorted(
             slots,
-            key=lambda s: _gpu_free_mib(s.gpu_id) or -1.0,
+            key=DynamicRouter._slot_rank,
             reverse=True,
         )
+
+    @staticmethod
+    def _slot_rank(slot: GpuSlot) -> "tuple[bool, float]":
+        free = _gpu_free_mib(slot.gpu_id)
+        if free is None:
+            return (False, -1.0)   # unreadable, guaranteed or not
+        return (_gpu_guaranteed(slot.gpu_id), free)
 
     def _allowed_gpus(self, model_name: str) -> "set[int] | None":
         """GPU IDs this model may occupy, or None if unconstrained.
@@ -2900,23 +3108,28 @@ class DynamicRouter:
 
     # ── Core: get or start a backend ──────────────────────────────────────────
 
-    async def _get_or_start(self, model_name: str) -> list[GpuBackend]:
+    async def _get_or_start(
+        self, model_name: str, gpus: "frozenset[int] | None" = None,
+    ) -> list[GpuBackend]:
         """Return ≥1 ready GpuBackend instances, starting one on a free slot if needed.
 
         Raises GPUBusyError if all slots are occupied by other models.
         Raises RuntimeError if vLLM fails to start.
         """
+        def on_gpus(backends: list[GpuBackend]) -> list[GpuBackend]:
+            return [b for b in backends if gpus is None or b.gpu_id in gpus]
+
         # ① Fast path — model already running
-        running = self._running_backends(model_name)
+        running = on_gpus(self._running_backends(model_name))
         if running:
             return running
 
         # ② Model is mid-spawn by a concurrent request — wait for it
-        claimed = self._claimed_backends(model_name)
+        claimed = on_gpus(self._claimed_backends(model_name))
         if claimed:
             b = claimed[0]
             await b._ensure_running()
-            running = self._running_backends(model_name)
+            running = on_gpus(self._running_backends(model_name))
             if running:
                 return running
             raise RuntimeError(f"Startup failed for '{model_name}' — see {b.log_path}.")
@@ -2924,11 +3137,11 @@ class DynamicRouter:
         # ③ Need to claim a slot — serialise with the router lock
         async with self._router_lock:
             # Re-check after acquiring the lock
-            running = self._running_backends(model_name)
+            running = on_gpus(self._running_backends(model_name))
             if running:
                 return running
 
-            claimed = self._claimed_backends(model_name)
+            claimed = on_gpus(self._claimed_backends(model_name))
             if claimed:
                 b = claimed[0]   # another coroutine claimed while we waited — fall through
             elif self.model_configs[model_name].coresident:
@@ -2938,6 +3151,13 @@ class DynamicRouter:
                 # Apply GPU affinity: drop slots on GPUs this model cannot use.
                 allowed = self._allowed_gpus(model_name)
                 compatible = [s for s in free if allowed is None or s.gpu_id in allowed]
+                if gpus is not None:
+                    compatible = [s for s in compatible if s.gpu_id in gpus]
+                    if not compatible:
+                        raise GPUBusyError(
+                            f"The GPU(s) {sorted(gpus)} that take images for '{model_name}' "
+                            "are held by another model; retry later."
+                        )
                 if not compatible:
                     occupied = [(s.slot_id, s.current_model) for s in self.slots
                                 if not s.is_free]
@@ -2967,7 +3187,7 @@ class DynamicRouter:
                 b.slot.backend = None
             raise
 
-        running = self._running_backends(model_name)
+        running = on_gpus(self._running_backends(model_name))
         return running if running else [b]
 
     # ── Scale-out ──────────────────────────────────────────────────────────────
@@ -3043,6 +3263,8 @@ class DynamicRouter:
             min_free_gib = MODEL_MIN_FREE_GIB.get(model_name)
             if min_free_gib is not None and free:
                 def _slot_has_room(s: GpuSlot) -> bool:
+                    if _gpu_guaranteed(s.gpu_id):
+                        return True   # whoever holds it is stopped at spawn
                     free_mib = _gpu_free_mib(s.gpu_id)
                     if free_mib is None:
                         return True   # can't check, optimistically allow
@@ -3093,7 +3315,7 @@ class DynamicRouter:
                     valid_targets = []
                     for s in evictable:
                         free_mib = _gpu_free_mib(s.gpu_id)
-                        if free_mib is None:
+                        if free_mib is None or _gpu_guaranteed(s.gpu_id):
                             valid_targets.append(s)   # can't query, allow it
                             continue
                         # All vLLM processes on this GPU will be gone after eviction.
@@ -3119,7 +3341,7 @@ class DynamicRouter:
                     )
                     return
 
-                victim_slot = evictable[0]
+                victim_slot = max(evictable, key=lambda s: _gpu_guaranteed(s.gpu_id))
                 evict_b = victim_slot.backend   # save ref before we overwrite
                 # Atomically claim the slot — prevents any other request from
                 # grabbing it while we're killing the incumbent vLLM.
@@ -3476,6 +3698,40 @@ class DynamicRouter:
                 for m in msgs if isinstance(m, dict)
             )
 
+        # Images: only the instances on vision_gpu_ids can take them, and they
+        # never cross regions.  A host without such a GPU answers 400, or 503 to
+        # work its peer handed over, so the peer's caller can retry there.  A
+        # handed-over image is refused even with vision here: the peer's region
+        # does not take images.
+        vision_gpus: "frozenset[int] | None" = None
+        if (
+            config.vision_gpu_ids is not None
+            and isinstance(parsed_body, dict)
+            and b"image" in body
+            and has_images(parsed_body)
+        ):
+            crossed = _already_crossed(request)
+            if not config.vision_gpu_ids and crossed:
+                return self._error_response(
+                    503, f"'{model_name}' takes no images in this region; retry later.", "gpu_busy")
+            if not config.vision_gpu_ids or crossed:
+                return self._invalid_request(
+                    f"'{model_name}' does not accept images on this endpoint.")
+            vision_gpus = config.vision_gpu_ids
+            request[KEEP_LOCAL] = True
+
+        # Shrink oversized images before the engine sees them.  Off the event
+        # loop, a few at a time: a 128-megapixel source takes ~400 MB decoded.
+        if config.max_image_pixels and isinstance(parsed_body, dict) and b"base64," in body:
+            try:
+                async with self._image_fit_slots:
+                    shrunk = await asyncio.to_thread(fit_images, parsed_body, config.max_image_pixels)
+            except ImageTooLarge as exc:
+                return self._invalid_request(f"Image is too large: {exc}")
+            if shrunk:
+                self.log.info(f"{model_name}: shrank {shrunk} image(s) to {config.max_image_pixels} px")
+                body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
+
         # Fit the prompt into the model's context window.  This runs after the
         # sticky key above was taken from the original messages: dropping the
         # oldest turns changes the first user message, which would re-pin the
@@ -3493,7 +3749,10 @@ class DynamicRouter:
         last_gone: BackendGoneError | None = None
         for attempt in range(2):
             try:
-                backends = await self._get_or_start(model_name)
+                backends = await (
+                    self._get_or_start(model_name) if vision_gpus is None
+                    else self._get_or_start(model_name, vision_gpus)
+                )
             except GPUBusyError as exc:
                 self.log.warning(str(exc))
                 return web.Response(
@@ -3522,7 +3781,7 @@ class DynamicRouter:
             if (
                 OVERFLOW_QUEUE_DEPTH
                 and config.request_kind == "chat"
-                and not _already_crossed(request)
+                and _may_overflow(request)
                 and waiting >= OVERFLOW_QUEUE_DEPTH
             ):
                 ahead = waiting - sum(b.waiting_behind(priority) for b in backends)
@@ -3830,7 +4089,7 @@ class DynamicRouter:
             )
             return
         model_name, config = match
-        if not _adopted_vllm_matches_config(pid, model_name, config):
+        if not _adopted_vllm_matches_config(pid, model_name, config, slot.gpu_id):
             self.log.warning(
                 f"Slot {slot.slot_id}: refusing to adopt stale vLLM pid={pid} "
                 f"for {model_name}; stopping it so current runtime config applies"
