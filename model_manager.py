@@ -393,7 +393,7 @@ GPU_CLEAR_KILL_SECONDS = float(os.environ.get("GPU_CLEAR_KILL_SECONDS", "15"))
 # so a broken card or a supervised process cannot pin every start to it.  Longer
 # than the 600 s scale-out cooldown, or each retry would pick the same card again.
 GPU_CLEAR_RETRY_SECONDS = 3600.0
-_gpu_clear_failed_at: "dict[int, float]" = {}
+_gpu_clear_failed_at: "dict[str, float]" = {}   # by UUID
 
 
 def _parse_gpu_uuid_table(csv_text: str) -> dict[str, int]:
@@ -406,15 +406,15 @@ def _parse_gpu_uuid_table(csv_text: str) -> dict[str, int]:
     return table
 
 
-def _resolve_guaranteed_gpus(spec: str, table: dict[str, int]) -> frozenset[int]:
-    uuids = [u.strip() for u in spec.split(",") if u.strip()]
-    unknown = [u for u in uuids if u not in table]
+def _parse_guaranteed_uuids(spec: str, table: dict[str, int]) -> frozenset[str]:
+    uuids = frozenset(u.strip() for u in spec.split(",") if u.strip())
+    unknown = sorted(uuids - table.keys())
     if unknown:
         raise ValueError(f"GUARANTEED_GPU_UUIDS: no such GPU {unknown}; this host has {sorted(table)}")
-    return frozenset(table[u] for u in uuids)
+    return uuids
 
 
-def _load_guaranteed_gpus() -> frozenset[int]:
+def _load_guaranteed_uuids() -> frozenset[str]:
     spec = os.environ.get("GUARANTEED_GPU_UUIDS", "").strip()
     if not spec:
         return frozenset()
@@ -422,24 +422,47 @@ def _load_guaranteed_gpus() -> frozenset[int]:
         ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
         capture_output=True, text=True, timeout=10, check=True,
     ).stdout
-    return _resolve_guaranteed_gpus(spec, _parse_gpu_uuid_table(out))
+    return _parse_guaranteed_uuids(spec, _parse_gpu_uuid_table(out))
 
 
-GUARANTEED_GPU_IDS: frozenset[int] = _load_guaranteed_gpus()
+GUARANTEED_GPU_UUIDS: frozenset[str] = _load_guaranteed_uuids()
+
+
+def _gpu_uuid(gpu_id: int) -> "str | None":
+    """UUID of the card nvidia-smi calls gpu_id right now.  Asked every time:
+    indices shift when a card appears or disappears (the A100 gained one without
+    a reboot, 2026-11), and a stale one would clear somebody else's card."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--id={gpu_id}", "--query-gpu=uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out or None
+
+
+def _guaranteed_uuid(gpu_id: int) -> "str | None":
+    """The card's UUID if it is a guaranteed one, else None."""
+    if not GUARANTEED_GPU_UUIDS:
+        return None
+    uuid = _gpu_uuid(gpu_id)
+    return uuid if uuid in GUARANTEED_GPU_UUIDS else None
 
 
 def _gpu_guaranteed(gpu_id: int) -> bool:
     """True for a guaranteed card that has not recently resisted clearing."""
-    if gpu_id not in GUARANTEED_GPU_IDS:
+    uuid = _guaranteed_uuid(gpu_id)
+    if uuid is None:
         return False
-    failed_at = _gpu_clear_failed_at.get(gpu_id)
+    failed_at = _gpu_clear_failed_at.get(uuid)
     return failed_at is None or time.monotonic() - failed_at >= GPU_CLEAR_RETRY_SECONDS
 
 
-def _gpu_compute_pids(gpu_id: int) -> list[int]:
-    """Every process computing on the GPU.  Raises if nvidia-smi cannot say."""
+def _gpu_compute_pids(gpu: str) -> list[int]:
+    """Every process computing on the GPU (by UUID).  Raises if nvidia-smi cannot say."""
     out = subprocess.run(
-        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader", f"--id={gpu_id}"],
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader", f"--id={gpu}"],
         capture_output=True, text=True, timeout=5, check=True,
     ).stdout
     return [int(line) for line in map(str.strip, out.splitlines()) if line.isdigit()]
@@ -1770,11 +1793,11 @@ class GpuBackend:
         self.log.error(msg)
         raise RuntimeError(msg)
 
-    def _foreign_gpu_pids(self) -> list[int]:
+    def _foreign_gpu_pids(self, uuid: str) -> list[int]:
         """Processes on this card that belong to no running backend of ours."""
         ours = self.router.live_pgids()
         found = []
-        for pid in _gpu_compute_pids(self.gpu_id):
+        for pid in _gpu_compute_pids(uuid):
             pgid = self._pgid_of(pid)
             if pid > 1 and pid != os.getpid() and pgid is not None and pgid not in ours:
                 found.append(pid)
@@ -1784,10 +1807,13 @@ class GpuBackend:
         """Stop everything that is not ours on a guaranteed card before a primary
         spawn.  Raises if something is still there afterwards.  Without a router
         there is no way to tell our processes apart, so nothing is touched."""
-        if self.gpu_id not in GUARANTEED_GPU_IDS or self.coresident or self.router is None:
+        if self.coresident or self.router is None:
+            return
+        uuid = _guaranteed_uuid(self.gpu_id)
+        if uuid is None:
             return
         try:
-            pids = self._foreign_gpu_pids()
+            pids = self._foreign_gpu_pids(uuid)
             for sig, grace in ((signal.SIGTERM, GPU_CLEAR_TERM_SECONDS),
                                (signal.SIGKILL, GPU_CLEAR_KILL_SECONDS)):
                 if not pids:
@@ -1800,16 +1826,16 @@ class GpuBackend:
                     _signal_pid(pid, sig)
                 deadline = time.monotonic() + grace
                 while True:
-                    pids = self._foreign_gpu_pids()
+                    pids = self._foreign_gpu_pids(uuid)
                     if not pids or time.monotonic() >= deadline:
                         break
                     await asyncio.sleep(1)
         except (OSError, subprocess.SubprocessError) as exc:
-            _gpu_clear_failed_at[self.gpu_id] = time.monotonic()
+            _gpu_clear_failed_at[uuid] = time.monotonic()
             self.log.warning(f"Guaranteed GPU {self.gpu_id}: could not clear it: {exc}")
             return
         if pids:
-            _gpu_clear_failed_at[self.gpu_id] = time.monotonic()
+            _gpu_clear_failed_at[uuid] = time.monotonic()
             msg = (
                 f"Guaranteed GPU {self.gpu_id} still holds "
                 + ", ".join(f"PID {pid} ({_describe_pid(pid)})" for pid in pids)
@@ -1945,14 +1971,15 @@ class GpuBackend:
     async def _spawn_locked(self) -> None:
         """Start the engine.  A primary start on a guaranteed card that fails
         costs the card its preference, whatever the cause; a good one restores it."""
+        uuid = None if self.coresident else _guaranteed_uuid(self.gpu_id)
         try:
             await self._start_engine_locked()
         except Exception:
-            if not self.coresident and self.gpu_id in GUARANTEED_GPU_IDS:
-                _gpu_clear_failed_at[self.gpu_id] = time.monotonic()
+            if uuid is not None:
+                _gpu_clear_failed_at[uuid] = time.monotonic()
             raise
-        if not self.coresident:
-            _gpu_clear_failed_at.pop(self.gpu_id, None)
+        if uuid is not None:
+            _gpu_clear_failed_at.pop(uuid, None)
 
     async def _start_engine_locked(self) -> None:
         """Spawn vLLM subprocess and wait for /health.  Caller must hold self._lock.
@@ -2040,9 +2067,8 @@ class GpuBackend:
             spawn_env = {
                 **os.environ,
                 "VLLM_CUDA_DEVICE": str(self.gpu_id),
-                # gpu_id is an nvidia-smi index.  CUDA's default order is
-                # fastest-first, which on the mixed A100 host put every spawn on
-                # a different card than the one nvidia-smi had just checked.
+                # gpu_id is an nvidia-smi index; make CUDA count the same way
+                # (its default order is fastest-first, which need not match).
                 "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
                 "VLLM_PORT":        str(self.vllm_port),
                 # Cap ninja parallelism for FlashInfer's JIT.  Unset it runs

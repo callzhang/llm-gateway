@@ -26,13 +26,14 @@ Before a primary model (not a co-resident one such as ASR) spawns on a listed ca
 | A100 (`a100-1`) | 1, 2, 3 | `GPU-233f80c8-31c4-b7d7-0c33-b827cc4a79ac,GPU-24af1ff5-eaa7-1d6f-318e-ad3907e93ede,GPU-47b1ec6d-2226-64be-614d-494520d05299` |
 | gpu4 | 0 | `GPU-391cbb07-44a9-b69a-4b43-828f06a9063e` |
 
+## GPU indices can move
+
+Pins (`MODEL_GPU_IDS`) and slot ids are nvidia-smi indices, and those shift when a card appears or disappears. The A100 had 7 cards when model_manager started on 2026-11-23 and 8 on 2026-11-26 (new one at bus `01:00`, no reboot), which moved every other card up by one. Guaranteed cards are named by UUID and looked up at the moment of clearing, so clearing never follows a moved index; the pins do. After the card count changes, check the pins and restart model_manager.
+
 ## Deploying to the A100: renumber the pins
 
-model_manager now starts engines with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so a GPU id means the nvidia-smi index everywhere. Before this, CUDA's fastest-first order applied on the A100 and id N started on a different card than the one checked. gpu4 has two identical cards and does not change.
+With 8 cards, the cards that were `0,1,2,6` are `1,2,3,7`, and TTS's `5` is `6`. model_manager also starts engines with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so CUDA counts as nvidia-smi does. In the same deployment:
 
-In the same deployment on the A100:
-
-1. In `/etc/llm-model-manager-cn-27b-scaleout.env`, set `MODEL_GPU_IDS="qwen3.8-27b=1,2,3,7;qwen3-tts-1.7b-customvoice=6"` (was `0,1,2,6` and `5`; the same physical cards).
-2. Add `GUARANTEED_GPU_UUIDS` to the same file.
-3. Stop model_manager **and every running engine** before starting it again. An engine adopted under the old numbering would be recorded on the wrong card.
-4. Check each instance with `nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv`.
+1. In `/etc/llm-model-manager-cn-27b-scaleout.env`, set `MODEL_GPU_IDS="qwen3.8-27b=1,2,3,7;qwen3-tts-1.7b-customvoice=6"`, add `GUARANTEED_GPU_UUIDS` and `VISION_GPU_IDS=none` (`vision.md`).
+2. Stop model_manager **and every running engine** before starting it again. An engine adopted under the old numbering would be recorded on the wrong card.
+3. Check each instance with `nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv`.
