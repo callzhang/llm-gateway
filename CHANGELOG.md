@@ -3,6 +3,38 @@
 ## 2026-11-22
 
 ### Fixed
+- `previous_response_hook` answers before the first SSE keepalive, so its 410 stays a real HTTP status. It waited up
+  to 30 s for history inside LiteLLM's keepalive wrapper; with pings at 10 s, US prod Memory's streaming
+  continuations got a 200, pings and a generic stream error, and its extraction jobs failed for good. An id this
+  proxy never issued (it must decrypt with this proxy's key to a managed id naming one of its deployments) is now
+  410 at once without a lookup; its own ids wait at most 12 s (`PREVIOUS_RESPONSE_WAIT_SECONDS`), the keepalive
+  starts at 15 s, and `proxy_batch_write_at: 2` writes spend-log rows every 2-7 s instead of 10-15 s so the history
+  lands inside the wait.
+
+### Known
+- A streamed Responses answer cannot be continued with `previous_response_id` on LiteLLM 1.99's `custom_openai`
+  bridge: its final id points at the stream's placeholder `resp_<uuid>`, which no spend-log row records, so the
+  continuation gets 410. Non-streamed answers continue normally. Streaming clients must resend the conversation.
+
+### Added
+- Priority 0 at model_manager's gate is now a grant held by a LiteLLM virtual key. `request_priority_hook.py`
+  runs a key whose metadata has `gateway_priority: P` at P when the request sends none and never better than P;
+  any other key's 0 becomes 1. model_manager raises the peer region's requests (which skip GPU4's LiteLLM) to
+  `PEER_PRIORITY_FLOOR` = 1. Before this, any client could claim 0: on 2026-11-22, 76 requests from the A100 and
+  122 on the shared `memory-ci-controller` key did. New key `friday-memory-us-prod` (US production friday-memory)
+  holds `gateway_priority: 0`; it is stored on GPU4 in `~/.config/llm-gateway/keys/`.
+- Cross-region overflow counts only the requests queued ahead of the incoming one: gate waiters with a larger
+  priority number are left out of the queue compared with `OVERFLOW_QUEUE_DEPTH`. The A100's requests are never
+  turned away here, so while they queued on GPU4 every local request, a prod priority-0 one included, was sent
+  across at once instead of jumping the queue. A normal (100) request also stays local while only evals (200) wait.
+  The depth itself is unchanged.
+- Streaming requests no longer 524 while queued. Cloudflare gives up after ~100 s without response bytes, and
+  LiteLLM wrote nothing until model_manager's first chunk, so a streaming request held at the gate for minutes
+  failed. `sse_keepalive_ping_interval_seconds: 15` turns on LiteLLM 1.99's TTFT keepalive: after 15 s of silence
+  the client gets 200 SSE headers and a `: ping` comment every 15 s (also in gaps mid-stream). A failure found after
+  the first ping arrives as a `data: {"error": ...}` frame under the 200. Non-streaming requests are unchanged.
+
+### Fixed
 - `OVERFLOW_QUEUE_DEPTH` is now per running instance: model_manager sends new chat work to the peer region once the
   model's summed queue reaches the depth times its instances, not the depth itself. On the A100, after scale-out to
   four 27B replicas (cards 0/1/2/6), the flat 4 still sent ~40 requests a minute to GPU4 while each replica ran

@@ -35,6 +35,12 @@ client ─► Cloudflare ─► tunnel ─► LiteLLM :8900 ──order 1──�
   cache) unless its own slot already has requests queued at the priority gate, and a binding lapses
   after `STICKY_IDLE_TTL` (default 300 s) without a request. A request carrying `x-gateway-overflow` already crossed once and is always served, so
   two saturated regions cannot bounce it.
+* Only requests queued ahead count (2026-11-22): the queue compared with the depth leaves out gate waiters
+  with a larger priority number than the incoming request, since the gate admits it before them. A
+  priority-0 request (US production friday-memory) therefore stays local while the queue is the peer
+  region's priority-1+ work, and a priority-100 request is not sent across for waiting evals at 200.
+  The same holds for a sticky hit's own slot. The peer's requests are raised to priority 1 on arrival
+  (`PEER_PRIORITY_FLOOR`), so they never tie with a granted 0.
 * LiteLLM 1.99 tries `order: 2` only after `order: 1` fails. `disable_cooldowns: true` keeps a
   burst of overflow 503s from benching the local deployment.
 * TTS and ASR run in both regions too, each region's own first. TTS needs a whole card, so on the

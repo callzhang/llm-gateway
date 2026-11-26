@@ -1176,6 +1176,11 @@ class GpuSlot:
 
 DEFAULT_REQUEST_PRIORITY = 100
 MAX_REQUEST_PRIORITY = 255
+# Priorities below this are granted by this host's LiteLLM per virtual key
+# (request_priority_hook.py, which raises an ungranted 0 to the same floor).  The peer
+# region's requests come straight from another host carrying whatever its clients sent,
+# so their priority is raised to this floor.  Equal to UNGRANTED_PRIORITY_FLOOR there.
+PEER_PRIORITY_FLOOR = 1
 
 
 # SGLang ignores vLLM's `thinking_token_budget`; it caps thinking only through a custom logit processor
@@ -1248,6 +1253,10 @@ class PriorityGate:
             if not fut.done():
                 counts[priority] = counts.get(priority, 0) + 1
         return counts
+
+    def waiting_behind(self, priority: int) -> int:
+        """Waiters that a request at ``priority`` is admitted before (larger number)."""
+        return sum(n for p, n in self.waiting_by_priority().items() if p > priority)
 
     async def acquire(self, priority: int, timeout: float | None = None) -> None:
         """Take a place, waiting at most ``timeout`` seconds (TimeoutError after that)."""
@@ -1413,6 +1422,10 @@ class GpuBackend:
     def local_waiting(self) -> int:
         """Requests held at this backend's priority gate, not yet admitted to vLLM."""
         return self._gate.waiting if self._gate is not None else 0
+
+    def waiting_behind(self, priority: int) -> int:
+        """Requests at this backend's gate that one at ``priority`` would be admitted before."""
+        return self._gate.waiting_behind(priority) if self._gate is not None else 0
 
     async def queue_depth(self) -> int:
         """vLLM's real internal queue (num_requests_waiting) for this backend.
@@ -3423,6 +3436,8 @@ class DynamicRouter:
                         "message": str(exc), "type": "invalid_request_error",
                     }}),
                 )
+            if request.remote not in _LOCAL_CALLERS:
+                priority = max(priority, PEER_PRIORITY_FLOOR)
             if "priority" in parsed_body:
                 parsed_body.pop("priority")
                 body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
@@ -3502,7 +3517,10 @@ class DynamicRouter:
                 )
             # A sticky hit keeps its prefix cache local, unless its own slot is
             # already queueing: waiting behind the gate there costs more than
-            # recomputing the history in the other region.
+            # recomputing the history in the other region.  Only requests the gate
+            # admits before this one count (priority number <= its own), so a request
+            # is never sent across for a queue it would jump.  `waiting` is the
+            # sampler's last reading; the live count of waiters behind it comes off it.
             waiting = self._queue_waiting.get(model_name, 0)
             instances = max(len(backends), 1)
             overflow_at = OVERFLOW_QUEUE_DEPTH * instances
@@ -3511,21 +3529,26 @@ class DynamicRouter:
                 and config.request_kind == "chat"
                 and not _already_crossed(request)
                 and waiting >= overflow_at
-                and (sticky_backend is None or sticky_backend.local_waiting > 0)
             ):
-                self.log.info(
-                    f"Overflow: {model_name} waiting={waiting} ≥ "
-                    f"{OVERFLOW_QUEUE_DEPTH}x{instances}"
-                    + (f", sticky slot {sticky_backend.slot.slot_id} queueing "
-                       f"{sticky_backend.local_waiting}" if sticky_backend is not None else "")
-                    + " — 503 so LiteLLM tries the peer region"
+                ahead = waiting - sum(b.waiting_behind(priority) for b in backends)
+                sticky_ahead = (
+                    sticky_backend.local_waiting - sticky_backend.waiting_behind(priority)
+                    if sticky_backend is not None else None
                 )
-                return self._error_response(
-                    503,
-                    f"'{model_name}' has {waiting} requests queued on {instances} "
-                    "instances here; send it to the other region.",
-                    "queue_overflow",
-                )
+                if ahead >= overflow_at and (sticky_ahead is None or sticky_ahead > 0):
+                    self.log.info(
+                        f"Overflow: {model_name} priority={priority} waiting={waiting} "
+                        f"ahead={ahead} ≥ {OVERFLOW_QUEUE_DEPTH}x{instances}"
+                        + (f", sticky slot {sticky_backend.slot.slot_id} queueing "
+                           f"{sticky_ahead} ahead" if sticky_backend is not None else "")
+                        + " — 503 so LiteLLM tries the peer region"
+                    )
+                    return self._error_response(
+                        503,
+                        f"'{model_name}' has {ahead} requests queued on {instances} "
+                        "instances here ahead of this one; send it to the other region.",
+                        "queue_overflow",
+                    )
             if sticky_backend is not None:
                 backend = sticky_backend
             else:
