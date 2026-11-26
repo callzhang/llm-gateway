@@ -16,6 +16,11 @@
 - Engines start with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so a GPU id means the nvidia-smi index. On the A100 this needs
   the pins renumbered in the same deployment (`docs/gpu-guaranteed.md`).
 
+### Fixed
+- `retry_breadcrumb_hook`: spend logs no longer hold other callers' requests. LiteLLM 1.99 kept retry breadcrumbs,
+  messages and images included, on one list per Router, and the overflow fallback wrote them even with
+  `num_retries: 0`. Rows already stored are unchanged (`docs/spend-log-retry-leak.md`).
+
 ## 2026-11-22
 
 ### Fixed

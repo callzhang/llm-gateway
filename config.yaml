@@ -170,6 +170,8 @@ litellm_settings:
     # Priority 0 at model_manager's gate is a grant held by a virtual key
     # (metadata gateway_priority), not something any client can ask for.
     - request_priority_hook.request_priority_hook
+    # Keep other callers' requests out of retry breadcrumbs in the spend logs.
+    - retry_breadcrumb_hook.retry_breadcrumb_hook
 
   # Cloudflare ends a request with 524 when the origin sends nothing for ~100 s,
   # and LiteLLM sends nothing until model_manager's first chunk, so a streaming

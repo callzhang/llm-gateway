@@ -117,6 +117,8 @@ litellm_settings:
   callbacks:
     - previous_response_hook.previous_response_history_hook
     - reasoning_effort_hook.reasoning_effort_hook
+    # Keep other callers' requests out of retry breadcrumbs in the spend logs.
+    - retry_breadcrumb_hook.retry_breadcrumb_hook
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
