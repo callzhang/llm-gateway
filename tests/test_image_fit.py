@@ -81,6 +81,18 @@ class FitImagesTests(unittest.TestCase):
         image_fit.fit_images(body, MAX)
         self.assertEqual(6, opened(body["messages"][0]["content"][1]["image_url"]["url"]).getexif()[0x0112])
 
+    def test_an_oversized_image_in_a_mode_png_cannot_hold_is_still_shrunk(self):
+        data = chat(url(300, 200, "TIFF", "CMYK"))
+        self.assertEqual(1, image_fit.fit_images(data, MAX))
+        small = opened(data["messages"][0]["content"][1]["image_url"]["url"])
+        self.assertLessEqual(small.width * small.height, MAX)
+
+    def test_an_oversized_image_that_cannot_be_re_encoded_is_refused(self):
+        big = url(300, 200)
+        with mock.patch.object(Image.Image, "save", side_effect=OSError("cannot write mode")), \
+                self.assertRaises(image_fit.ImageTooLarge):
+            image_fit._shrunk_data_url(big, MAX)
+
     def test_decompression_bomb_is_refused(self):
         with mock.patch.object(Image, "MAX_IMAGE_PIXELS", 1_000), self.assertRaises(image_fit.ImageTooLarge):
             image_fit.fit_images(chat(url(100, 100)), MAX)

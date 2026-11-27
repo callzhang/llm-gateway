@@ -615,7 +615,8 @@ model_manager, which stops the running engines.
 
 `GATEWAY_API_KEY` in `gateway.env`, the **same value in both regions** (`openssl rand -hex 32`). The LiteLLM
 deployments send it (`config.yaml`, `config.cn.yaml`), including to the peer region, and model_manager answers 401
-to any request that uses a model without it. Health, status and model-list GETs stay open. Callers use LiteLLM with
+to any request that uses a model without it, and to the `/admin` slot actions (loopback only; the dashboard asks for
+the key). Health, status and model-list GETs stay open. Callers use LiteLLM with
 a virtual key; they do not connect to `:8002`. To change it: set it in both files, restart both LiteLLMs and both
 model_managers.
 

@@ -1309,8 +1309,13 @@ ADMIN_HTML = """<!doctype html>
 <div id="meta" class="meta"></div>
 <script>
 async function post(path, payload) {
-  await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
-                     body: JSON.stringify(payload)});
+  const key = sessionStorage.getItem('gatewayKey') || prompt('GATEWAY_API_KEY');
+  if (!key) return;
+  const r = await fetch(path, {method:'POST',
+                               headers:{'Content-Type':'application/json', 'Authorization':'Bearer ' + key},
+                               body: JSON.stringify(payload)});
+  if (r.status === 401) { sessionStorage.removeItem('gatewayKey'); alert('wrong key'); }
+  else sessionStorage.setItem('gatewayKey', key);
   setTimeout(refresh, 300);
 }
 function opts(models, current) {
@@ -1937,10 +1942,10 @@ class GpuBackend:
         self.log.error(msg)
         raise RuntimeError(msg)
 
-    def _foreign_gpu_processes(self, uuid: str, ours: set) -> dict[int, str | None]:
-        """{pid: start time} of the processes on this card outside our process groups."""
+    def _foreign_of(self, pids: list[int], ours: set) -> dict[int, str | None]:
+        """{pid: start time} of those processes that are outside our process groups."""
         found = {}
-        for pid in _gpu_compute_pids(uuid):
+        for pid in pids:
             started = _pid_started(pid)
             pgid = self._pgid_of(pid)
             if pid > 1 and pid != os.getpid() and pgid is not None and pgid not in ours:
@@ -1953,15 +1958,19 @@ class GpuBackend:
         be checked.  Without a router there is no way to tell our processes apart,
         so nothing is touched.  nvidia-smi and sudo run off the event loop: other
         cards keep streaming meanwhile."""
-        if self.coresident or self.router is None:
+        if self.coresident or self.router is None or not GUARANTEED_GPU_UUIDS:
             return
-        uuid = await asyncio.to_thread(_guaranteed_uuid, self.gpu_id)
+        uuid = await asyncio.to_thread(_gpu_uuid, self.gpu_id)
         if uuid is None:
+            raise RuntimeError(
+                f"GPU {self.gpu_id}: cannot tell which card this is, so not whether to clear it")
+        if uuid not in GUARANTEED_GPU_UUIDS:
             return
 
         async def foreign() -> dict:
-            return await asyncio.to_thread(
-                self._foreign_gpu_processes, uuid, self.router.live_pgids())
+            pids = await asyncio.to_thread(_gpu_compute_pids, uuid)
+            # Read after the query: an engine of ours that came up during it is ours.
+            return self._foreign_of(pids, self.router.live_pgids())
 
         try:
             pids = await foreign()
@@ -3737,6 +3746,10 @@ class DynamicRouter:
             if request.remote not in ("127.0.0.1", "::1"):
                 return web.json_response(
                     {"error": "admin actions are loopback-only"}, status=403)
+            # Other accounts on this host reach loopback too, and starting a model
+            # can stop their processes on a guaranteed card.
+            if not _has_gateway_key(request):
+                return self._error_response(401, "missing or wrong gateway API key", "authentication_error")
             try:
                 data = await request.json()
                 slot_id = int(data["slot_id"])

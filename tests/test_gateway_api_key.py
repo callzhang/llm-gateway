@@ -41,6 +41,14 @@ class RouterTests(RouterHarness):
         self.assertEqual(200, response.status)
         self.assertEqual(1, len(self.forwarded))
 
+    async def test_slot_control_needs_the_key_even_from_this_host(self):
+        """Starting a model can stop other users' processes on a guaranteed card."""
+        for path in ("/admin/kill", "/admin/start", "/admin/switch"):
+            response = await self.client.post(path, json={"slot_id": 0, "model": MODEL})
+            self.assertEqual(401, response.status, path)
+        response = await self.client.post("/admin/kill", json={"slot_id": 0}, headers={"Authorization": f"Bearer {KEY}"})
+        self.assertEqual(200, response.status)
+
     async def test_health_and_status_stay_open(self):
         for path in ("/health", "/v1/models", "/status.json", "/admin/status"):
             self.assertEqual(200, (await self.client.get(path)).status, path)
