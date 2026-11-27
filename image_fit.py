@@ -72,15 +72,21 @@ def has_images(body: dict) -> bool:
     return any(_image_parts([body.get("messages"), body.get("input")]))
 
 
-def unsafe_image_url(body: dict) -> bool:
+def _is_inline(url: str) -> bool:
+    """A base64 data: URL, the one form fit_images can shrink."""
+    return url.startswith("data:") and url.partition(",")[0].endswith(";base64")
+
+
+def unsafe_image_url(body: dict, inline_only: bool = False) -> bool:
     """True if an image names anything but data: or http(s):.  SGLang opens a
-    "/..." or file:// URL from the server's own disk."""
+    "/..." or file:// URL from the server's own disk.  With inline_only, anything
+    but a base64 data: URL."""
     for part in _image_parts([body.get("messages"), body.get("input")]):
         image = part.get("image_url")
         url = image.get("url") if isinstance(image, dict) else image
-        if url is not None and not (
-            isinstance(url, str) and url.lower().startswith(("data:", "http://", "https://"))
-        ):
+        if url is not None and not (isinstance(url, str) and (
+            _is_inline(url) if inline_only else url.lower().startswith(("data:", "http://", "https://"))
+        )):
             return True
     return False
 

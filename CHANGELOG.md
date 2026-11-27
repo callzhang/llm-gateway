@@ -8,6 +8,8 @@
   `/data/derek` is no longer world-writable (`docs/region-cn.md`).
 
 ### Added
+- A100: `qwen3.8-27b` takes images again, on card 1's instance, as base64 `data:` URLs only
+  (`IMAGE_URLS_INLINE_ONLY=1`). A handed-over inline image answers 503 on a host that takes images (`docs/vision.md`).
 - `qwen3.8-27b`: model_manager shrinks inline (data: URL) images over 4,194,304 pixels on the CPU before forwarding
   (`image_fit.py`). The engine caps images there anyway but resized them on the GPU, where very large sources (up to
   128 megapixels on the CN key) ran the A100's SGLang out of memory and killed the instance. Images by http URL pass

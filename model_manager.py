@@ -754,6 +754,13 @@ def _parse_vision_gpus(spec: str) -> "frozenset[int] | None":
     return frozenset(int(x) for x in spec.split(",") if x.strip())
 
 
+def _parse_flag(name: str, spec: str) -> bool:
+    """An on/off setting: unset or "0" is off, "1" is on, anything else an error."""
+    if spec.strip() not in ("", "0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, not {spec!r}")
+    return spec.strip() == "1"
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     """Runtime and request contract for one dynamically scheduled model."""
@@ -773,6 +780,9 @@ class ModelConfig:
     # None: no restriction (every instance as its run script has it).  Empty:
     # this host takes no images for the model.  From VISION_GPU_IDS.
     vision_gpu_ids: frozenset[int] | None = None
+    # Images must be base64 data: URLs: the engine then fetches nothing, and every
+    # image passes the shrink above.  From IMAGE_URLS_INLINE_ONLY.
+    inline_images_only: bool = False
     # Scheduled by VRAM budget instead of taking a GPU slot: a small model that
     # shares a GPU with whichever primary model owns the slot.  It is admitted
     # only where the GPU's current free VRAM covers its min-viable footprint,
@@ -846,6 +856,8 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
         # == longest_edge in run_qwen38_27b.sh and SGLANG_IMAGE_MAX_PIXELS.
         max_image_pixels=4_194_304,
         vision_gpu_ids=_parse_vision_gpus(os.environ.get("VISION_GPU_IDS", "")),
+        inline_images_only=_parse_flag(
+            "IMAGE_URLS_INLINE_ONLY", os.environ.get("IMAGE_URLS_INLINE_ONLY", "")),
     ),
     "qwen3-tts-1.7b-customvoice": ModelConfig(
         "run_qwen3_tts_1_7b_customvoice.sh",
@@ -3787,9 +3799,9 @@ class DynamicRouter:
 
         # Images: only the instances on vision_gpu_ids can take them, and they
         # never cross regions.  A host without such a GPU answers 400, or 503 to
-        # work its peer handed over, so the peer's caller can retry there.  A
-        # handed-over image is refused even with vision here: the peer's region
-        # does not take images.
+        # work its peer handed over, so the peer's caller can retry there.  A host
+        # with one answers a handed-over inline image 503 too (the peer lacked
+        # capacity) and any other handed-over image 400 (the peer refused its URL).
         # Whatever the vision setting: an image may only be inline or on the web.
         if config.request_kind == "chat" and isinstance(parsed_body, dict) and unsafe_image_url(parsed_body):
             return self._invalid_request("image URLs must be data: or http(s):")
@@ -3802,14 +3814,19 @@ class DynamicRouter:
             and has_images(parsed_body)
         ):
             crossed = _already_crossed(request)
-            if not config.vision_gpu_ids and crossed:
+            if crossed and (not config.vision_gpu_ids
+                            or not unsafe_image_url(parsed_body, inline_only=True)):
                 return self._error_response(
-                    503, f"'{model_name}' takes no images in this region; retry later.", "gpu_busy")
+                    503, f"'{model_name}' takes no images handed over to this region; retry later.", "gpu_busy")
             if not config.vision_gpu_ids or crossed:
                 return self._invalid_request(
                     f"'{model_name}' does not accept images on this endpoint.")
             vision_gpus = config.vision_gpu_ids
             request[KEEP_LOCAL] = True
+
+        if (config.inline_images_only and isinstance(parsed_body, dict)
+                and unsafe_image_url(parsed_body, inline_only=True)):
+            return self._invalid_request("images must be base64 data: URLs on this endpoint")
 
         # Shrink oversized images before the engine sees them.  Off the event
         # loop, a few at a time: a 128-megapixel source takes ~400 MB decoded.
