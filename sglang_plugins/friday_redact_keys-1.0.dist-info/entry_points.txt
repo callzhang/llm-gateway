@@ -1,0 +1,2 @@
+[sglang.srt.plugins]
+friday_redact_keys = friday_redact_keys:register

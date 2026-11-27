@@ -1,7 +1,11 @@
 """GUARANTEED_GPU_UUIDS: cards where a primary spawn first stops every process
 that is not one of this gateway's backends."""
 
+import asyncio
 import signal
+import subprocess
+import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -41,7 +45,7 @@ class FakeGpu:
     def pgid(self, pid):
         return self.procs[pid][0] if pid in self.procs else None
 
-    def send(self, pid, sig):
+    def send(self, pid, sig, started=None):
         self.sent.append((pid, sig))
         ends_on = self.procs[pid][1]
         if ends_on is not None and sig in (ends_on, signal.SIGKILL):
@@ -63,6 +67,7 @@ class ClearGpuTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(mm, "GPU_CLEAR_KILL_SECONDS", 0.0), \
                 patch.object(mm, "_gpu_compute_pids", gpu.pids), \
                 patch.object(mm, "_signal_pid", gpu.send), \
+                patch.object(mm, "_pid_started", lambda pid: "1"), \
                 patch.object(mm, "_describe_pid", return_value="someone: python"), \
                 patch.object(GpuBackend, "_pgid_of", staticmethod(gpu.pgid)):
             await backend._clear_guaranteed_gpu()
@@ -125,13 +130,32 @@ class ClearGpuTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["clear", "reclaim", "check"], order)
         self.assertIn("GPU-bbb", mm._gpu_clear_failed_at)
 
-    async def test_an_unreadable_card_is_marked(self):
+    async def test_an_unreadable_card_fails_the_spawn_and_is_marked(self):
         def broken(_gpu_id):
             raise OSError("nvidia-smi")
 
-        with cards(), patch.object(mm, "_gpu_compute_pids", broken):
+        with cards(), patch.object(mm, "_gpu_compute_pids", broken), self.assertRaises(RuntimeError):
             await self._backend()._clear_guaranteed_gpu()
         self.assertIn("GPU-bbb", mm._gpu_clear_failed_at)
+
+    async def test_a_slow_card_query_does_not_stall_other_requests(self):
+        ticks = []
+
+        async def ticker():
+            while True:
+                ticks.append(1)
+                await asyncio.sleep(0.01)
+
+        def slow(_gpu_id):
+            time.sleep(0.3)
+            return []
+
+        task = asyncio.create_task(ticker())
+        await asyncio.sleep(0)
+        with cards(), patch.object(mm, "_gpu_compute_pids", slow):
+            await self._backend()._clear_guaranteed_gpu()
+        task.cancel()
+        self.assertGreater(len(ticks), 10)
 
 
 class SlotChoiceTests(unittest.TestCase):
@@ -162,11 +186,41 @@ class SlotChoiceTests(unittest.TestCase):
 
 
 class SignalTests(unittest.TestCase):
+    def _send(self, started_now, own_user=False):
+        with patch.object(mm, "_pid_started", return_value=started_now), \
+                patch.object(mm.os, "kill", side_effect=None if own_user else PermissionError) as own, \
+                patch.object(mm.subprocess, "run") as sudo:
+            mm._signal_pid(1234, signal.SIGTERM, "100")
+        return own, sudo
+
     def test_another_users_process_is_signalled_through_sudo(self):
-        with patch.object(mm.os, "kill", side_effect=PermissionError), \
-                patch.object(mm.subprocess, "run") as run:
-            mm._signal_pid(1234, signal.SIGTERM)
-        self.assertEqual(["sudo", "-n", "kill", "-15", "1234"], run.call_args.args[0])
+        _own, sudo = self._send("100")
+        self.assertEqual(["sudo", "-n", "kill", "-15", "1234"], sudo.call_args.args[0])
+
+    def test_our_users_process_is_signalled_directly(self):
+        own, sudo = self._send("100", own_user=True)
+        own.assert_called_once_with(1234, signal.SIGTERM)
+        sudo.assert_not_called()
+
+    def test_a_reused_pid_is_not_signalled(self):
+        own, sudo = self._send("200")
+        own.assert_not_called()
+        sudo.assert_not_called()
+
+    def test_the_start_time_of_a_live_process_is_read(self):
+        self.assertTrue(mm._pid_started(mm.os.getpid()).isdigit())
+        self.assertIsNone(mm._pid_started(2**30))
+
+
+class DescribeTests(unittest.TestCase):
+    def test_no_argument_of_another_process_reaches_the_log(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "secret-token"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        text = mm._describe_pid(child.pid)
+        self.assertNotIn("secret-token", text)
+        self.assertNotIn("sleep", text)
+        self.assertIn("python", text)
 
 
 if __name__ == "__main__":

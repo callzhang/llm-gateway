@@ -13,6 +13,13 @@
   could exceed the context window.
 
 ### Security
+- model_manager requires `GATEWAY_API_KEY` for every request that uses a model (README); it accepted any caller that
+  could connect, and added the engine key itself.
+- The SGLang engine log no longer holds the API keys; the manager forwards to a slot port only when the engine it
+  started is what listens there.
+- Guaranteed-GPU clearing: signals only the process it saw (not a reused PID), logs no process arguments, fails the
+  start when it cannot check the card, and runs off the event loop.
+- An `image_url` part without a `type` (vLLM's shorthand) is treated as an image.
 - An image URL must be `data:` or `http(s):`; a path or `file://` URL is a 400.
 - A100: SGLang's internal sockets bind loopback, the gateway unit takes only host and tailnet connections, and
   `/data/derek` is no longer world-writable (`docs/region-cn.md`).

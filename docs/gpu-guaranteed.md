@@ -34,6 +34,6 @@ Pins (`MODEL_GPU_IDS`) and slot ids are nvidia-smi indices, and those shift when
 
 With 8 cards, the cards that were `0,1,2,6` are `1,2,3,7`, and TTS's `5` is `6`. model_manager also starts engines with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so CUDA counts as nvidia-smi does. In the same deployment:
 
-1. In `/etc/llm-model-manager-cn-27b-scaleout.env`, set `MODEL_GPU_IDS="qwen3.8-27b=1,2,3,7;qwen3-tts-1.7b-customvoice=6"`, add `GUARANTEED_GPU_UUIDS` and `VISION_GPU_IDS=none` (`vision.md`).
+1. In `/etc/llm-model-manager-cn-27b-scaleout.env`, set `MODEL_GPU_IDS="qwen3.8-27b=1,2,3,7;qwen3-tts-1.7b-customvoice=6"`, add `GUARANTEED_GPU_UUIDS` and the host's image settings (the table in `vision.md`).
 2. Stop model_manager **and every running engine** before starting it again. An engine adopted under the old numbering would be recorded on the wrong card.
 3. Check each instance with `nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv`.

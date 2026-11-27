@@ -32,6 +32,7 @@ import heapq
 import itertools
 import fcntl
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -469,25 +470,42 @@ def _gpu_compute_pids(gpu: str) -> list[int]:
 
 
 def _describe_pid(pid: int) -> str:
-    """"<user>: <command>" for the log; arguments are cut off, they can hold secrets."""
+    """"<user>: <program>" for the log; no argument of another user's process is
+    recorded, any of them can be a secret."""
     try:
         user = pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_name
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            argv = f.read().decode("utf-8", errors="ignore").split("\0")
-        return f"{user}: {' '.join(argv[:3])[:160]}"
+        with open(f"/proc/{pid}/comm", "r", errors="ignore") as f:
+            return f"{user}: {f.read().strip()}"
     except (OSError, KeyError):
         return "unknown process"
 
 
-def _signal_pid(pid: int, sig: int) -> None:
-    """Signal one process, through passwordless sudo if another user owns it."""
+def _pid_started(pid: int) -> str | None:
+    """Start time of the process (field 22 of /proc/pid/stat), which tells it
+    apart from a later one with the same number.  None if it is gone."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+        return data[data.rindex(b")") + 2:].split()[19].decode()
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _signal_pid(pid: int, sig: int, started: str | None) -> None:
+    """Signal the process that was seen on the card (`started`), not whatever has
+    its number now; through passwordless sudo if another user owns it.  The start
+    time is read right before each signal (the gateway's Python has no
+    os.pidfd_open, and sudo takes only a number)."""
+    if started is None or _pid_started(pid) != started:
+        return
     try:
         os.kill(pid, sig)
     except ProcessLookupError:
         pass
     except PermissionError:
-        subprocess.run(["sudo", "-n", "kill", f"-{int(sig)}", str(pid)],
-                       capture_output=True, timeout=10)
+        if _pid_started(pid) == started:
+            subprocess.run(["sudo", "-n", "kill", f"-{int(sig)}", str(pid)],
+                           capture_output=True, timeout=10)
 
 
 def _gpu_vllm_pids(gpu_id: int) -> "list[tuple[int, str]]":
@@ -593,6 +611,52 @@ def _read_process_env(pid: int, name: str) -> str | None:
         (e[len(prefix):].decode("utf-8", errors="ignore") for e in entries if e.startswith(prefix)),
         None,
     )
+
+
+# Local addresses, as /proc/net/tcp{,6} writes them, at which a request to
+# 127.0.0.1 arrives: loopback and the wildcards.
+_LOOPBACK_LISTEN = frozenset({
+    "0100007F", "00000000", "0" * 32, "0000000000000000FFFF00000100007F",
+})
+
+
+def _listening_inodes(port: int) -> set[str]:
+    inodes = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as f:
+                rows = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        for fields in map(str.split, rows):
+            address, _, hex_port = fields[1].partition(":")
+            if fields[3] == "0A" and int(hex_port, 16) == port and address in _LOOPBACK_LISTEN:
+                inodes.add(fields[9])
+    return inodes
+
+
+def _listener_is_ours(port: int, pgid: int | None) -> bool:
+    """True when every socket listening for the port belongs to process group
+    `pgid`.  A /health answer alone does not say who gave it, and every forwarded
+    request carries the engine key."""
+    wanted = _listening_inodes(port)
+    if not wanted or pgid is None:
+        return False
+    held = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or GpuBackend._pgid_of(int(entry)) != pgid:
+            continue
+        try:
+            for fd in os.listdir(f"/proc/{entry}/fd"):
+                try:
+                    target = os.readlink(f"/proc/{entry}/fd/{fd}")
+                except OSError:
+                    continue
+                if target.startswith("socket:["):
+                    held.add(target[len("socket:["):-1])
+        except OSError:
+            continue
+    return wanted <= held
 
 
 def _adopted_engine_has_gateway_key(pid: int) -> bool:
@@ -1145,6 +1209,17 @@ MODEL_LEN_RETRY_FRACTION = float(os.environ.get("MODEL_LEN_RETRY_FRACTION", "0.9
 # What the engines accept from this process, and nothing else: generated at deployment, set in
 # gateway.env, handed to the engines through their environment (never their command line).
 ENGINE_API_KEY = os.environ.get("ENGINE_API_KEY", "")
+# What the gateway's LiteLLMs (this host's and the peer region's) send to this
+# process.  Without it anyone who can connect to the port uses the models past
+# the virtual keys, their limits and the usage records.  main() requires it.
+GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY", "")
+
+
+def _has_gateway_key(request: web.Request) -> bool:
+    if not GATEWAY_API_KEY:
+        return True
+    return hmac.compare_digest(
+        request.headers.get("Authorization", "").encode(), f"Bearer {GATEWAY_API_KEY}".encode())
 
 
 def _engine_auth_headers() -> dict[str, str]:
@@ -1859,47 +1934,55 @@ class GpuBackend:
         self.log.error(msg)
         raise RuntimeError(msg)
 
-    def _foreign_gpu_pids(self, uuid: str) -> list[int]:
-        """Processes on this card that belong to no running backend of ours."""
-        ours = self.router.live_pgids()
-        found = []
+    def _foreign_gpu_processes(self, uuid: str, ours: set) -> dict[int, str | None]:
+        """{pid: start time} of the processes on this card outside our process groups."""
+        found = {}
         for pid in _gpu_compute_pids(uuid):
+            started = _pid_started(pid)
             pgid = self._pgid_of(pid)
             if pid > 1 and pid != os.getpid() and pgid is not None and pgid not in ours:
-                found.append(pid)
+                found[pid] = started
         return found
 
     async def _clear_guaranteed_gpu(self) -> None:
         """Stop everything that is not ours on a guaranteed card before a primary
-        spawn.  Raises if something is still there afterwards.  Without a router
-        there is no way to tell our processes apart, so nothing is touched."""
+        spawn.  Raises if something is still there afterwards, or if that cannot
+        be checked.  Without a router there is no way to tell our processes apart,
+        so nothing is touched.  nvidia-smi and sudo run off the event loop: other
+        cards keep streaming meanwhile."""
         if self.coresident or self.router is None:
             return
-        uuid = _guaranteed_uuid(self.gpu_id)
+        uuid = await asyncio.to_thread(_guaranteed_uuid, self.gpu_id)
         if uuid is None:
             return
+
+        async def foreign() -> dict:
+            return await asyncio.to_thread(
+                self._foreign_gpu_processes, uuid, self.router.live_pgids())
+
         try:
-            pids = self._foreign_gpu_pids(uuid)
+            pids = await foreign()
             for sig, grace in ((signal.SIGTERM, GPU_CLEAR_TERM_SECONDS),
                                (signal.SIGKILL, GPU_CLEAR_KILL_SECONDS)):
                 if not pids:
                     break
-                for pid in pids:
+                for pid, started in pids.items():
                     self.log.warning(
                         f"Guaranteed GPU {self.gpu_id}: {signal.Signals(sig).name} "
                         f"PID {pid} ({_describe_pid(pid)})"
                     )
-                    _signal_pid(pid, sig)
+                    await asyncio.to_thread(_signal_pid, pid, sig, started)
                 deadline = time.monotonic() + grace
                 while True:
-                    pids = self._foreign_gpu_pids(uuid)
+                    pids = await foreign()
                     if not pids or time.monotonic() >= deadline:
                         break
                     await asyncio.sleep(1)
         except (OSError, subprocess.SubprocessError) as exc:
             _gpu_clear_failed_at[uuid] = time.monotonic()
-            self.log.warning(f"Guaranteed GPU {self.gpu_id}: could not clear it: {exc}")
-            return
+            msg = f"Guaranteed GPU {self.gpu_id}: could not check that it is clear: {exc}"
+            self.log.warning(msg)
+            raise RuntimeError(msg) from exc
         if pids:
             _gpu_clear_failed_at[uuid] = time.monotonic()
             msg = (
@@ -2216,6 +2299,11 @@ class GpuBackend:
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as r:
                     if r.status == 200:
+                        if not _listener_is_ours(self.vllm_port, spawn_pid):
+                            await self._kill_process_locked()
+                            raise RuntimeError(
+                                f"port {self.vllm_port} is answered by a process that is not the "
+                                f"engine just started on slot {self.slot.slot_id}")
                         elapsed = int(time.monotonic() - started)
                         self.log.info(
                             f"vLLM ready in {elapsed}s "
@@ -3664,6 +3752,11 @@ class DynamicRouter:
                 self._track_admin(fn(slot_id, model))
             return web.json_response({"ok": True, "action": action, "slot_id": slot_id})
 
+        # Everything above is health, status and loopback-only admin; the rest uses the models.
+        if not _has_gateway_key(request):
+            self.log.warning(f"Unauthorized {request.method} {request.path!r} from {request.remote}")
+            return self._error_response(401, "missing or wrong gateway API key", "authentication_error")
+
         body = await request.read()
         model_name = self._extract_model(body, request.headers.get("Content-Type", ""))
         if not model_name:
@@ -4245,6 +4338,13 @@ class DynamicRouter:
                 f"within {self.ADOPT_BOOT_WAIT}s — skipping"
             )
             return
+        if not _listener_is_ours(slot.port, GpuBackend._pgid_of(pid)):
+            self.log.warning(
+                f"Slot {slot.slot_id}: port {slot.port} is not served by vLLM pid={pid} alone; "
+                "stopping that engine instead of adopting it"
+            )
+            await _terminate_adopted_vllm(pid)
+            return
         b = self._make_backend(model_name, slot, served_name=served_name)
         await b.start()                # init session + idle watchdog
         b._adopted_pid = pid
@@ -4262,6 +4362,8 @@ async def main() -> None:
     log = logging.getLogger("model_manager")
     if not ENGINE_API_KEY:
         raise SystemExit("ENGINE_API_KEY is not set (gateway.env); refusing to start.")
+    if not GATEWAY_API_KEY:
+        raise SystemExit("GATEWAY_API_KEY is not set (gateway.env); refusing to start.")
 
     slots  = [GpuSlot(sid, gid, port) for sid, gid, port in GPU_SLOTS]
     router = DynamicRouter(slots, MODEL_CONFIGS, ContextFitter.from_config())

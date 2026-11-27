@@ -613,6 +613,16 @@ environment and accept nothing else outside `/health` and `/metrics`: vLLM throu
 Only model_manager holds it; callers' `Authorization` headers never reach an engine. After changing it, restart
 model_manager, which stops the running engines.
 
+### Gateway key (required)
+
+`GATEWAY_API_KEY` in `gateway.env`, the **same value in both regions** (`openssl rand -hex 32`). The LiteLLM
+deployments send it (`config.yaml`, `config.cn.yaml`), including to the peer region, and model_manager answers 401
+to any request that uses a model without it. Health, status and model-list GETs stay open. Callers use LiteLLM with
+a virtual key; they do not connect to `:8002`. To change it: set it in both files, restart both LiteLLMs and both
+model_managers.
+
+The SGLang engine prints its start arguments; `sglang_plugins/friday_redact_keys.py` masks the keys there.
+
 ### GPU slot configuration
 
 | Variable | Default | Description |

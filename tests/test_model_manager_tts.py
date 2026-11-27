@@ -271,7 +271,7 @@ class LiteLlmConfigTests(unittest.TestCase):
         local, peer = sorted((m["litellm_params"] for m in matches), key=lambda p: p["order"])
         for params in (local, peer):
             self.assertEqual(f"hosted_vllm/{MODEL_NAME}", params["model"])
-            self.assertEqual("local-qwen36", params["api_key"])
+            self.assertEqual("os.environ/GATEWAY_API_KEY", params["api_key"])
             self.assertEqual(600, params["timeout"])
         self.assertEqual((1, "http://127.0.0.1:8002/v1"), (local["order"], local["api_base"]))
         self.assertEqual((2, "os.environ/PEER_GATEWAY_API_BASE"), (peer["order"], peer["api_base"]))
