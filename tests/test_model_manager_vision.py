@@ -122,6 +122,18 @@ class ImageRoutingTests(RouterHarness):
         self.assertEqual(200, (await self._post(body({"image_url": {"url": "https://example.com/a.png"}}))).status)
         self.assertEqual([frozenset({0})], self.asked)
 
+    async def test_an_inline_only_host_takes_no_video_or_audio(self):
+        """Their URLs would be loaded by the engine as image URLs would, and none of its models take them."""
+        await self._setup(frozenset({0}))
+        self.router.model_configs[MODEL] = mm.replace(self.router.model_configs[MODEL], inline_images_only=True)
+        for part in ({"type": "video_url", "video_url": {"url": "file:///x.mp4"}},
+                     {"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}},
+                     {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}},
+                     {"video_url": {"url": "data:video/mp4;base64,AA=="}}):
+            response = await self._post(body(part))
+            self.assertEqual(400, response.status, part)
+        self.assertEqual([], self.forwarded)
+
     async def test_unrestricted_models_are_unchanged(self):
         await self._setup(None)
         self.assertEqual(200, (await self._post(body(IMAGE), **{mm.OVERFLOW_HEADER: "1"})).status)

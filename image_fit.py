@@ -16,6 +16,8 @@ import math
 from PIL import Image
 
 _IMAGE_PART_TYPES = ("image_url", "input_image")
+# Video and audio parts, by type or by the key that carries them.
+_OTHER_MEDIA = ("video_url", "video", "input_video", "audio_url", "audio", "input_audio")
 
 # One token covers a 32x32 pixel square (patch 16 x merge 2), and the processor never
 # goes below MIN_PIXELS.  PROCESSOR_MAX_PIXELS is the checkpoints' own longest_edge,
@@ -122,6 +124,18 @@ def has_images(body: dict) -> bool:
 def _is_inline(url: str) -> bool:
     """A base64 data: URL, the one form fit_images can shrink."""
     return url.startswith("data:") and url.partition(",")[0].endswith(";base64")
+
+
+def has_video_or_audio(body: dict) -> bool:
+    """Whether a message or Responses input carries a video or audio part."""
+    def walk(node) -> bool:
+        if isinstance(node, dict):
+            if node.get("type") in _OTHER_MEDIA or any(key in node for key in _OTHER_MEDIA):
+                return True
+            node = list(node.values())
+        return isinstance(node, list) and any(walk(child) for child in node)
+
+    return walk([body.get("messages"), body.get("input")])
 
 
 def unsafe_image_url(body: dict, inline_only: bool = False) -> bool:
