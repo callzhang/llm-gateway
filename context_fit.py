@@ -163,7 +163,8 @@ def _template_part(part: Any) -> Any:
     """A text part as the engines read it.  The template picks a part's kind by
     which keys exist, so a `"video": null` beside the text would count a video
     placeholder instead of the text."""
-    if isinstance(part, dict) and part.get("type") == "text" and part.get("uuid") is None:
+    if (isinstance(part, dict) and part.get("type") == "text" and part.get("uuid") is None
+            and isinstance(part.get("text"), str)):
         return {"type": "text", "text": part.get("text")}
     return part
 

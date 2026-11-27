@@ -78,9 +78,10 @@ def _shrunk_data_url(url: str, max_pixels: int) -> "str | None":
 
 def _image_parts(node):
     if isinstance(node, dict):
-        # vLLM also takes a part without a type (or with a uuid) by its `image_url` key.
-        if node.get("type") in _IMAGE_PART_TYPES or (
-            "image_url" in node and (node.get("type") is None or node.get("uuid") is not None)
+        # Whatever its type, a part that names an image counts as one: engines also read
+        # parts by their keys (vLLM: no type, or a uuid, whose image_url may be null).
+        if node.get("type") in _IMAGE_PART_TYPES or node.get("image_url") is not None or (
+            node.get("uuid") is not None and "image_url" in node
         ):
             yield node
             return
