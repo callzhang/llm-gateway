@@ -163,11 +163,7 @@ class _Counter:
 _TEXT_PARTS = {"text": "text", "input_text": "text", "output_text": "text", "refusal": "refusal", "thinking": "thinking"}
 
 
-def _template_part(part: Any) -> Any:
-    """A text-like part as the engines read it.  The template knows only "text",
-    and picks a part's kind by which keys exist: a replayed refusal would make it
-    raise, and a `"video": null` beside the text would count a video placeholder
-    instead of the text."""
+def _as_text_part(part: Any) -> Any:
     if not isinstance(part, dict) or part.get("uuid") is not None:
         return part
     kind = part.get("type")
@@ -177,13 +173,25 @@ def _template_part(part: Any) -> Any:
     return {"type": "text", "text": part[field]}
 
 
+def normalize_text_parts(body: dict) -> None:
+    """Rewrite, in place, each text-like content part of a chat body as a plain
+    text part, so the engine and the count read the same thing.  The chat template
+    picks a part's kind by which keys exist (vLLM keeps a text part's extra keys,
+    SGLang drops them) and knows only "text".  A part with a uuid, or without a
+    string to read, is left for the engine; a Responses `input` is not touched,
+    its part types are the API's own."""
+    messages = body.get("messages")
+    for message in messages if isinstance(messages, list) else ():
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            message["content"] = [_as_text_part(part) for part in content]
+
+
 def _template_messages(messages: list[dict]) -> list[dict]:
     """Messages as vLLM hands them to the chat template: tool-call arguments
     arrive as JSON strings on the wire but the template iterates them as dicts."""
     out = []
     for msg in messages:
-        if isinstance(msg.get("content"), list):
-            msg = {**msg, "content": [_template_part(part) for part in msg["content"]]}
         if msg.get("tool_calls"):
             calls = []
             for call in msg["tool_calls"]:

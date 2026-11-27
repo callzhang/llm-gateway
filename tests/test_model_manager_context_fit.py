@@ -149,6 +149,26 @@ class ImagesCountTowardTheWindow(RouterHarness):
         self.assertEqual(3000, sent["max_tokens"])
 
 
+class TextPartsReachTheEngineAsText(RouterHarness):
+    async def test_text_like_parts_are_rewritten_and_nothing_else_is(self):
+        """So the engine renders, and the count reads, the same thing whichever engine it is."""
+        kept = [{"type": "text", "uuid": "u", "text": "cached", "image_url": None}, {"type": "text", "text": 5},
+                {"type": "image_url", "image_url": {"url": "data:,"}}]
+        parts = [{"type": "text", "text": "a", "video": None, "image_url": "file:///x"},
+                 {"type": "refusal", "refusal": "no"}, {"type": "output_text", "text": "b", "annotations": []}]
+        payload = {"model": MODEL, "messages": [{"role": "user", "content": parts + kept, "audio": None}]}
+        await self.client.post("/v1/chat/completions", json=payload)
+        sent = json.loads(self.forwarded[0])["messages"][0]
+        self.assertEqual([{"type": "text", "text": "a"}, {"type": "text", "text": "no"}, {"type": "text", "text": "b"}] + kept,
+                         sent["content"])
+        self.assertIsNone(sent["audio"])
+
+    async def test_a_responses_input_keeps_its_part_types(self):
+        payload = {"model": MODEL, "input": [{"role": "user", "content": [{"type": "input_text", "text": "a"}]}]}
+        await self.client.post("/v1/responses", json=payload)
+        self.assertEqual(payload["input"], json.loads(self.forwarded[0])["input"])
+
+
 class UnrenderableRequests(RouterHarness):
     def make_fitter(self) -> ContextFitter:
         fitter = super().make_fitter()

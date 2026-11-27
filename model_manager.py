@@ -53,7 +53,7 @@ from aiohttp import web
 from asr_adapter import service as asr_service
 from asr_adapter.cpu_pool import CpuAsrWorker, CpuWorkerError
 from asr_adapter.engine import EngineError, pcm16_wav
-from context_fit import ContextFitter
+from context_fit import ContextFitter, normalize_text_parts
 from image_fit import ImageTooLarge, fit_images, has_images, has_video_or_audio, unsafe_image_url
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -3823,7 +3823,9 @@ class DynamicRouter:
             return invalid
         if config.request_kind == "transcription":
             return await self._handle_transcription(request, body, model_name)
-        # The engine gets what was checked, not the client's bytes (repeated keys).
+        # The engine gets what was checked, not the client's bytes (repeated keys),
+        # with text-like parts in the one form the count and every engine read.
+        normalize_text_parts(parsed_body)
         body = json.dumps(parsed_body).encode()
         if config.request_kind == "speech":
             # The public speech contract is deliberately MP3-only.  vLLM-Omni
@@ -3915,8 +3917,8 @@ class DynamicRouter:
             approx_chars = sum(
                 len(m.get("content", "")) if isinstance(m.get("content"), str)
                 else sum(
-                    len(p.get("text", "") or "")
-                    for p in (m.get("content") or []) if isinstance(p, dict)
+                    len(p["text"])
+                    for p in (m.get("content") or []) if isinstance(p, dict) and isinstance(p.get("text"), str)
                 )
                 for m in msgs if isinstance(m, dict)
             )

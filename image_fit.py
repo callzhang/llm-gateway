@@ -115,13 +115,8 @@ def image_tokens(url: object, max_pixels: int) -> int:
 
 
 def image_urls(messages: list):
-    """The URL of every part the engine reads as an image, in order (None for one
-    without a URL).  Narrower than _image_parts, which errs toward checking: a
-    text part is read as text whatever else it carries, and takes no image tokens."""
+    """The URL of every image part, in order (None for a part without one)."""
     for part in _image_parts(messages):
-        if not (part.get("type") in _IMAGE_PART_TYPES or part.get("type") is None
-                or part.get("uuid") is not None):
-            continue
         image = part.get("image_url")
         yield image.get("url") if isinstance(image, dict) else image
 

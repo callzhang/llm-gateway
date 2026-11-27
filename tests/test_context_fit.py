@@ -441,28 +441,24 @@ def test_real_tokenizer_trims_a_long_conversation_to_fit(real):
     assert data["max_tokens"] == 32768   # trimmed enough that the cap was not needed
 
 
-def test_real_template_counts_a_text_part_as_text_whatever_empty_keys_it_carries(real):
-    """The template picks a part's kind by which keys exist, so `"video": null` turned a text part
-    into a video placeholder and its text went uncounted; the engines go by `type`."""
+def test_real_template_counts_a_normalized_part_as_plain_text(real):
+    """The template picks a part's kind by which keys exist (`"video": null` made a text part a video
+    placeholder) and knows no "refusal"; model_manager rewrites such parts before counting."""
     text = "the quarterly report is attached below. " * 300
-    for model, limits in real._limits.items():
-        plain = limits.tokenizer.count([{"role": "user", "content": [{"type": "text", "text": text}]}], None)
-        for extra in ({"video": None}, {"image": None}, {"image_url": None}, {"audio": None, "video": None}):
-            part = {"type": "text", "text": text, **extra}
-            assert limits.tokenizer.count([{"role": "user", "content": [part]}], None) == plain, (model, extra)
-
-
-def test_real_template_counts_the_parts_the_engine_reads_as_text(real):
-    """A client replaying a refusal got a 400: the template refuses the part, while vLLM renders its text."""
-    text = "I cannot help with that request. " * 50
+    variants = [{"type": "text", "text": text, **extra} for extra in
+                ({"video": None}, {"image": None}, {"image_url": None}, {"video": "data:,"}, {"image_url": "data:,"})]
+    variants += [{"type": kind, field: text} for kind, field in
+                 (("refusal", "refusal"), ("input_text", "text"), ("output_text", "text"), ("thinking", "thinking"))]
     for model, limits in real._limits.items():
         def count(part):
-            return limits.tokenizer.count([{"role": "user", "content": "q"}, {"role": "assistant", "content": [part]},
-                                           {"role": "user", "content": "again"}], None)
+            body = {"messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": [part]},
+                                 {"role": "user", "content": "again"}]}
+            context_fit.normalize_text_parts(body)
+            return limits.tokenizer.count(body["messages"], None)
 
         plain = count({"type": "text", "text": text})
-        for kind, field in (("refusal", "refusal"), ("input_text", "text"), ("output_text", "text"), ("thinking", "thinking")):
-            assert count({"type": kind, field: text}) == plain, (model, kind)
+        for part in variants:
+            assert count(dict(part)) == plain, (model, sorted(part))
 
 
 def test_real_template_bills_old_thinking_in_full_and_stripping_it_recovers_the_room(real):
