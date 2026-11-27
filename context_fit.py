@@ -159,11 +159,22 @@ class _Counter:
             return self._tokenizer.decode(ids)
 
 
+def _template_part(part: Any) -> Any:
+    """A text part as the engines read it.  The template picks a part's kind by
+    which keys exist, so a `"video": null` beside the text would count a video
+    placeholder instead of the text."""
+    if isinstance(part, dict) and part.get("type") == "text" and part.get("uuid") is None:
+        return {"type": "text", "text": part.get("text")}
+    return part
+
+
 def _template_messages(messages: list[dict]) -> list[dict]:
     """Messages as vLLM hands them to the chat template: tool-call arguments
     arrive as JSON strings on the wire but the template iterates them as dicts."""
     out = []
     for msg in messages:
+        if isinstance(msg.get("content"), list):
+            msg = {**msg, "content": [_template_part(part) for part in msg["content"]]}
         if msg.get("tool_calls"):
             calls = []
             for call in msg["tool_calls"]:

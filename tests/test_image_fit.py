@@ -49,6 +49,17 @@ class ImageTokenTests(unittest.TestCase):
             self.assertEqual(ENGINE_PIXELS // 1024, image_fit.image_tokens(value, ENGINE_PIXELS), value)
 
 
+class ImageDetectionTests(unittest.TestCase):
+    def test_a_typed_text_part_is_not_an_image_whatever_keys_it_carries(self):
+        """vLLM reads the keys only of a part without a type, or with a uuid."""
+        def has(part):
+            return image_fit.has_images({"messages": [{"role": "user", "content": [part]}]})
+
+        self.assertFalse(has({"type": "text", "text": "x", "image_url": None}))
+        self.assertTrue(has({"image_url": {"url": "data:,"}}))
+        self.assertTrue(has({"type": "text", "uuid": "u", "image_url": None}))
+
+
 class FitImagesTests(unittest.TestCase):
     def test_large_image_is_shrunk_keeping_shape_and_format(self):
         for fmt in ("PNG", "JPEG"):

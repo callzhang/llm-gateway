@@ -441,6 +441,17 @@ def test_real_tokenizer_trims_a_long_conversation_to_fit(real):
     assert data["max_tokens"] == 32768   # trimmed enough that the cap was not needed
 
 
+def test_real_template_counts_a_text_part_as_text_whatever_empty_keys_it_carries(real):
+    """The template picks a part's kind by which keys exist, so `"video": null` turned a text part
+    into a video placeholder and its text went uncounted; the engines go by `type`."""
+    text = "the quarterly report is attached below. " * 300
+    for model, limits in real._limits.items():
+        plain = limits.tokenizer.count([{"role": "user", "content": [{"type": "text", "text": text}]}], None)
+        for extra in ({"video": None}, {"image": None}, {"image_url": None}, {"audio": None, "video": None}):
+            part = {"type": "text", "text": text, **extra}
+            assert limits.tokenizer.count([{"role": "user", "content": [part]}], None) == plain, (model, extra)
+
+
 def test_real_template_bills_old_thinking_in_full_and_stripping_it_recovers_the_room(real):
     limits = real._limits["qwen3.8-27b"]
     think = "let me think about this carefully step by step " * 1200
