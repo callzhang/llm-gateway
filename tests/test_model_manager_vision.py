@@ -129,7 +129,9 @@ class ImageRoutingTests(RouterHarness):
         for part in ({"type": "video_url", "video_url": {"url": "file:///x.mp4"}},
                      {"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}},
                      {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}},
-                     {"video_url": {"url": "data:video/mp4;base64,AA=="}}):
+                     {"video_url": {"url": "data:video/mp4;base64,AA=="}},
+                     {"type": "text", "audio_url": {"url": "data:audio/wav;base64,AA=="}},
+                     {"type": "bogus", "video": "data:,"}):
             response = await self._post(body(part))
             self.assertEqual(400, response.status, part)
         self.assertEqual([], self.forwarded)

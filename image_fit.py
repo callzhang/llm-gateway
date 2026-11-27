@@ -115,8 +115,13 @@ def image_tokens(url: object, max_pixels: int) -> int:
 
 
 def image_urls(messages: list):
-    """The URL of every image part, in order (None for a part without one)."""
+    """The URL of every part the engine reads as an image, in order (None for one
+    without a URL).  Narrower than _image_parts, which errs toward checking: a
+    text part is read as text whatever else it carries, and takes no image tokens."""
     for part in _image_parts(messages):
+        if not (part.get("type") in _IMAGE_PART_TYPES or part.get("type") is None
+                or part.get("uuid") is not None):
+            continue
         image = part.get("image_url")
         yield image.get("url") if isinstance(image, dict) else image
 
@@ -132,12 +137,14 @@ def _is_inline(url: str) -> bool:
 
 
 def _is_video_or_audio(part: object) -> bool:
+    """Like _image_parts: by type, or by a key that names media, whatever the type."""
     if not isinstance(part, dict):
         return False
-    if part.get("type") in _OTHER_MEDIA_TYPES:
-        return True
-    return (part.get("type") is None or part.get("uuid") is not None) and any(
-        part.get(key) is not None for key in _OTHER_MEDIA_KEYS)
+    return (
+        part.get("type") in _OTHER_MEDIA_TYPES
+        or any(part.get(key) is not None for key in _OTHER_MEDIA_KEYS)
+        or (part.get("uuid") is not None and any(key in part for key in _OTHER_MEDIA_KEYS))
+    )
 
 
 def has_video_or_audio(body: dict) -> bool:

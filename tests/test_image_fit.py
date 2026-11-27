@@ -63,6 +63,14 @@ class ImageDetectionTests(unittest.TestCase):
             {"type": "text", "text": "x", "image_url": "file:///x"}]}]}))
 
 
+class CountedImageTests(unittest.TestCase):
+    def test_only_what_the_engine_reads_as_an_image_takes_context(self):
+        """A text part is read as text whatever else it carries: billing it an image dropped history needlessly."""
+        parts = [{"type": "text", "text": "x", "image_url": "data:,"}, {"type": "image_url", "image_url": {"url": "a"}},
+                 {"image_url": "b"}, {"type": "text", "uuid": "u", "image_url": "c"}, {"type": "input_image", "image_url": "d"}]
+        self.assertEqual(["a", "b", "c", "d"], list(image_fit.image_urls([{"role": "user", "content": parts}])))
+
+
 class FitImagesTests(unittest.TestCase):
     def test_large_image_is_shrunk_keeping_shape_and_format(self):
         for fmt in ("PNG", "JPEG"):
