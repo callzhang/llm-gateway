@@ -22,6 +22,10 @@ if [[ -n ${ASR_VLLM_DISABLED_KERNELS:-} ]]; then
   export VLLM_DISABLED_KERNELS=$ASR_VLLM_DISABLED_KERNELS
 fi
 
+# The engine accepts only model_manager's key, read from the environment (engine_plugins/require_api_key.py).
+: "${ENGINE_API_KEY:?set ENGINE_API_KEY in gateway.env}"
+export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/engine_plugins${PYTHONPATH:+:$PYTHONPATH}"
+
 # --quantization fp8: weights are converted from the official BF16 checkpoint at
 # load (no calibration, dynamic activation scales).  gpu-memory-utilization
 # comes from model_manager (VLLM_GPU_MEM_UTIL): preferred 0.10, lowered to fit the
@@ -30,7 +34,7 @@ fi
 exec "$VLLM_BIN" serve Qwen/Qwen3-ASR-0.6B \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9100} \
-  --api-key local-qwen36 \
+  --middleware require_api_key.RequireApiKey \
   --served-model-name qwen3-asr-0.6b \
   --quantization fp8 \
   --gpu-memory-utilization ${VLLM_GPU_MEM_UTIL:-0.10} \

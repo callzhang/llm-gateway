@@ -581,6 +581,35 @@ def _read_vllm_cmdline(pid: int) -> list[str] | None:
         return None
 
 
+def _read_process_env(pid: int, name: str) -> str | None:
+    """One variable from a running process's initial environment."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            entries = f.read().split(b"\x00")
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+    prefix = name.encode() + b"="
+    return next(
+        (e[len(prefix):].decode("utf-8", errors="ignore") for e in entries if e.startswith(prefix)),
+        None,
+    )
+
+
+def _adopted_engine_has_gateway_key(pid: int) -> bool:
+    """Whether a running engine accepts the current ENGINE_API_KEY and only that.
+
+    The environment alone does not say how the engine was launched, so the command
+    line must also show the launch scripts' way of taking the key.
+    """
+    args = _read_vllm_cmdline(pid)
+    if not args or any(a == "--api-key" or a.startswith("--api-key=") for a in args):
+        return False
+    key_option = (
+        "--config" if "sglang.launch_server" in args else "require_api_key.RequireApiKey"
+    )
+    return key_option in args and _read_process_env(pid, "ENGINE_API_KEY") == ENGINE_API_KEY
+
+
 def _cmdline_option(args: list[str], option: str) -> str | None:
     try:
         index = args.index(option)
@@ -1024,7 +1053,6 @@ CORESIDENT_PORT_BASE = int(os.environ.get("GPU_CORESIDENT_PORT_BASE", "9100"))
 # POST /v1/audio/transcriptions is chunked here (<=30 s, silence trimmed, loops
 # dropped) and each chunk goes to the co-resident GPU lane, or — when no GPU has
 # room — to a CPU worker process (same model, transformers bf16, ~6x realtime).
-ASR_GPU_API_KEY = os.environ.get("ASR_GPU_API_KEY", "local-qwen36")   # run_qwen3_asr_0_6b.sh --api-key
 ASR_GPU_CHUNK_TIMEOUT = float(os.environ.get("ASR_GPU_CHUNK_TIMEOUT", "120"))
 ASR_CPU_PYTHON = os.environ.get("ASR_CPU_PYTHON", "/home/derek/miniforge3/bin/python")
 ASR_CPU_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asr_adapter", "cpu_worker.py")
@@ -1101,6 +1129,15 @@ MIN_USEFUL_MODEL_LEN = int(os.environ.get("MIN_USEFUL_MODEL_LEN", "16384"))
 # Safety haircut applied to vLLM's estimated-max-len before retrying, so we sit
 # comfortably under the limit (KV must hold ≥1 full sequence plus a little slack).
 MODEL_LEN_RETRY_FRACTION = float(os.environ.get("MODEL_LEN_RETRY_FRACTION", "0.92"))
+
+# What the engines accept from this process, and nothing else: generated at deployment, set in
+# gateway.env, handed to the engines through their environment (never their command line).
+ENGINE_API_KEY = os.environ.get("ENGINE_API_KEY", "")
+
+
+def _engine_auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {ENGINE_API_KEY}"}
+
 
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -2354,7 +2391,7 @@ class GpuBackend:
             form.add_field("file", wav, filename="chunk.wav", content_type="audio/wav")
             async with self._session.post(
                 f"{self.vllm_base}/v1/audio/transcriptions", data=form,
-                headers={"Authorization": f"Bearer {ASR_GPU_API_KEY}"},
+                headers=_engine_auth_headers(),
                 timeout=aiohttp.ClientTimeout(total=ASR_GPU_CHUNK_TIMEOUT),
             ) as resp:
                 if resp.status != 200:
@@ -2463,8 +2500,9 @@ class GpuBackend:
         target_url  = f"{self.vllm_base}{request.path_qs}"
         fwd_headers = {
             k: v for k, v in request.headers.items()
-            if k.lower() not in _HOP_BY_HOP | {"host", "content-length"}
+            if k.lower() not in _HOP_BY_HOP | {"host", "content-length", "authorization"}
         }
+        fwd_headers.update(_engine_auth_headers())
         # Normalise the body before it reaches vLLM.  Parsed once, re-serialised
         # only if something actually changed.
         if body:
@@ -4147,7 +4185,8 @@ class DynamicRouter:
             )
             return
         model_name, config = match
-        if not _adopted_vllm_matches_config(pid, model_name, config, slot.gpu_id):
+        if not (_adopted_engine_has_gateway_key(pid)
+                and _adopted_vllm_matches_config(pid, model_name, config, slot.gpu_id)):
             self.log.warning(
                 f"Slot {slot.slot_id}: refusing to adopt stale vLLM pid={pid} "
                 f"for {model_name}; stopping it so current runtime config applies"
@@ -4200,6 +4239,8 @@ class DynamicRouter:
 
 async def main() -> None:
     log = logging.getLogger("model_manager")
+    if not ENGINE_API_KEY:
+        raise SystemExit("ENGINE_API_KEY is not set (gateway.env); refusing to start.")
 
     slots  = [GpuSlot(sid, gid, port) for sid, gid, port in GPU_SLOTS]
     router = DynamicRouter(slots, MODEL_CONFIGS, ContextFitter.from_config())
