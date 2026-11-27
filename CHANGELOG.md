@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Fixed
+- A request the chat template cannot render (an audio or video part) answered 500; it now reaches the engine, which
+  answers 400.
+
+### Fixed
 - context_fit counts image tokens (one per 32x32 pixels of the size the engine resizes to; the largest when the size
   is unknown, as for an http URL). It counted only the placeholder, so a near-full conversation with a large image
   could exceed the context window.

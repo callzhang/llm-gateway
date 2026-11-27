@@ -12,6 +12,7 @@ import json
 import unittest
 from unittest import mock
 
+import jinja2
 import yaml
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -146,6 +147,27 @@ class ImagesCountTowardTheWindow(RouterHarness):
         sent = json.loads(self.forwarded[0])
         self.assertEqual([{"role": "user", "content": "x" * 100}], sent["messages"])
         self.assertEqual(3000, sent["max_tokens"])
+
+
+class UnrenderableRequests(RouterHarness):
+    def make_fitter(self) -> ContextFitter:
+        fitter = super().make_fitter()
+
+        def refuse(*_args, **_kwargs):
+            raise jinja2.exceptions.TemplateError("Unsupported multimodal content item.")
+
+        fitter._limits[MODEL].tokenizer._tokenizer.apply_chat_template = refuse
+        return fitter
+
+    async def test_a_request_the_template_refuses_goes_to_the_engine_as_it_is(self):
+        """It answered 500 here (an audio or video part); the engine says what is wrong with a 400."""
+        payload = {"model": MODEL, "max_tokens": 3000,
+                   "messages": [{"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": "data:,"}}]}]}
+        with self.assertLogs(level="WARNING") as logs:
+            response = await self.client.post("/v1/chat/completions", json=payload)
+        self.assertEqual(200, response.status)
+        self.assertEqual(payload, json.loads(self.forwarded[0]))
+        self.assertIn("Unsupported multimodal content item", "\n".join(logs.output))
 
 
 class ContextFitWithRealTokenizerTests(unittest.IsolatedAsyncioTestCase):
