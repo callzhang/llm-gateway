@@ -16,8 +16,10 @@ import math
 from PIL import Image
 
 _IMAGE_PART_TYPES = ("image_url", "input_image")
-# Video and audio parts, by type or by the key that carries them.
-_OTHER_MEDIA = ("video_url", "video", "input_video", "audio_url", "audio", "input_audio")
+# Video and audio content parts: their types, and the keys vLLM reads from a part
+# without a type (or with a uuid).
+_OTHER_MEDIA_TYPES = ("video_url", "video", "input_video", "audio_url", "audio", "input_audio")
+_OTHER_MEDIA_KEYS = ("video_url", "video", "audio_url", "audio", "input_audio")
 
 # One token covers a 32x32 pixel square (patch 16 x merge 2), and the processor never
 # goes below MIN_PIXELS.  PROCESSOR_MAX_PIXELS is the checkpoints' own longest_edge,
@@ -76,8 +78,11 @@ def _shrunk_data_url(url: str, max_pixels: int) -> "str | None":
 
 def _image_parts(node):
     if isinstance(node, dict):
-        # vLLM also takes a part without a type (or with a uuid) by its `image_url` key.
-        if node.get("type") in _IMAGE_PART_TYPES or "image_url" in node:
+        # Whatever its type, a part that names an image counts as one: engines also read
+        # parts by their keys (vLLM: no type, or a uuid, whose image_url may be null).
+        if node.get("type") in _IMAGE_PART_TYPES or node.get("image_url") is not None or (
+            node.get("uuid") is not None and "image_url" in node
+        ):
             yield node
             return
         node = list(node.values())
@@ -126,16 +131,33 @@ def _is_inline(url: str) -> bool:
     return url.startswith("data:") and url.partition(",")[0].endswith(";base64")
 
 
-def has_video_or_audio(body: dict) -> bool:
-    """Whether a message or Responses input carries a video or audio part."""
-    def walk(node) -> bool:
-        if isinstance(node, dict):
-            if node.get("type") in _OTHER_MEDIA or any(key in node for key in _OTHER_MEDIA):
-                return True
-            node = list(node.values())
-        return isinstance(node, list) and any(walk(child) for child in node)
+def _is_video_or_audio(part: object) -> bool:
+    """Like _image_parts: by type, or by a key that names media, whatever the type."""
+    if not isinstance(part, dict):
+        return False
+    return (
+        part.get("type") in _OTHER_MEDIA_TYPES
+        or any(part.get(key) is not None for key in _OTHER_MEDIA_KEYS)
+        or (part.get("uuid") is not None and any(key in part for key in _OTHER_MEDIA_KEYS))
+    )
 
-    return walk([body.get("messages"), body.get("input")])
+
+def has_video_or_audio(body: dict) -> bool:
+    """Whether a message's content (or tool output), or a Responses input, has a
+    video or audio part.  A message's own fields are not parts: SDKs replay
+    assistant messages with `"audio": null` or a reference to their audio."""
+    for field in ("messages", "input"):
+        items = body.get(field)
+        for item in items if isinstance(items, list) else ():
+            message = isinstance(item, dict) and "role" in item
+            if not message and _is_video_or_audio(item):
+                return True
+            if isinstance(item, dict):
+                for key in ("content", "output"):
+                    parts = item.get(key)
+                    if isinstance(parts, list) and any(map(_is_video_or_audio, parts)):
+                        return True
+    return False
 
 
 def unsafe_image_url(body: dict, inline_only: bool = False) -> bool:

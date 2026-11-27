@@ -159,6 +159,37 @@ class _Counter:
             return self._tokenizer.decode(ids)
 
 
+# The parts rewritten as plain text, and the field each carries its text in: a text
+# part, and a replayed refusal (vLLM renders its text; the template knows no such type).
+# Other types are left alone: the engines differ on them (SGLang keeps a `thinking`
+# part out of the prompt).
+_TEXT_PARTS = {"text": "text", "refusal": "refusal"}
+
+
+def _as_text_part(part: Any) -> Any:
+    if not isinstance(part, dict) or part.get("uuid") is not None:
+        return part
+    kind = part.get("type")
+    field = _TEXT_PARTS.get(kind) if isinstance(kind, str) else None
+    if field is None or not isinstance(part.get(field), str):
+        return part
+    return {"type": "text", "text": part[field]}
+
+
+def normalize_text_parts(body: dict) -> None:
+    """Rewrite, in place, each text and refusal part of a chat body as a plain text
+    part, so the engine and the count read the same thing.  The chat template picks
+    a part's kind by which keys exist (vLLM keeps a text part's extra keys, SGLang
+    drops them), so a `"video": null` beside the text lost the text.  A part with a
+    uuid, or without a string to read, is left for the engine; a Responses `input`
+    is not touched, its part types are the API's own."""
+    messages = body.get("messages")
+    for message in messages if isinstance(messages, list) else ():
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            message["content"] = [_as_text_part(part) for part in content]
+
+
 def _template_messages(messages: list[dict]) -> list[dict]:
     """Messages as vLLM hands them to the chat template: tool-call arguments
     arrive as JSON strings on the wire but the template iterates them as dicts."""

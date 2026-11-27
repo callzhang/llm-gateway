@@ -49,6 +49,20 @@ class ImageTokenTests(unittest.TestCase):
             self.assertEqual(ENGINE_PIXELS // 1024, image_fit.image_tokens(value, ENGINE_PIXELS), value)
 
 
+class ImageDetectionTests(unittest.TestCase):
+    def test_any_part_that_names_an_image_is_one_whatever_its_type(self):
+        """Not left to how an engine reads a part whose declared type does not fit; only an empty field is ignored."""
+        def has(part):
+            return image_fit.has_images({"messages": [{"role": "user", "content": [part]}]})
+
+        for part in ({"image_url": {"url": "data:,"}}, {"type": "text", "text": "x", "image_url": "file:///x"},
+                     {"type": "audio_url", "image_url": {"url": "data:,"}}, {"type": "text", "uuid": "u", "image_url": None}):
+            self.assertTrue(has(part), part)
+        self.assertFalse(has({"type": "text", "text": "x", "image_url": None}))
+        self.assertTrue(image_fit.unsafe_image_url({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "x", "image_url": "file:///x"}]}]}))
+
+
 class FitImagesTests(unittest.TestCase):
     def test_large_image_is_shrunk_keeping_shape_and_format(self):
         for fmt in ("PNG", "JPEG"):
