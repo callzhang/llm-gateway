@@ -72,6 +72,19 @@ def has_images(body: dict) -> bool:
     return any(_image_parts([body.get("messages"), body.get("input")]))
 
 
+def unsafe_image_url(body: dict) -> bool:
+    """True if an image names anything but data: or http(s):.  SGLang opens a
+    "/..." or file:// URL from the server's own disk."""
+    for part in _image_parts([body.get("messages"), body.get("input")]):
+        image = part.get("image_url")
+        url = image.get("url") if isinstance(image, dict) else image
+        if url is not None and not (
+            isinstance(url, str) and url.lower().startswith(("data:", "http://", "https://"))
+        ):
+            return True
+    return False
+
+
 def fit_images(body: dict, max_pixels: int) -> int:
     """Shrink, in place, every inline image over max_pixels in a Chat Completions
     (`messages`) or Responses (`input`) body.  Returns how many were replaced."""

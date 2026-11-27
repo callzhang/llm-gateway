@@ -259,3 +259,14 @@ Rollback of overflow on GPU4: remove `OVERFLOW_QUEUE_DEPTH` and `PEER_GATEWAY_AP
 `gateway.env` and the order-2 entry from `config.yaml`, then restart `llm-litellm` and
 `llm-model-manager`. The CN stack can stay up or be stopped with
 `systemctl --user stop llm-gateway.target` on the A100.
+
+## Network and file access on the shared host (2026-11-27)
+
+* `llm-model-manager.service` only takes connections from the host itself and the tailnet
+  (`IPAddressDeny=any` plus an allow list: loopback, `100.64.0.0/10`, `fd7a:115c:a1e0::/48`, the host's LAN
+  address `172.20.10.41/32`), set with `systemctl set-property`; drop-ins are in
+  `/etc/systemd/system.control/`. It covers the engines' internal ports, one of which SGLang opens on all
+  interfaces even with `SGLANG_HOST_IP`. If the LAN address changes, update the list.
+* `/data/derek` is no longer world-writable (read and execute kept). The previous ACLs are saved in
+  `llm-gateway/backups/20261127-acl.facl`.
+

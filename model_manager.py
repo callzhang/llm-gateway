@@ -52,7 +52,7 @@ from asr_adapter import service as asr_service
 from asr_adapter.cpu_pool import CpuAsrWorker, CpuWorkerError
 from asr_adapter.engine import EngineError, pcm16_wav
 from context_fit import ContextFitter
-from image_fit import ImageTooLarge, fit_images, has_images
+from image_fit import ImageTooLarge, fit_images, has_images, unsafe_image_url
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 # 300→1200 (2026-09-04): real traffic for both chat models arrives in bursts
@@ -3790,6 +3790,10 @@ class DynamicRouter:
         # work its peer handed over, so the peer's caller can retry there.  A
         # handed-over image is refused even with vision here: the peer's region
         # does not take images.
+        # Whatever the vision setting: an image may only be inline or on the web.
+        if config.request_kind == "chat" and isinstance(parsed_body, dict) and unsafe_image_url(parsed_body):
+            return self._invalid_request("image URLs must be data: or http(s):")
+
         vision_gpus: "frozenset[int] | None" = None
         if (
             config.vision_gpu_ids is not None

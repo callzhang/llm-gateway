@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Security
+- An image URL must be `data:` or `http(s):`; a path or `file://` URL is a 400.
+- A100: SGLang's internal sockets bind loopback, the gateway unit takes only host and tailnet connections, and
+  `/data/derek` is no longer world-writable (`docs/region-cn.md`).
+
 ### Added
 - `qwen3.8-27b`: model_manager shrinks inline (data: URL) images over 4,194,304 pixels on the CPU before forwarding
   (`image_fit.py`). The engine caps images there anyway but resized them on the GPU, where very large sources (up to

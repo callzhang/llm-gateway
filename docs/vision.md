@@ -27,6 +27,8 @@ LiteLLM 1.99 moves on to the `order: 2` deployment after a 400 as well as after 
 
 The A100 runs SGLang, whose `--language-only` loaded the same weights and KV as with vision (2026-11-26), so its engines are unchanged and images are only refused by model_manager. Refusing them keeps both image paths that ran SGLang out of memory (the processor and the vision encoder) from running.
 
+An image URL must be `data:` or `http(s):`, whatever the vision setting (SGLang would open a path or `file://` URL from the server's disk); anything else is a 400.
+
 Inline images over 4,194,304 pixels are also shrunk on the CPU before forwarding (`image_fit.py`).
 
 ## Deploying

@@ -17,6 +17,8 @@ export SGLANG_PLUGINS=friday_tool_json
 # thinking_token_budget (SGLang ignores that vLLM option); loaded by reference, so it must be importable here.
 export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/sglang_plugins${PYTHONPATH:+:$PYTHONPATH}"
 export SGLANG_IMAGE_MAX_PIXELS=4194304 SGLANG_IMAGE_MIN_PIXELS=65536
+# Unset, SGLang binds its internal ZMQ sockets to the LAN address, unauthenticated.
+export SGLANG_HOST_IP=127.0.0.1
 # --constrained-json-disable-any-whitespace: xgrammar otherwise allows unlimited whitespace between JSON tokens.
 # When the model quoted a phrase with a bare `"` inside a string value, the string ended early and the grammar
 # left it nothing but whitespace, so it padded to the output ceiling (CN memory's judges: 16,000 tokens, ~575 s

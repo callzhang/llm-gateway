@@ -74,6 +74,16 @@ class ImageRoutingTests(RouterHarness):
             {"role": "user", "content": [{"type": "input_image", "image_url": "https://example.com/a.png"}]}]})
         self.assertEqual(400, response.status)
 
+    async def test_an_image_may_only_be_inline_or_on_the_web(self):
+        await self._setup(None)
+        for url in ("/etc/passwd", "file:///etc/passwd", "ftp://host/a.png", "a.png", 7):
+            for image in ({"url": url}, url):
+                payload = body({"type": "image_url", "image_url": image})
+                self.assertEqual(400, (await self._post(payload)).status, image)
+        self.assertEqual([], self.forwarded)
+        for url in ("data:image/png;base64,AA==", "HTTPS://example.com/a.png"):
+            self.assertEqual(200, (await self._post(body({"type": "image_url", "image_url": {"url": url}}))).status)
+
     async def test_unrestricted_models_are_unchanged(self):
         await self._setup(None)
         self.assertEqual(200, (await self._post(body(IMAGE), **{mm.OVERFLOW_HEADER: "1"})).status)
