@@ -34,5 +34,23 @@ class ListenerTests(unittest.TestCase):
         self.assertFalse(mm._listener_is_ours(free, self.child.pid))
 
 
+class SpawnTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_foreign_listener_fails_the_start_with_that_reason(self):
+        backend = mm.GpuBackend("qwen3.8-27b", "run.sh", "qwen3.8-27b", mm.GpuSlot(0, 0, 9000))
+        process = mock.Mock(pid=4242, poll=mock.Mock(return_value=None))
+        healthy = mock.MagicMock()
+        healthy.__aenter__ = mock.AsyncMock(return_value=mock.Mock(status=200))
+        healthy.__aexit__ = mock.AsyncMock(return_value=False)
+        backend._session = mock.Mock(get=mock.Mock(return_value=healthy))
+        with mock.patch("builtins.open", mock.mock_open()), mock.patch.object(mm.subprocess, "Popen", return_value=process), \
+                mock.patch.object(mm, "_listener_is_ours", return_value=False), \
+                mock.patch.object(backend, "_kill_process_locked", mock.AsyncMock()) as kill, \
+                mock.patch.object(mm, "HEALTH_POLL", 0), mock.patch.object(mm.os, "killpg") as killpg, \
+                self.assertRaisesRegex(RuntimeError, "not the engine just started"):
+            await backend._spawn_attempt_locked(None)
+        kill.assert_awaited_once()
+        killpg.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -53,7 +53,7 @@ from asr_adapter import service as asr_service
 from asr_adapter.cpu_pool import CpuAsrWorker, CpuWorkerError
 from asr_adapter.engine import EngineError, pcm16_wav
 from context_fit import ContextFitter
-from image_fit import ImageTooLarge, fit_images, has_images, unsafe_image_url
+from image_fit import ImageTooLarge, fit_images, has_images, has_video_or_audio, unsafe_image_url
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 # 300→1200 (2026-09-04): real traffic for both chat models arrives in bursts
@@ -621,6 +621,10 @@ def _read_process_env(pid: int, name: str) -> str | None:
 _LOOPBACK_LISTEN = frozenset({
     "0100007F", "00000000", "0" * 32, "0000000000000000FFFF00000100007F",
 })
+
+
+class ForeignListener(RuntimeError):
+    """A slot port is answered by something other than the engine just started."""
 
 
 def _listening_inodes(port: int) -> set[str]:
@@ -2313,7 +2317,7 @@ class GpuBackend:
                     if r.status == 200:
                         if not _listener_is_ours(self.vllm_port, spawn_pid):
                             await self._kill_process_locked()
-                            raise RuntimeError(
+                            raise ForeignListener(
                                 f"port {self.vllm_port} is answered by a process that is not the "
                                 f"engine just started on slot {self.slot.slot_id}")
                         elapsed = int(time.monotonic() - started)
@@ -2332,6 +2336,8 @@ class GpuBackend:
                             f"health poll: HTTP {r.status} after "
                             f"{int(time.monotonic()-started)}s"
                         )
+            except ForeignListener:
+                raise
             except Exception as exc:
                 self.log.warning(
                     f"health poll: {type(exc).__name__}: {exc} after "
@@ -3919,6 +3925,10 @@ class DynamicRouter:
         # Whatever the vision setting: an image may only be inline or on the web.
         if config.request_kind == "chat" and isinstance(parsed_body, dict) and unsafe_image_url(parsed_body):
             return self._invalid_request("image URLs must be data: or http(s):")
+
+        # A region that takes images inline only takes no other media at all.
+        if config.inline_images_only and isinstance(parsed_body, dict) and has_video_or_audio(parsed_body):
+            return self._invalid_request("video and audio are not accepted on this endpoint")
 
         vision_gpus: "frozenset[int] | None" = None
         if (
