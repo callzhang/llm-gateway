@@ -452,6 +452,19 @@ def test_real_template_counts_a_text_part_as_text_whatever_empty_keys_it_carries
             assert limits.tokenizer.count([{"role": "user", "content": [part]}], None) == plain, (model, extra)
 
 
+def test_real_template_counts_the_parts_the_engine_reads_as_text(real):
+    """A client replaying a refusal got a 400: the template refuses the part, while vLLM renders its text."""
+    text = "I cannot help with that request. " * 50
+    for model, limits in real._limits.items():
+        def count(part):
+            return limits.tokenizer.count([{"role": "user", "content": "q"}, {"role": "assistant", "content": [part]},
+                                           {"role": "user", "content": "again"}], None)
+
+        plain = count({"type": "text", "text": text})
+        for kind, field in (("refusal", "refusal"), ("input_text", "text"), ("output_text", "text"), ("thinking", "thinking")):
+            assert count({"type": kind, field: text}) == plain, (model, kind)
+
+
 def test_real_template_bills_old_thinking_in_full_and_stripping_it_recovers_the_room(real):
     limits = real._limits["qwen3.8-27b"]
     think = "let me think about this carefully step by step " * 1200

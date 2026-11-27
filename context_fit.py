@@ -159,14 +159,22 @@ class _Counter:
             return self._tokenizer.decode(ids)
 
 
+# Content parts the engines turn into text, and the field each carries it in.
+_TEXT_PARTS = {"text": "text", "input_text": "text", "output_text": "text", "refusal": "refusal", "thinking": "thinking"}
+
+
 def _template_part(part: Any) -> Any:
-    """A text part as the engines read it.  The template picks a part's kind by
-    which keys exist, so a `"video": null` beside the text would count a video
-    placeholder instead of the text."""
-    if (isinstance(part, dict) and part.get("type") == "text" and part.get("uuid") is None
-            and isinstance(part.get("text"), str)):
-        return {"type": "text", "text": part.get("text")}
-    return part
+    """A text-like part as the engines read it.  The template knows only "text",
+    and picks a part's kind by which keys exist: a replayed refusal would make it
+    raise, and a `"video": null` beside the text would count a video placeholder
+    instead of the text."""
+    if not isinstance(part, dict) or part.get("uuid") is not None:
+        return part
+    kind = part.get("type")
+    field = _TEXT_PARTS.get(kind) if isinstance(kind, str) else None
+    if field is None or not isinstance(part.get(field), str):
+        return part
+    return {"type": "text", "text": part[field]}
 
 
 def _template_messages(messages: list[dict]) -> list[dict]:
