@@ -43,13 +43,13 @@ The first row holding another key's data is from 2026-11-23.
 | Database / spend-log table | 28 GB / 28 GB |
 | `proxy_server_request`, stored (compressed) | 24 GB, of which 17 GB in these rows |
 | `proxy_server_request` JSON text | 28 GB, of which 19 GB in these rows (largest row 34 MB) |
-| Rows holding another virtual key's hash in a top-level breadcrumb (lower bound) | 175: `friday-memory-cn` 88, `memory-ci-controller` 87 |
-| ... first and last | 2026-11-24 04:48 to 08:48 UTC |
+| ... holding another virtual key's hash (a lower bound for cross-key content) | 361: `friday-memory-cn` 245, `memory-ci-controller` 116 |
+| ... of those, also holding an inline image | 99 |
+| ... cross-key rows, first and last | 2026-11-24 04:48 to 08:48 UTC |
+| Raw `sk-` / Bearer keys found in the rows with `previous_models` | 0 |
 | Free space on `/data` | 2.2 TB |
 
-The CN cross-key count reads only each breadcrumb's own metadata (the full-text scan used for
-GPU4 did not finish), so the two regions' counts are not comparable. Inline images and raw keys
-were not counted on CN.
+Both regions' cross-key rows were counted the same way (any key hash in the row other than its own).
 
 ### Both
 
@@ -58,26 +58,59 @@ The `metadata` and `messages` columns contain none. `previous_response_id` histo
 the row's own `input` / `messages`, so other callers' content was not fed back to a model by that path.
 Anyone who can read a key's spend logs (admin UI, `/spend/logs`, database dumps) could see it.
 
+## Verification
+
+2026-11-26, on LiteLLM 1.99.0: a real proxy with `config.yaml`'s router, callback and general
+settings, a throwaway Postgres, fake order 1 (always 503) and order 2 upstreams, two virtual keys,
+chat and Responses requests with inline images.
+
+| Rows holding the other key's text and image | without the hook | with it |
+|---|---|---|
+| Answered by order 2 (14 rows) | 11 | 0 |
+| Every deployment failed (12 rows) | 10 | 0 |
+
+`previous_response_id` carried the earlier turn upstream with the hook (string `input`).
+
+The cleanup SQL ran on 2,814 contaminated rows in three batches: none left, every row equal to its
+original minus `previous_models`, rows newer than `fixed_at` untouched, and a cleaned response id
+still continued with its history.
+
+## Other copies
+
+Searched 2026-11-26 on both hosts: files newer than 2026-11-19 under `/home`, `/data`, `/srv`,
+`/opt`, `/var/backups`, `/mnt`, `/backup` with dump-like names. None readable by `derek` was a copy
+of the spend logs. Both databases have WAL archiving off and no replica or replication slot. The
+GPU4 proxy logs, the CN `logs/litellm*.log` and the CN Postgres container log never mention
+`previous_models`.
+
+Not checked: other users' directories, GPU4's Postgres server log (`adm` group only), files with
+other names, and copies off these two hosts.
+
 ## Cleanup (not run)
 
 Doing nothing also works: the 7-day retention removes the last affected row 7 days after the fixed
 proxy starts. Clean up now if the cross-key content must not stay that long.
 
 Order: restart with the fix first, otherwise new rows keep arriving. This removes only the
-breadcrumbs and keeps each request's own body, so `previous_response_id` keeps working. A read-only
-dry run of the `#-` expression on GPU4 (not on CN) left no `previous_models` in any of the 8,312 rows.
+breadcrumbs and keeps each request's own body, so `previous_response_id` keeps working. Tested on a
+throwaway database (see Verification), not on either live one. A read-only dry run of the `#-`
+expression on GPU4 left no `previous_models` in any of the 8,312 rows.
 
 ```sql
 -- psql -v fixed_at='<UTC time the fixed proxy started>'; newer rows hold the fix's short records.
-UPDATE "LiteLLM_SpendLogs"
-SET proxy_server_request = proxy_server_request
+-- One scan collects the rows; each batch then goes by primary key.
+CREATE TEMP TABLE leak_ids AS
+SELECT request_id FROM "LiteLLM_SpendLogs"
+WHERE "startTime" < :'fixed_at'
+  AND (proxy_server_request #> '{metadata,previous_models}' IS NOT NULL
+       OR proxy_server_request #> '{litellm_metadata,previous_models}' IS NOT NULL);
+WITH batch AS (
+  DELETE FROM leak_ids WHERE request_id IN (SELECT request_id FROM leak_ids LIMIT 1000)
+  RETURNING request_id)
+UPDATE "LiteLLM_SpendLogs" s
+SET proxy_server_request = s.proxy_server_request
       #- '{metadata,previous_models}' #- '{litellm_metadata,previous_models}'
-WHERE request_id IN (
-  SELECT request_id FROM "LiteLLM_SpendLogs"
-  WHERE "startTime" < :'fixed_at'
-    AND (proxy_server_request #> '{metadata,previous_models}' IS NOT NULL
-         OR proxy_server_request #> '{litellm_metadata,previous_models}' IS NOT NULL)
-  LIMIT 1000);
+FROM batch WHERE s.request_id = batch.request_id;
 \watch 2
 -- Stop (Ctrl-C) once it reports UPDATE 0.
 ```
@@ -85,7 +118,6 @@ WHERE request_id IN (
 Then `VACUUM (ANALYZE) "LiteLLM_SpendLogs";`. That frees the space for reuse but does not shrink the
 files. The update rewrites each affected row, so the table may grow while it runs. `VACUUM FULL`
 returns the space but locks out log writes and history lookups while it runs: not worth it on GPU4
-(about 280 MB at most), optional on CN in a quiet window (not urgent with 2.2 TB free). Check any
-database dump taken since 2026-11-19 and delete or scrub it too.
+(about 280 MB at most), optional on CN in a quiet window (not urgent with 2.2 TB free).
 
 Run it on each region's own database.
