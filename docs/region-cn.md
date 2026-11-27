@@ -14,7 +14,7 @@ only when its own queue is long.
 | model_manager | `127.0.0.1` + tailnet `:8002` | Tailscale IP only `100.118.88.28:8002` |
 | Database | Postgres `127.0.0.1:5433` | its own Postgres, Docker container `llm-litellm-pg` on `127.0.0.1:15433`; keys copied from GPU4 |
 | Public entrance | `llm-api.preseen.ai` (tunnel `preseen-gateway`) | `https://llm-cn.preseen.ai:18900` direct (Caddy TLS, virtual-key auth, open to all sources); `llm-api-geo.preseen.ai` (tunnel, slower, see below) |
-| Units | `systemd/*.service` (user), `systemd/system/llm-pg-peer.*` (root) | `systemd/region-cn/*` (user, linger on) |
+| Units | `systemd/*.service` (system, `User=derek`), `systemd/system/llm-pg-peer.*` (root) | `systemd/region-cn/*` (user, linger on) |
 
 ## Request path
 

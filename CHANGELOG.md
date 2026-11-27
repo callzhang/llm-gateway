@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+- gpu4: model_manager, LiteLLM, Open WebUI and the JIT warm-up are system units running as `derek` (were user units),
+  so systemd-oomd's swap kills pass them over. Manage them with `sudo systemctl`.
+- gpu4: the TTS access gateway is retired (no requests; `ai-services` calls LiteLLM for speech). Code kept.
+
 ### Fixed
 - context_fit counts image tokens (one per 32x32 pixels of the size the engine resizes to; the largest when the size
   is unknown, as for an http URL). It counted only the placeholder, so a near-full conversation with a large image

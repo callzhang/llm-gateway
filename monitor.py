@@ -179,7 +179,7 @@ def gpu_stats() -> dict[int, dict]:
 
 
 def systemd_service_state() -> dict:
-    out = sh(["systemctl", "--user", "show", "llm-model-manager",
+    out = sh(["systemctl", "show", "llm-model-manager",
               "--property=ActiveState,MainPID,ExecMainStartTimestamp"])
     active_m = re.search(r"ActiveState=(\S+)", out)
     pid_m    = re.search(r"MainPID=(\d+)", out)
@@ -258,7 +258,7 @@ def report() -> str:
         out.append(f"  model-manager   {fail(svc['active'])}")
         anomalies.append(
             f"model-manager service is {svc['active']!r}  "
-            "→  systemctl --user restart llm-model-manager")
+            "→  sudo systemctl restart llm-model-manager")
 
     # ── 2. GPU VRAM overview ─────────────────────────────────────────────────
     out.append(f"\n{bold('GPU VRAM')}")

@@ -296,17 +296,22 @@ The stack is grouped under `systemd/llm-gateway.target`. Each service declares
 all members, while each keeps its own `Restart=` supervision and log file.
 
 ```bash
-systemctl --user start    llm-gateway.target   # bring up the whole stack
-systemctl --user stop     llm-gateway.target   # tear it all down
-systemctl --user restart  llm-gateway.target
-systemctl --user status   llm-gateway.target
+sudo systemctl start    llm-gateway.target   # bring up the whole stack
+sudo systemctl stop     llm-gateway.target   # tear it all down
+sudo systemctl restart  llm-gateway.target
+systemctl status        llm-gateway.target
 # components remain independently controllable, e.g.:
-systemctl --user restart  llm-litellm
+sudo systemctl restart  llm-litellm
 ```
 
+These are system units running as `derek`: systemd-oomd spares only root-owned cgroups from swap
+kills, and it repeatedly killed model_manager when it was a user unit (2026-11). While
+`llm-jit-warmup` is failed, `sudo systemctl restart --job-mode=ignore-dependencies llm-model-manager`
+skips the warm-up.
+
 Members: `llm-model-manager` · `llm-litellm` · `llm-open-webui`. Install/enable
-everything with `systemd/install.sh` (linger is enabled so the stack survives
-logout and starts at boot).
+everything with `systemd/install.sh`. The TTS access gateway was retired on 2026-11-27
+(`ai-services` calls LiteLLM for speech); its code is kept.
 
 ### Loopback-only binding
 
@@ -483,10 +488,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now llm-litellm-mem-watc
 # model_manager alone (listens on :8002)
 python3 model_manager.py
 
-# with systemd (user service)
-cp systemd/llm-model-manager.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now llm-model-manager
+# with systemd (system services running as derek)
+systemd/install.sh && sudo systemctl start llm-gateway.target
 
 # LiteLLM proxy (reads config.yaml, listens on :8900)
 litellm --config config.yaml --port 8900
@@ -577,8 +580,7 @@ Operational checks:
 ```bash
 curl -sS http://127.0.0.1:8002/admin/status
 nvidia-smi
-journalctl --user -u llm-model-manager -u llm-litellm -u llm-open-webui -n 100
-systemctl --user status llm-tts-access-gateway
+journalctl -u llm-model-manager -u llm-litellm -u llm-open-webui -n 100
 ```
 
 The status payload includes each chat model's configured vLLM sequence ceiling at
@@ -593,7 +595,7 @@ commit:
 
 ```bash
 git switch --detach e922645
-systemctl --user restart llm-model-manager llm-litellm llm-open-webui
+sudo systemctl restart llm-model-manager llm-litellm llm-open-webui
 ```
 
 Return to the deployed branch with `git switch master` and restart the same

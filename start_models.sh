@@ -72,10 +72,10 @@ for m in "${MODELS[@]}"; do
   fi
 done
 
-if systemctl --user is-active --quiet llm-model-manager.service; then
+if systemctl is-active --quiet llm-model-manager.service; then
   echo "[models] ERROR: llm-model-manager is running — it owns the GPUs and would"
   echo "         fight this script for them."
-  echo "         systemctl --user stop llm-model-manager.service, then re-run."
+  echo "         sudo systemctl stop llm-model-manager.service, then re-run."
   exit 1
 fi
 
