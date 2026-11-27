@@ -454,13 +454,16 @@ def _guaranteed_uuid(gpu_id: int) -> "str | None":
     return uuid if uuid in GUARANTEED_GPU_UUIDS else None
 
 
+def _clear_cooling(uuid: str) -> bool:
+    """True while a card that recently resisted clearing is left aside."""
+    failed_at = _gpu_clear_failed_at.get(uuid)
+    return failed_at is not None and time.monotonic() - failed_at < GPU_CLEAR_RETRY_SECONDS
+
+
 def _gpu_guaranteed(gpu_id: int) -> bool:
     """True for a guaranteed card that has not recently resisted clearing."""
     uuid = _guaranteed_uuid(gpu_id)
-    if uuid is None:
-        return False
-    failed_at = _gpu_clear_failed_at.get(uuid)
-    return failed_at is None or time.monotonic() - failed_at >= GPU_CLEAR_RETRY_SECONDS
+    return uuid is not None and not _clear_cooling(uuid)
 
 
 def _gpu_compute_pids(gpu: str) -> list[int]:
@@ -3123,11 +3126,16 @@ class DynamicRouter:
         )
 
     @staticmethod
-    def _slot_rank(slot: GpuSlot) -> "tuple[bool, float]":
+    def _slot_rank(slot: GpuSlot) -> "tuple[int, float]":
+        """Higher first: healthy guaranteed cards, then other cards, then a card
+        that is cooling down after resisting clearing, then an unreadable one."""
         free = _gpu_free_mib(slot.gpu_id)
         if free is None:
-            return (False, -1.0)   # unreadable, guaranteed or not
-        return (_gpu_guaranteed(slot.gpu_id), free)
+            return (-1, -1.0)
+        uuid = _guaranteed_uuid(slot.gpu_id)
+        if uuid is None:
+            return (1, free)
+        return (0 if _clear_cooling(uuid) else 2, free)
 
     def _allowed_gpus(self, model_name: str) -> "set[int] | None":
         """GPU IDs this model may occupy, or None if unconstrained.
