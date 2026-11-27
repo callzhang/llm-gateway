@@ -16,6 +16,14 @@
 - Engines start with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so a GPU id means the nvidia-smi index. On the A100 this needs
   the pins renumbered in the same deployment (`docs/gpu-guaranteed.md`).
 
+### Security
+- Chat models accept only `POST /v1/chat/completions`, `/v1/completions` and `/v1/responses`, and a client body may
+  not set `custom_logit_processor`, `mm_processor_kwargs` or `chat_template`.
+- The engines accept only `ENGINE_API_KEY` (new, required in `gateway.env`; model_manager and the launch scripts
+  refuse to start without it), on every route but `/health` and `/metrics`. model_manager replaces the caller's
+  `Authorization` with it. It replaces the fixed key in the launch scripts and `ASR_GPU_API_KEY`. A restart stops
+  engines started with anything else instead of adopting them.
+
 ### Fixed
 - `retry_breadcrumb_hook`: spend logs no longer hold other callers' requests. LiteLLM 1.99 kept retry breadcrumbs,
   messages and images included, on one list per Router, and the overflow fallback wrote them even with

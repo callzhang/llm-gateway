@@ -603,6 +603,14 @@ memory.
 
 ## Environment variables
 
+### Engine key (required)
+
+`ENGINE_API_KEY` in `gateway.env`, generated per host (`openssl rand -hex 32`). The engines take it from their
+environment and accept nothing else outside `/health` and `/metrics`: vLLM through
+`engine_plugins/require_api_key.py`, SGLang through `engine-api-key.yaml`, which its launch script writes (mode 600).
+Only model_manager holds it; callers' `Authorization` headers never reach an engine. After changing it, restart
+model_manager, which stops the running engines.
+
 ### GPU slot configuration
 
 | Variable | Default | Description |
