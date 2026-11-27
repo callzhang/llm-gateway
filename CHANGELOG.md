@@ -8,6 +8,13 @@
 - gpu4: the TTS access gateway is retired (no requests; `ai-services` calls LiteLLM for speech). Code kept.
 
 ### Fixed
+- Chat text and refusal parts are forwarded as plain text parts: an empty
+  media key beside the text could turn it into a media placeholder, and a replayed refusal was a template error.
+- A request the chat template cannot render (an audio or video part, say) answered 500; it is now a 400, and no
+  engine gets it.
+- The inline-only host refused a message that merely carried `"audio": null` or an audio reference.
+
+### Fixed
 - context_fit counts image tokens (one per 32x32 pixels of the size the engine resizes to; the largest when the size
   is unknown, as for an http URL). It counted only the placeholder, so a near-full conversation with a large image
   could exceed the context window.

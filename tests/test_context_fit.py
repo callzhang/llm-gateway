@@ -441,6 +441,25 @@ def test_real_tokenizer_trims_a_long_conversation_to_fit(real):
     assert data["max_tokens"] == 32768   # trimmed enough that the cap was not needed
 
 
+def test_real_template_counts_a_normalized_part_as_plain_text(real):
+    """The template picks a part's kind by which keys exist (`"video": null` made a text part a video
+    placeholder) and knows no "refusal"; model_manager rewrites such parts before counting."""
+    text = "the quarterly report is attached below. " * 300
+    variants = [{"type": "text", "text": text, **extra} for extra in
+                ({"video": None}, {"image": None}, {"image_url": None}, {"video": "data:,"}, {"image_url": "data:,"})]
+    variants.append({"type": "refusal", "refusal": text})
+    for model, limits in real._limits.items():
+        def count(part):
+            body = {"messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": [part]},
+                                 {"role": "user", "content": "again"}]}
+            context_fit.normalize_text_parts(body)
+            return limits.tokenizer.count(body["messages"], None)
+
+        plain = count({"type": "text", "text": text})
+        for part in variants:
+            assert count(dict(part)) == plain, (model, sorted(part))
+
+
 def test_real_template_bills_old_thinking_in_full_and_stripping_it_recovers_the_room(real):
     limits = real._limits["qwen3.8-27b"]
     think = "let me think about this carefully step by step " * 1200
