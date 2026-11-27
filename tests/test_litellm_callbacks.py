@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 
+import yaml
+
 
 def test_callbacks_load_by_file_path_like_the_proxy_does():
     """LiteLLM execs each callback file from its path without registering the
@@ -25,3 +27,12 @@ def test_callbacks_load_by_file_path_like_the_proxy_does():
     )
     assert result.returncode == 0, result.stderr[-1500:]
     assert result.stdout.strip().endswith("ok")
+
+
+def test_an_exhausted_budget_stays_429_in_both_regions():
+    """LiteLLM 1.104 changed the default to 422, which callers do not treat as retryable."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in ("config.yaml", "config.cn.yaml"):
+        with open(os.path.join(repo, name)) as f:
+            settings = yaml.safe_load(f)["litellm_settings"]
+        assert settings.get("budget_exceeded_status_code") == 429, name

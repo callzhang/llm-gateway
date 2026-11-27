@@ -12,6 +12,7 @@ Upstream: BerriAI/litellm issue 24965, fixed by PR 39491 (1.101.0, backported to
 1.100.0 is worse (breadcrumbs grow without bound, OOM); do not upgrade to it.
 
 Fix here: `retry_breadcrumb_hook.py`. It takes effect at the next LiteLLM restart in each region.
+The upgrade to 1.108.19 removes it, because upstream is fixed there (`litellm-upgrade-1.108.md`).
 
 ## Stored rows
 

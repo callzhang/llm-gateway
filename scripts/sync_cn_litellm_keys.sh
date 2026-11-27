@@ -52,7 +52,7 @@ begin
     select string_agg(format('%I = excluded.%I', column_name, column_name), ', ') into assignments
     from information_schema.columns
     where table_schema = 'public' and table_name = tbl_name
-      and column_name <> all (array[pk, 'spend', 'model_spend', 'last_active']);
+      and column_name <> all (array[pk, 'spend', 'model_spend', 'last_active', 'total_spend']);
     execute format(
       'insert into %I select r.* from incoming i, jsonb_populate_record(null::%I, i.doc) r where i.tbl = %L '
       'on conflict (%I) do update set %s',

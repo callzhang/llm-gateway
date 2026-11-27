@@ -6,13 +6,15 @@ Registered in config.yaml:
         - request_priority_hook.request_priority_hook
 
 model_manager admits queued chat requests by the body field `priority` (0..255, smaller first;
-missing = 100; docs/request-priority-gate.md). Clients set it with a nested
-`extra_body: {extra_body: {priority: N}}` in the OpenAI SDK, so any key could claim 0. This hook
-makes priority 0 a grant held by a key:
+missing = 100; docs/request-priority-gate.md). Clients set it in the request body (`extra_body` in
+the OpenAI SDK; LiteLLM 1.108 also forwards a top-level `priority`), so any key could claim 0. This
+hook makes priority 0 a grant held by a key:
 
   - A key whose metadata has `gateway_priority: P` (an integer 0..255) runs at P when the request
     sends no priority. It may send a larger number (run lower), never a smaller one.
   - Any other key may send 1..255 as before; a 0 it sends becomes PEER_PRIORITY_FLOOR (1).
+  - What a client sends is checked on every route and in both places; the grant is only filled in
+    for chat completions and the Responses API.
   - A malformed priority is left alone, so model_manager still answers 400 for it.
 
 Grant a key with LiteLLM's /key/update: `{"key": ..., "metadata": {..., "gateway_priority": 0}}`.
@@ -31,7 +33,7 @@ logger = logging.getLogger("litellm.request_priority_hook")
 MAX_PRIORITY = 255
 # The best priority a key without a grant can get; must equal model_manager.PEER_PRIORITY_FLOOR.
 UNGRANTED_PRIORITY_FLOOR = 1
-# LiteLLM's call types for chat completions and the Responses API; model_manager gates only chat.
+# LiteLLM's call types for chat completions and the Responses API: where a grant is filled in.
 CHAT_CALL_TYPES = frozenset({"acompletion", "aresponses"})
 
 
@@ -60,23 +62,28 @@ class RequestPriorityHook(CustomLogger):
         data: dict,
         call_type: str,
     ) -> dict | None:
-        if call_type not in CHAT_CALL_TYPES:
-            return None
+        grant = self._grant(user_api_key_dict)
         extra_body = data.get("extra_body")
         if not isinstance(extra_body, dict):
             extra_body = {}
-        grant = self._grant(user_api_key_dict)
+        # LiteLLM 1.108 sends a top-level 0 upstream unchecked and hands any other top-level value
+        # to its own scheduler.  extra_body is what reaches model_manager, and it wins there.
+        moved = "priority" in data
+        if moved:
+            extra_body = data["extra_body"] = {"priority": data.pop("priority"), **extra_body}
+        # What a client sends is checked on every route: /v1/messages and /v1/completions also
+        # end up at model_manager's gate.
         if "priority" in extra_body:
             sent = extra_body["priority"]
             if not _valid(sent):
-                return None
+                return data if moved else None
             priority = max(sent, UNGRANTED_PRIORITY_FLOOR if grant is None else grant)
-        elif grant is not None:
+        elif grant is not None and call_type in CHAT_CALL_TYPES:
             priority = grant
         else:
             return None
         if extra_body.get("priority") == priority:
-            return None
+            return data if moved else None
         data["extra_body"] = {**extra_body, "priority": priority}
         return data
 
