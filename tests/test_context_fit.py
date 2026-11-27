@@ -447,8 +447,7 @@ def test_real_template_counts_a_normalized_part_as_plain_text(real):
     text = "the quarterly report is attached below. " * 300
     variants = [{"type": "text", "text": text, **extra} for extra in
                 ({"video": None}, {"image": None}, {"image_url": None}, {"video": "data:,"}, {"image_url": "data:,"})]
-    variants += [{"type": kind, field: text} for kind, field in
-                 (("refusal", "refusal"), ("input_text", "text"), ("output_text", "text"), ("thinking", "thinking"))]
+    variants.append({"type": "refusal", "refusal": text})
     for model, limits in real._limits.items():
         def count(part):
             body = {"messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": [part]},

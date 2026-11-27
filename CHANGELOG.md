@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Fixed
-- Text-like chat content parts (text, refusal, thinking and the like) are forwarded as plain text parts: an empty
+- Chat text and refusal parts are forwarded as plain text parts: an empty
   media key beside the text could turn it into a media placeholder, and a replayed refusal was a template error.
 - A request the chat template cannot render (an audio or video part, say) answered 500; it is now a 400, and no
   engine gets it.
