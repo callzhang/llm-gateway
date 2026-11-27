@@ -17,6 +17,13 @@ from PIL import Image
 
 _IMAGE_PART_TYPES = ("image_url", "input_image")
 
+# One token covers a 32x32 pixel square (patch 16 x merge 2), and the processor never
+# goes below MIN_PIXELS.  PROCESSOR_MAX_PIXELS is the checkpoints' own longest_edge,
+# for a model whose engine is not capped lower.  Qwen3.5-arch checkpoints, both chat models.
+_TOKEN_SIDE = 32
+_MIN_PIXELS = 65_536
+PROCESSOR_MAX_PIXELS = 16_777_216
+
 
 class ImageTooLarge(ValueError):
     """An image Pillow refuses to decode (over ~179 million pixels)."""
@@ -65,6 +72,36 @@ def _image_parts(node):
     if isinstance(node, list):
         for child in node:
             yield from _image_parts(child)
+
+
+def image_tokens(url: object, max_pixels: int) -> int:
+    """Prompt tokens the engine spends on one image: its size rounded to the token
+    grid and held between the pixel limits, as the Qwen processor resizes it.  An
+    image whose size cannot be read here (an http URL) counts as the largest."""
+    largest = max_pixels // (_TOKEN_SIDE * _TOKEN_SIDE)
+    if not (isinstance(url, str) and _is_inline(url)):
+        return largest
+    try:
+        with Image.open(io.BytesIO(base64.b64decode(url.partition(",")[2]))) as image:
+            width, height = image.size
+    except (OSError, ValueError, SyntaxError, binascii.Error, Image.DecompressionBombError):
+        return largest
+    rows, cols = round(height / _TOKEN_SIDE), round(width / _TOKEN_SIDE)
+    pixels = rows * cols * _TOKEN_SIDE * _TOKEN_SIDE
+    if pixels > max_pixels:
+        scale = _TOKEN_SIDE * math.sqrt(height * width / max_pixels)
+        rows, cols = max(1, math.floor(height / scale)), max(1, math.floor(width / scale))
+    elif pixels < _MIN_PIXELS:
+        scale = math.sqrt(_MIN_PIXELS / (height * width)) / _TOKEN_SIDE
+        rows, cols = math.ceil(height * scale), math.ceil(width * scale)
+    return rows * cols
+
+
+def image_urls(messages: list):
+    """The URL of every image part, in order (None for a part without one)."""
+    for part in _image_parts(messages):
+        image = part.get("image_url")
+        yield image.get("url") if isinstance(image, dict) else image
 
 
 def has_images(body: dict) -> bool:

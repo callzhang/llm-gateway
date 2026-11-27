@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+- context_fit counts image tokens (one per 32x32 pixels of the size the engine resizes to; the largest when the size
+  is unknown, as for an http URL). It counted only the placeholder, so a near-full conversation with a large image
+  could exceed the context window.
+
 ### Security
 - An image URL must be `data:` or `http(s):`; a path or `file://` URL is a 400.
 - A100: SGLang's internal sockets bind loopback, the gateway unit takes only host and tailnet connections, and

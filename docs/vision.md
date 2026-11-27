@@ -32,6 +32,8 @@ An image URL must be `data:` or `http(s):`, whatever the vision setting (SGLang 
 
 Inline images over 4,194,304 pixels are also shrunk on the CPU before forwarding (`image_fit.py`).
 
+context_fit adds each image's tokens to the prompt count (`image_fit.image_tokens`: about 400 for 0.4 Mpx, 4,096 at the 4 Mpx cap; an http URL counts as the largest).
+
 `IMAGE_URLS_INLINE_ONLY=1` accepts only base64 `data:` URLs: the engine then fetches nothing, and every image passes that shrink. The A100 sets it, because its engines could not reach public URLs anyway (`IPAddressDeny`, `region-cn.md`) while loopback and tailnet addresses were reachable.
 
 ## Deploying

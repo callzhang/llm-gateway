@@ -14,6 +14,7 @@ import model_manager as mm
 from tests.test_model_manager_context_fit import MODEL, RouterHarness
 
 MAX = 10_000
+ENGINE_PIXELS = 4_194_304
 
 
 def url(width, height, fmt="PNG", mode="RGB", **save):
@@ -29,6 +30,23 @@ def opened(data_url):
 def chat(image_url):
     return {"model": MODEL, "messages": [{"role": "user", "content": [
         {"type": "text", "text": "what is this"}, {"type": "image_url", "image_url": {"url": image_url}}]}]}
+
+
+class ImageTokenTests(unittest.TestCase):
+    """The expected counts are what the engine reported as prompt_tokens, less the text (A100, 2026-11-27)."""
+
+    def test_inline_images_are_counted_by_their_size(self):
+        for size, tokens in (((640, 240), 160), ((730, 550), 391), ((900, 500), 448), ((2048, 2048), 4096),
+                             ((2364, 1773), 4070), ((10, 10), 64)):
+            self.assertEqual(tokens, image_fit.image_tokens(url(*size), ENGINE_PIXELS), size)
+
+    def test_larger_images_count_at_the_cap(self):
+        self.assertLessEqual(image_fit.image_tokens(url(4000, 3000), ENGINE_PIXELS), ENGINE_PIXELS // 1024)
+        self.assertGreater(image_fit.image_tokens(url(4000, 3000), ENGINE_PIXELS), ENGINE_PIXELS // 1024 - 150)
+
+    def test_an_image_whose_size_is_unknown_counts_as_the_largest(self):
+        for value in ("https://example.com/a.png", "data:image/png;base64,AAAA", "data:image/png,AAAA", None):
+            self.assertEqual(ENGINE_PIXELS // 1024, image_fit.image_tokens(value, ENGINE_PIXELS), value)
 
 
 class FitImagesTests(unittest.TestCase):
