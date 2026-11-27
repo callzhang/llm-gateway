@@ -134,6 +134,20 @@ class ImageRoutingTests(RouterHarness):
             self.assertEqual(400, response.status, part)
         self.assertEqual([], self.forwarded)
 
+    async def test_only_content_parts_count_as_video_or_audio(self):
+        """An SDK replays an assistant message with `"audio": null`, or with a reference to its audio."""
+        await self._setup(frozenset({0}))
+        self.router.model_configs[MODEL] = mm.replace(self.router.model_configs[MODEL], inline_images_only=True)
+        history = [{"role": "user", "content": "hi", "audio": None},
+                   {"role": "assistant", "content": [{"type": "text", "text": "x", "video": None}], "audio": None},
+                   {"role": "assistant", "content": "y", "audio": {"id": "audio_1"}},
+                   {"role": "user", "content": "again"}]
+        response = await self._post({"model": MODEL, "messages": history})
+        self.assertEqual(200, response.status)
+        response = await self.client.post("/v1/responses", json={"model": MODEL, "input": [
+            {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}]})
+        self.assertEqual(400, response.status)
+
     async def test_unrestricted_models_are_unchanged(self):
         await self._setup(None)
         self.assertEqual(200, (await self._post(body(IMAGE), **{mm.OVERFLOW_HEADER: "1"})).status)

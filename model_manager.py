@@ -47,6 +47,7 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 import aiohttp
+import jinja2
 from aiohttp import web
 
 from asr_adapter import service as asr_service
@@ -3972,7 +3973,13 @@ class DynamicRouter:
         # oldest turns changes the first user message, which would re-pin the
         # conversation to another slot and lose its prefix cache.
         if config.request_kind == "chat" and isinstance(parsed_body, dict):
-            if await self.context_fitter.fit(parsed_body, model_name, config.max_image_pixels):
+            try:
+                fitted = await self.context_fitter.fit(parsed_body, model_name, config.max_image_pixels)
+            except jinja2.exceptions.TemplateError as exc:
+                # The model's template cannot render it (an audio or video part,
+                # say).  No engine gets it, and none is started for it.
+                return self._invalid_request(f"{model_name} cannot take this request: {exc}")
+            if fitted:
                 body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
 
         # A backend can vanish BEFORE it streams a single byte — a crash-recycle

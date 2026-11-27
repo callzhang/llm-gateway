@@ -59,9 +59,6 @@ run on the same messages (and tool definitions) vLLM will render.  The template
 only holds a placeholder per image, so each image's tokens are added from its
 size (image_fit.image_tokens).
 
-A request the chat template cannot render at all (an audio or video part, say)
-is left untouched too, for the engine to answer with its own 400.
-
 Only bodies with a `messages` list are touched; models without
 model_info.max_input_tokens (TTS, ASR) have no limits and pass through.
 """
@@ -75,7 +72,6 @@ import os
 import threading
 from typing import Any, Callable, NamedTuple
 
-import jinja2
 import yaml
 
 from image_fit import PROCESSOR_MAX_PIXELS, image_tokens, image_urls
@@ -475,14 +471,8 @@ class ContextFitter:
         limits = self._limits.get(model_name)
         if limits is None:
             return injected
-        try:
-            changed = await asyncio.to_thread(
-                self._fit, body, model_name, limits, image_max_pixels or PROCESSOR_MAX_PIXELS)
-        except jinja2.exceptions.TemplateError as exc:
-            logger.warning(
-                "context_fit: the chat template of %s cannot render this request (%s) — "
-                "leaving it for the engine to answer", model_name, exc)
-            return injected
+        changed = await asyncio.to_thread(
+            self._fit, body, model_name, limits, image_max_pixels or PROCESSOR_MAX_PIXELS)
         return changed or injected
 
     def _fit(self, data: dict, model: str, limits: ModelLimits, image_max_pixels: int) -> bool:

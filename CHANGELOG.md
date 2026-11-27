@@ -3,8 +3,9 @@
 ## Unreleased
 
 ### Fixed
-- A request the chat template cannot render (an audio or video part) answered 500; it now reaches the engine, which
-  answers 400.
+- A request the chat template cannot render (an audio or video part, say) answered 500; it is now a 400, and no
+  engine gets it.
+- The inline-only host refused a message that merely carried `"audio": null` or an audio reference.
 
 ### Fixed
 - context_fit counts image tokens (one per 32x32 pixels of the size the engine resizes to; the largest when the size

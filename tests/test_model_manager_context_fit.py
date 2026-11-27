@@ -159,15 +159,15 @@ class UnrenderableRequests(RouterHarness):
         fitter._limits[MODEL].tokenizer._tokenizer.apply_chat_template = refuse
         return fitter
 
-    async def test_a_request_the_template_refuses_goes_to_the_engine_as_it_is(self):
-        """It answered 500 here (an audio or video part); the engine says what is wrong with a 400."""
-        payload = {"model": MODEL, "max_tokens": 3000,
-                   "messages": [{"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": "data:,"}}]}]}
-        with self.assertLogs(level="WARNING") as logs:
-            response = await self.client.post("/v1/chat/completions", json=payload)
-        self.assertEqual(200, response.status)
-        self.assertEqual(payload, json.loads(self.forwarded[0]))
-        self.assertIn("Unsupported multimodal content item", "\n".join(logs.output))
+    async def test_a_request_the_template_refuses_is_a_400_before_any_engine(self):
+        """It answered 500 (an audio or video part).  It goes to no engine: one that loads media would
+        fetch the URL, and a cold model would be started for a request that cannot succeed."""
+        self.router._get_or_start = mock.AsyncMock()
+        response = await self.client.post("/v1/chat/completions", json={"model": MODEL, "messages": [
+            {"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": "data:,"}}]}]})
+        self.assertEqual(400, response.status)
+        self.assertIn("Unsupported multimodal content item", (await response.json())["error"]["message"])
+        self.router._get_or_start.assert_not_awaited()
 
 
 class ContextFitWithRealTokenizerTests(unittest.IsolatedAsyncioTestCase):
