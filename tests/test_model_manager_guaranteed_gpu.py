@@ -202,6 +202,12 @@ class SlotChoiceTests(unittest.TestCase):
     def test_preference_stays_lost_past_the_scale_out_cooldown(self):
         self.assertGreater(mm.GPU_CLEAR_RETRY_SECONDS, DynamicRouter.SCALE_OUT_COOLDOWN)
 
+    def test_a_card_that_could_not_be_cleared_ranks_after_every_usable_card(self):
+        """It may well have the most free memory; picking it again would fail every request for an hour."""
+        mm._gpu_clear_failed_at["GPU-bbb"] = mm.time.monotonic()
+        with cards(), patch.object(mm, "_gpu_free_mib", side_effect=lambda g: {0: 29000.0, 1: 30000.0}[g]):
+            self.assertEqual([0, 1], [s.gpu_id for s in DynamicRouter._by_free_vram(self.slots)])
+
     def test_a_card_that_could_not_be_cleared_loses_its_preference(self):
         mm._gpu_clear_failed_at["GPU-bbb"] = mm.time.monotonic()
         self.assertEqual(0, self._first())
