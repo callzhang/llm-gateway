@@ -126,6 +126,9 @@ general_settings:
   port: 8900
   health_check_interval: 0
   store_prompts_in_spend_logs: true
+  # History rows are written every proxy_batch_write_at + 0-5 s (default 10), and
+  # previous_response_hook waits 12 s for one before answering 410 (as in config.yaml).
+  proxy_batch_write_at: 2
   # Rows hold raw prompt/response text, so cap retention, as in config.yaml.
   maximum_spend_logs_retention_period: "7d"
   # The local database is loaded from a dump of GPU4's, so migrate it by hand
