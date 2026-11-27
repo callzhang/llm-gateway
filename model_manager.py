@@ -1361,6 +1361,23 @@ def translate_thinking_budget_for_sglang(parsed_body: dict) -> bool:
     return True
 
 
+# The engine routes a chat model serves; the engines have many more (native, admin, weight loading).
+CHAT_ENGINE_PATHS = frozenset({"/v1/chat/completions", "/v1/completions", "/v1/responses"})
+# Request fields an engine turns into code or loader arguments.  Only the gateway may set them.
+GATEWAY_ONLY_FIELDS = ("custom_logit_processor", "mm_processor_kwargs", "chat_template")
+
+
+def gateway_only_field(parsed_body: dict) -> str | None:
+    """The first field of a client body that only the gateway may set, or None."""
+    for field in GATEWAY_ONLY_FIELDS:
+        if parsed_body.get(field) is not None:
+            return field
+    template_kwargs = parsed_body.get("chat_template_kwargs")
+    if isinstance(template_kwargs, dict) and template_kwargs.get("chat_template") is not None:
+        return "chat_template_kwargs.chat_template"
+    return None
+
+
 def request_priority(parsed_body: dict | None) -> int:
     """Priority carried in the request body: an integer 0..255, smaller runs first.
 
@@ -3625,9 +3642,15 @@ class DynamicRouter:
         config = self.model_configs[model_name]
         invalid = self._validate_model_request(request, parsed_body, config)
         if invalid is not None:
+            self.log.warning(
+                f"Refused {request.method} {request.path!r} for {model_name} from {request.remote}: "
+                f"{invalid.text}"
+            )
             return invalid
         if config.request_kind == "transcription":
             return await self._handle_transcription(request, body, model_name)
+        # The engine gets what was checked, not the client's bytes (repeated keys).
+        body = json.dumps(parsed_body).encode()
         if config.request_kind == "speech":
             # The public speech contract is deliberately MP3-only.  vLLM-Omni
             # can encode it natively, and LiteLLM 1.86.2 labels every speech
@@ -4031,14 +4054,23 @@ class DynamicRouter:
                     "POST /v1/audio/transcriptions"
                 )
             return None
-        if config.request_kind != "speech":
-            return None
-        if request.method != "POST" or request.path != "/v1/audio/speech":
+        if config.request_kind == "speech":
+            if request.method != "POST" or request.path != "/v1/audio/speech":
+                return self._invalid_request(
+                    "Speech models are only available through POST /v1/audio/speech"
+                )
+        elif request.method != "POST" or request.path not in CHAT_ENGINE_PATHS:
             return self._invalid_request(
-                "Speech models are only available through POST /v1/audio/speech"
+                "Chat models are only available through POST "
+                + ", ".join(sorted(CHAT_ENGINE_PATHS))
             )
         if not isinstance(parsed_body, dict):
             return self._invalid_request("Request body must be a JSON object")
+        field = gateway_only_field(parsed_body)
+        if field is not None:
+            return self._invalid_request(f"'{field}' is not accepted", param=field)
+        if config.request_kind != "speech":
+            return None
         input_text = parsed_body.get("input")
         if not isinstance(input_text, str) or not input_text.strip():
             return self._invalid_request(
