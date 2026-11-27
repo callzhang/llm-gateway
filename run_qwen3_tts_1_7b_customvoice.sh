@@ -20,10 +20,14 @@ if [[ -f "$HF_TOKEN_FILE" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
 
+# The engine accepts only model_manager's key, read from the environment (engine_plugins/require_api_key.py).
+: "${ENGINE_API_KEY:?set ENGINE_API_KEY in gateway.env}"
+export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/engine_plugins${PYTHONPATH:+:$PYTHONPATH}"
+
 exec "$VLLM_BIN" serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9000} \
-  --api-key local-qwen36 \
+  --middleware require_api_key.RequireApiKey \
   --served-model-name qwen3-tts-1.7b-customvoice \
   --deploy-config "$DEPLOY_CONFIG" \
   --trust-remote-code \

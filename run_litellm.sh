@@ -10,6 +10,9 @@ export PATH="$GATEWAY_PY_BIN:$PATH"   # make prisma CLI visible for schema migra
 # published credential the moment gateway.env is missing.
 : "${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in gateway.env (openssl rand -hex 32)}"
 export LITELLM_MASTER_KEY
+# What the config's deployments send to model_manager, here and in the peer region.
+: "${GATEWAY_API_KEY:?set GATEWAY_API_KEY in gateway.env (the same value in both regions)}"
+export GATEWAY_API_KEY
 # No OPENAI_API_KEY: every model in config.yaml is served locally via
 # model_manager on 127.0.0.1:8002.  There is deliberately no external fallback.
 

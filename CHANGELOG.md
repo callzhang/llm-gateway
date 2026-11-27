@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- context_fit counts image tokens (one per 32x32 pixels of the size the engine resizes to; the largest when the size
+  is unknown, as for an http URL). It counted only the placeholder, so a near-full conversation with a large image
+  could exceed the context window.
+
+### Security
+- model_manager requires `GATEWAY_API_KEY` for every request that uses a model (README); it accepted any caller that
+  could connect, and added the engine key itself.
+- The SGLang engine log no longer holds the API keys; the manager forwards to a slot port only when the engine it
+  started is what listens there.
+- Guaranteed-GPU clearing: signals only the process it saw (not a reused PID), logs no process arguments, fails the
+  start when it cannot check the card, and runs off the event loop.
+- An `image_url` part without a `type` (vLLM's shorthand) is treated as an image.
+- An image URL must be `data:` or `http(s):`; a path or `file://` URL is a 400.
+- A100: SGLang's internal sockets bind loopback, the gateway unit takes only host and tailnet connections, and
+  `/data/derek` is no longer world-writable (`docs/region-cn.md`).
+
+### Added
+- A100: `qwen3.8-27b` takes images again, on card 1's instance, as base64 `data:` URLs only
+  (`IMAGE_URLS_INLINE_ONLY=1`). A handed-over inline image answers 503 on a host that takes images (`docs/vision.md`).
+- `qwen3.8-27b`: model_manager shrinks inline (data: URL) images over 4,194,304 pixels on the CPU before forwarding
+  (`image_fit.py`). The engine caps images there anyway but resized them on the GPU, where very large sources (up to
+  128 megapixels on the CN key) ran the A100's SGLang out of memory and killed the instance. Images by http URL pass
+  through unchanged; one Pillow refuses to decode (over ~179 megapixels) is a 400.
+- `VISION_GPU_IDS`: only the listed GPUs' `qwen3.8-27b` instance takes images (`none`: the host takes none). Image
+  requests go to those instances and never overflow to the other region; see `docs/vision.md`.
+- `GUARANTEED_GPU_UUIDS`: cards cleared of foreign processes before a primary model starts there; see
+  `docs/gpu-guaranteed.md`.
+
+### Changed
+- Engines start with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so a GPU id means the nvidia-smi index. On the A100 this needs
+  the pins renumbered in the same deployment (`docs/gpu-guaranteed.md`).
+
+### Security
+- Chat models accept only `POST /v1/chat/completions`, `/v1/completions` and `/v1/responses`, and a client body may
+  not set `custom_logit_processor`, `mm_processor_kwargs` or `chat_template`.
+- The engines accept only `ENGINE_API_KEY` (new, required in `gateway.env`; model_manager and the launch scripts
+  refuse to start without it), on every route but `/health` and `/metrics`. model_manager replaces the caller's
+  `Authorization` with it. It replaces the fixed key in the launch scripts and `ASR_GPU_API_KEY`. A restart stops
+  engines started with anything else instead of adopting them.
+
+### Fixed
+- `retry_breadcrumb_hook`: spend logs no longer hold other callers' requests. LiteLLM 1.99 kept retry breadcrumbs,
+  messages and images included, on one list per Router, and the overflow fallback wrote them even with
+  `num_retries: 0`. Rows already stored are unchanged (`docs/spend-log-retry-leak.md`).
+
 ## 2026-11-22
 
 ### Fixed

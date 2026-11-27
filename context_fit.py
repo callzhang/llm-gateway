@@ -55,9 +55,9 @@ valid.  Steps 1 and 3 are per-message and deterministic; 2 and 4 are not
 prefix-stable, which only costs cache hits on conversations that overflow.
 
 Input tokens are counted exactly: the model's own tokenizer and chat template
-run on the same messages (and tool definitions) vLLM will render.  Image parts
-only contribute their template placeholder, so a request heavy on images can
-still undercount by up to SAFETY_MARGIN-scale amounts per image.
+run on the same messages (and tool definitions) vLLM will render.  The template
+only holds a placeholder per image, so each image's tokens are added from its
+size (image_fit.image_tokens).
 
 Only bodies with a `messages` list are touched; models without
 model_info.max_input_tokens (TTS, ASR) have no limits and pass through.
@@ -74,6 +74,8 @@ from typing import Any, Callable, NamedTuple
 
 import yaml
 
+from image_fit import PROCESSOR_MAX_PIXELS, image_tokens, image_urls
+
 logger = logging.getLogger("mgr.context_fit")
 
 # Single source of truth is config.yaml, the same file LiteLLM loads.  Per model:
@@ -88,7 +90,7 @@ CONFIG_PATH = os.path.join(
 )
 _DEFAULT_OUT = 4096
 
-# Reserve for what the tokenizer cannot see (image tokens expand inside vLLM).
+# Reserve for what this count does not see (the engine's own template differences).
 _SAFETY_MARGIN = 512
 
 # Below this many output tokens an answer is not worth keeping history for.
@@ -447,9 +449,10 @@ class ContextFitter:
         logger.info("context_fit: limits for %s", {k: v.context_window for k, v in limits.items()})
         return cls(limits)
 
-    async def fit(self, body: dict, model_name: str) -> bool:
+    async def fit(self, body: dict, model_name: str, image_max_pixels: int | None = None) -> bool:
         """Apply the module-docstring policy to a parsed chat/completions body in
-        place; True if it changed.  Tokenizing and rendering the chat template is
+        place; True if it changed.  image_max_pixels is the engine's cap on one
+        image, None for the processor's own.  Tokenizing and rendering the chat template is
         CPU work, so it runs in a thread."""
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -468,15 +471,22 @@ class ContextFitter:
         limits = self._limits.get(model_name)
         if limits is None:
             return injected
-        changed = await asyncio.to_thread(self._fit, body, model_name, limits)
+        changed = await asyncio.to_thread(
+            self._fit, body, model_name, limits, image_max_pixels or PROCESSOR_MAX_PIXELS)
         return changed or injected
 
-    def _fit(self, data: dict, model: str, limits: ModelLimits) -> bool:
+    def _fit(self, data: dict, model: str, limits: ModelLimits, image_max_pixels: int) -> bool:
         tools = data.get("tools") or None
         messages = data["messages"]
+        sizes: dict = {}   # image URL -> tokens; count() runs many times over the same images
 
         def count(items: list) -> int:
-            return limits.tokenizer.count(items, tools)
+            total = limits.tokenizer.count(items, tools)
+            for url in image_urls(items):
+                if url not in sizes:
+                    sizes[url] = image_tokens(url, image_max_pixels)
+                total += sizes[url]
+            return total
 
         requested = next((data[k] for k in _OUTPUT_KEYS if data.get(k)), None) or limits.default_output
         floor = math.ceil(requested / _OUTPUT_TOLERANCE)

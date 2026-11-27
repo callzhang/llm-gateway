@@ -44,7 +44,7 @@ client ─► Cloudflare ─► tunnel ─► LiteLLM :8900 ──order 1──�
 * LiteLLM 1.99 tries `order: 2` only after `order: 1` fails. `disable_cooldowns: true` keeps a
   burst of overflow 503s from benching the local deployment.
 * TTS and ASR run in both regions too, each region's own first. TTS needs a whole card, so on the
-  A100 `MODEL_GPU_IDS` keeps card 5 for it: the 27B may use 0-4 and 6. Without that the 27B replicas
+  A100 `MODEL_GPU_IDS` keeps one card for it (numbers here predate the PCI-order renumbering in [gpu-guaranteed.md](gpu-guaranteed.md); card 5 then is 6 now): the 27B may use 0-4 and 6. Without that the 27B replicas
   never gave a card back and TTS failed in both regions. A region with no free slot answers
   `503 gpu_busy` and the other region takes it. ASR has no queue
   to measure: an upload of `ASR_OVERFLOW_MIN_SECONDS` (default 300) or more that would run on the
@@ -243,13 +243,13 @@ ssh a100-1 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user status llm-model
 ```
 
 Deploying to the A100: `git archive HEAD | ssh a100-1 'tar -x -C /data/derek/llm-gateway'`, then
-restart the unit. model_manager keeps and re-adopts its vLLM children across a restart, as on GPU4.
+restart the unit. model_manager keeps and re-adopts its vLLM children across a restart, as on GPU4. The one exception is the deployment that renumbers the GPUs ([gpu-guaranteed.md](gpu-guaranteed.md)): stop the engines there.
 After a deploy that changes `patches/qwen3_engine_tool_parser.py`, run
 `VLLM_BIN=/data/derek/venv-vllm029/bin/vllm scripts/install_qwen_parser.sh` there (see
 `docs/qwen-native-output-grammar-fix.md`). The A100 `gateway.env` is not tracked. Its variables are `GPU_PORT_BASE`,
 `GPU_CORESIDENT_PORT_BASE`, `LISTEN_HOST`, `PYTHON_BIN`, `VLLM_BIN`, `MODEL_HF_HOME`,
 `MODEL_CUDA_HOME`, `PATH`, `MAX_JOBS`, `WAKE_TIMEOUT`, `OVERFLOW_QUEUE_DEPTH`, `HF_HOME`,
-`HF_HUB_OFFLINE`, `LITELLM_CONFIG`, `LOCAL_GATEWAY_API_BASE`, `PEER_GATEWAY_API_BASE`,
+`HF_HUB_OFFLINE`, `ENGINE_API_KEY`, `GATEWAY_API_KEY` (both in README), `LITELLM_CONFIG`, `LOCAL_GATEWAY_API_BASE`, `PEER_GATEWAY_API_BASE`,
 `DATABASE_URL`, `DISABLE_SCHEMA_UPDATE`, `LITELLM_MASTER_KEY`, `GATEWAY_PY_BIN`,
 `PRISMA_BINARY_CACHE_DIR`, `LITELLM_HOST`, `CN_TLS_HOST`, `CN_TLS_PORT`, `CN_ALLOW_CIDRS`,
 `VLLM_ASR_BIN`, `VLLM_TTS_BIN`, `ASR_CPU_PYTHON`, `ASR_HF_HOME`, `ASR_VLLM_DISABLED_KERNELS`
@@ -259,3 +259,14 @@ Rollback of overflow on GPU4: remove `OVERFLOW_QUEUE_DEPTH` and `PEER_GATEWAY_AP
 `gateway.env` and the order-2 entry from `config.yaml`, then restart `llm-litellm` and
 `llm-model-manager`. The CN stack can stay up or be stopped with
 `systemctl --user stop llm-gateway.target` on the A100.
+
+## Network and file access on the shared host (2026-11-27)
+
+* `llm-model-manager.service` only takes connections from the host itself and the tailnet
+  (`IPAddressDeny=any` plus an allow list: loopback, `100.64.0.0/10`, `fd7a:115c:a1e0::/48`, the host's LAN
+  address `172.20.10.41/32`), set with `systemctl set-property`; drop-ins are in
+  `/etc/systemd/system.control/`. It covers the engines' internal ports, one of which SGLang opens on all
+  interfaces even with `SGLANG_HOST_IP`. If the LAN address changes, update the list.
+* `/data/derek` is no longer world-writable (read and execute kept). The previous ACLs are saved in
+  `llm-gateway/backups/20261127-acl.facl`.
+

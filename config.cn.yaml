@@ -10,19 +10,23 @@
 # PEER_GATEWAY_API_BASE   GPU4's model_manager
 # Keep the qwen3.8-27b model_info identical to config.yaml: it is the same
 # checkpoint, and context_fit on either side must cut to the same limits.
+# model_info.id is pinned to what LiteLLM derived on 2026-11-27: previous_response_id names it, and
+# otherwise changing any litellm_params (the api_key included) would end every stored chain.  A new
+# deployment needs an id of its own (openssl rand -hex 32).
 model_list:
 
   - model_name: qwen3.8-27b
     litellm_params:
       model: custom_openai/qwen3.8-27b
       api_base: os.environ/LOCAL_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       max_tokens: 32768
       timeout: 600
       stream_timeout: 600
       allowed_openai_params: ["reasoning_effort"]
       order: 1
     model_info: &qwen38_27b_info
+      id: 0564153aa903afe8882fbcc8f84869492edd246d20d0d67f176014638287df0f
       max_input_tokens: 131072
       max_output_tokens: 32768
       tool_cap_tokens: 2000
@@ -39,7 +43,7 @@ model_list:
     litellm_params:
       model: custom_openai/qwen3.8-27b
       api_base: os.environ/PEER_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       max_tokens: 32768
       timeout: 600
       stream_timeout: 600
@@ -55,11 +59,12 @@ model_list:
     litellm_params:
       model: custom_openai/qwen3.6-35b-a3b-heretic
       api_base: os.environ/PEER_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       max_tokens: 32768
       timeout: 600
       stream_timeout: 600
     model_info:
+      id: 27749416ea3bbab544ab060e2d9cd15bc2c54704cdba527cb95d1ae71e4e691e
       max_output_tokens: 32768
       supports_vision: true
 
@@ -67,18 +72,22 @@ model_list:
   # no card here is free (503 gpu_busy) or, for a long upload that would run on
   # the CPU here, on 503 queue_overflow.
   - model_name: qwen3-tts-1.7b-customvoice
+    model_info:
+      id: f7f71978e90439131bb0f09b8c948d23fd09a589a56b5fbc29f910356d26b49b
     litellm_params:
       model: hosted_vllm/qwen3-tts-1.7b-customvoice
       api_base: os.environ/LOCAL_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 600
       order: 1
 
   - model_name: qwen3-tts-1.7b-customvoice
+    model_info:
+      id: f16d3871a83d3bb2de026318b611e84437c559c621a713de771a34ae10308396
     litellm_params:
       model: hosted_vllm/qwen3-tts-1.7b-customvoice
       api_base: os.environ/PEER_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 600
       extra_headers: {x-gateway-overflow: "1"}
       order: 2
@@ -87,21 +96,23 @@ model_list:
     litellm_params:
       model: openai/qwen3-asr-0.6b
       api_base: os.environ/LOCAL_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 1800
       order: 1
     model_info:
+      id: 7ce6013b1a6f3fc2b25cad6fd6d1427a0d3fb72a319ee4979b3cc56368deddd3
       mode: audio_transcription
 
   - model_name: qwen3-asr
     litellm_params:
       model: openai/qwen3-asr-0.6b
       api_base: os.environ/PEER_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 1800
       extra_headers: {x-gateway-overflow: "1"}
       order: 2
     model_info:
+      id: 7c524b26b411a4929a0dd9b6d2a486860c7df649a4ec70e48b3ca29660b1dff7
       mode: audio_transcription
 
 router_settings:
@@ -117,6 +128,8 @@ litellm_settings:
   callbacks:
     - previous_response_hook.previous_response_history_hook
     - reasoning_effort_hook.reasoning_effort_hook
+    # Keep other callers' requests out of retry breadcrumbs in the spend logs.
+    - retry_breadcrumb_hook.retry_breadcrumb_hook
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
@@ -124,6 +137,9 @@ general_settings:
   port: 8900
   health_check_interval: 0
   store_prompts_in_spend_logs: true
+  # History rows are written every proxy_batch_write_at + 0-5 s (default 10), and
+  # previous_response_hook waits 12 s for one before answering 410 (as in config.yaml).
+  proxy_batch_write_at: 2
   # Rows hold raw prompt/response text, so cap retention, as in config.yaml.
   maximum_spend_logs_retention_period: "7d"
   # The local database is loaded from a dump of GPU4's, so migrate it by hand

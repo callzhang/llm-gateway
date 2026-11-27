@@ -13,6 +13,7 @@ prisma/
 .env
 gateway.env
 cloudflared.env
+engine-api-key.yaml*
 # Timestamped local backups (config.yaml.bak-YYYYMMDD-HHMM etc.)
 *.bak-*
 .claude/

@@ -29,6 +29,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOG_DIR"
+# The run scripts need ENGINE_API_KEY (and the per-host paths) that the units get from here.
+if [[ -f $SCRIPT_DIR/gateway.env ]]; then set -a; . "$SCRIPT_DIR/gateway.env"; set +a; fi
 
 # Interpreter for deriving per-model spawn env from model_manager.py — the run
 # scripts require VLLM_MAX_NUM_SEQS / VLLM_GPU_MEM_UTIL and carry no defaults

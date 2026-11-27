@@ -111,6 +111,11 @@ def test_the_wait_ends_before_the_first_keepalive_can_commit_a_200():
     cfg = yaml.safe_load(open(os.path.join(_REPO, "config.yaml")))
     interval = cfg["litellm_settings"]["sse_keepalive_ping_interval_seconds"]
     assert mod._WAIT_SECONDS + 2 * mod._POLL_SECONDS <= interval
-    # Spend-log rows (the history) are written every proxy_batch_write_at + 0..5 s, so a follow-up
-    # sent right after its response finds its row inside the wait.
+
+
+@pytest.mark.parametrize("name", ["config.yaml", "config.cn.yaml"])
+def test_history_is_written_inside_the_wait_in_every_region(name):
+    """Spend-log rows (the history) are written every proxy_batch_write_at + 0..5 s (default 10), so a
+    follow-up sent right after its response must find its row before the hook answers 410."""
+    cfg = yaml.safe_load(open(os.path.join(_REPO, name)))
     assert cfg["general_settings"]["proxy_batch_write_at"] + 5 + mod._POLL_SECONDS <= mod._WAIT_SECONDS

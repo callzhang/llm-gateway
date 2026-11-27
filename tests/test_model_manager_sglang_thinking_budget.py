@@ -79,6 +79,64 @@ class VllmBackend(Harness):
         self.assertEqual(json.loads(self.forwarded[0]), body)
 
 
+class RequestsTheEngineMayNotSee(Harness):
+    """Client fields an engine would turn into code or loader arguments, and routes it must not receive."""
+
+    CHAT = {"model": MODEL, "messages": [{"role": "user", "content": "hi"}]}
+    FIELDS = (
+        {"custom_logit_processor": "client-value"},
+        {"custom_logit_processor": ["client-value"]},
+        {"custom_logit_processor": "client-value", "thinking_token_budget": 16},
+        {"mm_processor_kwargs": {"subfolder": "client-value"}},
+        {"chat_template": "client-value"},
+        {"chat_template_kwargs": {"chat_template": "client-value"}},
+    )
+
+    async def send(self, path: str, data: bytes, method: str = "POST", headers: dict | None = None):
+        return await self.client.request(method, path, data=data,
+                                         headers={"content-type": "application/json", **(headers or {})})
+
+    async def test_the_fields_are_refused_on_every_served_route_and_from_the_peer_region(self):
+        for path in ("/v1/chat/completions", "/v1/completions", "/v1/responses"):
+            for headers in ({}, {mm.OVERFLOW_HEADER: "1"}):
+                for extra in self.FIELDS:
+                    with self.subTest(path=path, headers=headers, extra=extra):
+                        resp = await self.send(path, json.dumps({**self.CHAT, **extra}).encode(), headers=headers)
+                        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.forwarded, [])
+
+    async def test_other_engine_routes_and_methods_are_not_forwarded(self):
+        body = json.dumps(self.CHAT).encode()
+        for path in ("/generate", "/invocations", "/vertex_generate", "/update_weights_from_tensor",
+                     "/load_lora_adapter", "/v1/chat/completions/", "/chat/completions", "/v1/chat/completions%3F"):
+            with self.subTest(path=path):
+                self.assertEqual((await self.send(path, body)).status, 400)
+        for method in ("GET", "PUT"):
+            with self.subTest(method=method):
+                self.assertEqual((await self.send("/v1/chat/completions", body, method=method)).status, 400)
+        self.assertEqual(self.forwarded, [])
+
+    async def test_a_body_that_is_not_a_json_object_is_refused(self):
+        multipart = (b'--b\r\nContent-Disposition: form-data; name="model"\r\n\r\n' + MODEL.encode() + b"\r\n--b--\r\n")
+        resp = await self.send("/v1/chat/completions", multipart, headers={"content-type": "multipart/form-data; boundary=b"})
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.forwarded, [])
+
+    async def test_the_engine_gets_what_was_checked_not_the_client_bytes(self):
+        raw = json.dumps(self.CHAT)[:-1] + ', "custom_logit_processor": "client-value", "custom_logit_processor": null}'
+        self.assertEqual((await self.send("/v1/chat/completions", raw.encode())).status, 200)
+        self.assertNotIn(b"client-value", self.forwarded[0])
+
+    async def test_ordinary_template_arguments_still_pass(self):
+        body = {**self.CHAT, "chat_template_kwargs": {"enable_thinking": False}}
+        await self.send("/v1/chat/completions", json.dumps(body).encode())
+        self.assertEqual(json.loads(self.forwarded[0]), body)
+
+
+class RequestsAVllmEngineMayNotSee(RequestsTheEngineMayNotSee):
+    engine = "vllm"
+
+
 class ProcessorReference(unittest.TestCase):
     def test_the_processor_string_only_names_the_plugin_class(self):
         payload = bytes.fromhex(json.loads(mm.SGLANG_QWEN38_THINKING_BUDGET_PROCESSOR)["callable"])

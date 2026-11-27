@@ -101,10 +101,22 @@ MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:?VLLM_MAX_NUM_SEQS is required}
 # Compact JSON for structured outputs: pretty-printing was ~37% of the answer
 # tokens of memory extraction.  disable_any_whitespace needs an explicit
 # xgrammar/guidance backend (vLLM rejects it with backend=auto).
+# model_manager sets QWEN_VISION=0 for instances that take no images (VISION_GPU_IDS).
+if [[ "${QWEN_VISION:-1}" == 0 ]]; then
+  MM_ARGS=(--language-model-only)
+else
+  MM_ARGS=(--limit-mm-per-prompt '{"image":1,"video":0}'
+           --mm-processor-kwargs '{"size":{"longest_edge":4194304,"shortest_edge":65536}}')
+fi
+
+# The engine accepts only model_manager's key, read from the environment (engine_plugins/require_api_key.py).
+: "${ENGINE_API_KEY:?set ENGINE_API_KEY in gateway.env}"
+export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/engine_plugins${PYTHONPATH:+:$PYTHONPATH}"
+
 exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
-  --api-key local-qwen36 \
+  --middleware require_api_key.RequireApiKey \
   --served-model-name qwen3.8-27b \
   --revision 35fd99fb8434ef70ee61372df3face5174bed2c8 \
   --gpu-memory-utilization ${GPU_MEM_UTIL} \
@@ -118,6 +130,5 @@ exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --enable-auto-tool-choice \
-  --limit-mm-per-prompt '{"image":1,"video":0}' \
-  --mm-processor-kwargs '{"size":{"longest_edge":4194304,"shortest_edge":65536}}' \
+  "${MM_ARGS[@]}" \
   --trust-remote-code

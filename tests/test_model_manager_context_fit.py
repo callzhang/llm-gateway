@@ -126,6 +126,28 @@ class ContextFitInRouterTests(RouterHarness):
         self.assertEqual([raw], self.forwarded)
 
 
+class ImagesCountTowardTheWindow(RouterHarness):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.router.model_configs[MODEL] = mm.replace(self.router.model_configs[MODEL], max_image_pixels=4_194_304)
+
+    async def test_the_output_cap_leaves_room_for_the_image(self):
+        image = {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}   # size unknown: 4096 tokens
+        payload = {"model": MODEL, "messages": [{"role": "user", "content": [image]}], "max_tokens": 8000}
+        await self.client.post("/v1/chat/completions", json=payload)
+        sent = json.loads(self.forwarded[0])
+        self.assertEqual(CTX - (1 + 4) - 4096 - 512, sent["max_tokens"])
+
+    async def test_a_dropped_turn_gives_back_its_image(self):
+        image = {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+        history = [{"role": "user", "content": [image]}, {"role": "assistant", "content": "a" * 3000}]
+        payload = {"model": MODEL, "messages": history + [{"role": "user", "content": "x" * 100}], "max_tokens": 3000}
+        await self.client.post("/v1/chat/completions", json=payload)
+        sent = json.loads(self.forwarded[0])
+        self.assertEqual([{"role": "user", "content": "x" * 100}], sent["messages"])
+        self.assertEqual(3000, sent["max_tokens"])
+
+
 class ContextFitWithRealTokenizerTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_long_previous_response_chain_is_made_to_fit(self):
         """What LiteLLM sends for previous_response_id after it appended the
