@@ -12,7 +12,8 @@ export TRITON_CACHE_DIR=/data/derek/sglang-runtime/cache/triton
 export TORCHINDUCTOR_CACHE_DIR=/data/derek/sglang-runtime/cache/torchinductor
 export FLASHINFER_WORKSPACE_BASE=/data/derek/sglang-runtime/cache
 export MAX_JOBS=8
-export SGLANG_PLUGINS=friday_tool_json
+# friday_redact_keys: SGLang prints its start arguments, the engine key included; this masks it.
+export SGLANG_PLUGINS=friday_tool_json,friday_redact_keys
 # friday_thinking_budget: the qwen3.8 thinking-budget processor model_manager names for requests that carry
 # thinking_token_budget (SGLang ignores that vLLM option); loaded by reference, so it must be importable here.
 export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/sglang_plugins${PYTHONPATH:+:$PYTHONPATH}"

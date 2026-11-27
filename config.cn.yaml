@@ -16,7 +16,7 @@ model_list:
     litellm_params:
       model: custom_openai/qwen3.8-27b
       api_base: os.environ/LOCAL_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       max_tokens: 32768
       timeout: 600
       stream_timeout: 600
@@ -39,7 +39,7 @@ model_list:
     litellm_params:
       model: custom_openai/qwen3.8-27b
       api_base: os.environ/PEER_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       max_tokens: 32768
       timeout: 600
       stream_timeout: 600
@@ -55,7 +55,7 @@ model_list:
     litellm_params:
       model: custom_openai/qwen3.6-35b-a3b-heretic
       api_base: os.environ/PEER_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       max_tokens: 32768
       timeout: 600
       stream_timeout: 600
@@ -70,7 +70,7 @@ model_list:
     litellm_params:
       model: hosted_vllm/qwen3-tts-1.7b-customvoice
       api_base: os.environ/LOCAL_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 600
       order: 1
 
@@ -78,7 +78,7 @@ model_list:
     litellm_params:
       model: hosted_vllm/qwen3-tts-1.7b-customvoice
       api_base: os.environ/PEER_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 600
       extra_headers: {x-gateway-overflow: "1"}
       order: 2
@@ -87,7 +87,7 @@ model_list:
     litellm_params:
       model: openai/qwen3-asr-0.6b
       api_base: os.environ/LOCAL_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 1800
       order: 1
     model_info:
@@ -97,7 +97,7 @@ model_list:
     litellm_params:
       model: openai/qwen3-asr-0.6b
       api_base: os.environ/PEER_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 1800
       extra_headers: {x-gateway-overflow: "1"}
       order: 2

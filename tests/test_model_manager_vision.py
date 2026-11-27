@@ -110,6 +110,18 @@ class ImageRoutingTests(RouterHarness):
         self.assertEqual(503, (await self._post(inline, **{mm.OVERFLOW_HEADER: "1"})).status)
         self.assertEqual([], self.forwarded)
 
+    async def test_a_part_without_a_type_may_not_name_a_server_path(self):
+        await self._setup(None)
+        for part in ({"image_url": {"url": "file:///etc/passwd"}}, {"type": "text", "uuid": "u", "image_url": "file:///x"}):
+            self.assertEqual(400, (await self._post(body(part))).status, part)
+        self.assertEqual([], self.forwarded)
+
+    async def test_a_part_without_a_type_is_still_an_image(self):
+        """vLLM takes an `image_url` key with no type (or with a uuid) as an image."""
+        await self._setup(frozenset({0}))
+        self.assertEqual(200, (await self._post(body({"image_url": {"url": "https://example.com/a.png"}}))).status)
+        self.assertEqual([frozenset({0})], self.asked)
+
     async def test_unrestricted_models_are_unchanged(self):
         await self._setup(None)
         self.assertEqual(200, (await self._post(body(IMAGE), **{mm.OVERFLOW_HEADER: "1"})).status)
