@@ -138,6 +138,28 @@ class ClearGpuTests(unittest.IsolatedAsyncioTestCase):
             await self._backend()._clear_guaranteed_gpu()
         self.assertIn("GPU-bbb", mm._gpu_clear_failed_at)
 
+    async def test_a_backend_that_started_during_the_card_query_is_spared(self):
+        live = {500}
+        backend = self._backend()
+        backend.router = type("R", (), {"live_pgids": lambda _self: set(live)})()
+        gpu = FakeGpu({600: (600, signal.SIGTERM)})
+
+        def pids(gpu_id):
+            live.add(600)   # an ASR engine came up while nvidia-smi was running
+            return gpu.pids(gpu_id)
+
+        with cards(), patch.object(mm, "_gpu_compute_pids", pids), patch.object(mm, "_signal_pid", gpu.send), \
+                patch.object(GpuBackend, "_pgid_of", staticmethod(gpu.pgid)):
+            await backend._clear_guaranteed_gpu()
+        self.assertEqual([], gpu.sent)
+
+    async def test_a_card_that_cannot_be_identified_fails_the_spawn(self):
+        gpu = FakeGpu({100: (100, signal.SIGTERM)})
+        with patch.multiple(mm, GUARANTEED_GPU_UUIDS=frozenset({"GPU-bbb"}), _gpu_uuid=lambda i: None), \
+                patch.object(mm, "_signal_pid", gpu.send), self.assertRaises(RuntimeError):
+            await self._backend()._clear_guaranteed_gpu()
+        self.assertEqual([], gpu.sent)
+
     async def test_a_slow_card_query_does_not_stall_other_requests(self):
         ticks = []
 

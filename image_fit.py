@@ -31,15 +31,23 @@ class ImageTooLarge(ValueError):
 
 def _shrunk_data_url(url: str, max_pixels: int) -> "str | None":
     """A smaller data: URL, or None to leave `url` as it is (already small
-    enough, or not something we can read: the engine reports that itself)."""
+    enough, or not something we can read: the engine reports that itself).
+    Raises ImageTooLarge for an oversized image that cannot be made smaller."""
     header, _, payload = url.partition(",")
     if not header.startswith("data:") or not header.endswith(";base64"):
         return None
     try:
-        with Image.open(io.BytesIO(base64.b64decode(payload))) as image:
-            width, height = image.size
-            if width * height <= max_pixels:
-                return None
+        image = Image.open(io.BytesIO(base64.b64decode(payload)))
+    except Image.DecompressionBombError as exc:
+        raise ImageTooLarge(str(exc)) from None
+    except (OSError, ValueError, SyntaxError, binascii.Error):
+        return None
+    with image:
+        width, height = image.size
+        if width * height <= max_pixels:
+            return None
+        # Known to be oversized from here on: it is shrunk or refused, never forwarded.
+        try:
             source_format = image.format
             keep = {k: image.info[k] for k in ("exif", "icc_profile") if image.info.get(k)}
             scale = math.sqrt(max_pixels / (width * height))
@@ -48,18 +56,19 @@ def _shrunk_data_url(url: str, max_pixels: int) -> "str | None":
                 image.draft(image.mode, size)   # decode at reduced scale: less host memory
             if image.mode in ("P", "1"):
                 image = image.convert("RGBA" if image.mode == "P" else "L")
+            elif source_format != "JPEG" and image.mode not in ("RGB", "RGBA", "L", "LA"):
+                image = image.convert("RGB")    # PNG cannot hold CMYK and the like
+                keep.pop("icc_profile", None)
             small = image.resize(size, Image.Resampling.BICUBIC)
-        out = io.BytesIO()
-        if source_format == "JPEG":
-            small.save(out, "JPEG", quality=95, **keep)
-            mime = "image/jpeg"
-        else:
-            small.save(out, "PNG", compress_level=1, **keep)
-            mime = "image/png"
-    except Image.DecompressionBombError as exc:
-        raise ImageTooLarge(str(exc)) from None
-    except (OSError, ValueError, SyntaxError, binascii.Error):
-        return None
+            out = io.BytesIO()
+            if source_format == "JPEG":
+                small.save(out, "JPEG", quality=95, **keep)
+                mime = "image/jpeg"
+            else:
+                small.save(out, "PNG", compress_level=1, **keep)
+                mime = "image/png"
+        except (OSError, ValueError, SyntaxError) as exc:
+            raise ImageTooLarge(f"cannot shrink it: {exc}") from None
     return f"data:{mime};base64," + base64.b64encode(out.getvalue()).decode("ascii")
 
 
