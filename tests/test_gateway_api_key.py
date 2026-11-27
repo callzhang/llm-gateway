@@ -67,6 +67,20 @@ class StartupTests(unittest.TestCase):
             self.assertEqual({"os.environ/GATEWAY_API_KEY"}, {e["litellm_params"]["api_key"] for e in entries}, name)
         self.assertIn("${GATEWAY_API_KEY:?", (ROOT / "run_litellm.sh").read_text())
 
+    def test_every_deployment_pins_its_id(self):
+        """LiteLLM otherwise derives the id from litellm_params, previous_response_id names it, and
+        previous_response_hook answers 410 for an id this proxy has no deployment for: changing any
+        parameter, the key included, would end every stored chain."""
+        for name in ("config.yaml", "config.cn.yaml"):
+            with open(ROOT / name) as f:
+                entries = yaml.safe_load(f)["model_list"]
+            ids = {}
+            for entry in entries:
+                pinned = (entry.get("model_info") or {}).get("id", "")
+                self.assertRegex(pinned, r"^[0-9a-f]{64}$", (name, entry["model_name"]))
+                ids.setdefault(pinned, set()).add(entry["model_name"])
+            self.assertTrue(all(len(models) == 1 for models in ids.values()), name)
+
 
 if __name__ == "__main__":
     unittest.main()
