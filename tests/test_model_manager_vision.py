@@ -1,4 +1,5 @@
-"""VISION_GPU_IDS: only some instances take images; images never cross regions."""
+"""VISION_GPU_IDS: only some instances take images.  Images do not queue-overflow to the peer; one the
+sending region cannot serve is served by the peer if it can."""
 from __future__ import annotations
 
 import os
@@ -68,12 +69,18 @@ class ImageRoutingTests(RouterHarness):
         self.assertEqual([], self.asked)
         self.assertEqual(200, (await self._post(body())).status)
 
-    async def test_handed_over_images_are_refused(self):
-        header = {mm.OVERFLOW_HEADER: "1"}
-        await self._setup(frozenset())   # peer's image arriving here: retryable there
-        self.assertEqual(503, (await self._post(body(IMAGE), **header)).status)
-        await self._setup(frozenset({0}))   # peer region takes no images
-        self.assertEqual(400, (await self._post(body(IMAGE), **header)).status)
+    async def test_a_handed_over_image_is_served_by_a_host_that_takes_images(self):
+        """The sender could not serve it (a web URL it cannot fetch, or its vision GPU was taken)."""
+        await self._setup(frozenset({0}))
+        for image in (IMAGE, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}):
+            self.asked.clear()
+            response = await self._post(body(image), **{mm.OVERFLOW_HEADER: "1"})
+            self.assertEqual(200, response.status, await response.text())
+            self.assertEqual([frozenset({0})], self.asked)
+
+    async def test_a_host_without_vision_leaves_a_handed_over_image_retryable(self):
+        await self._setup(frozenset())
+        self.assertEqual(503, (await self._post(body(IMAGE), **{mm.OVERFLOW_HEADER: "1"})).status)
         self.assertEqual([], self.forwarded)
 
     async def test_responses_input_image_is_recognised(self):
@@ -105,12 +112,14 @@ class ImageRoutingTests(RouterHarness):
         self.assertEqual(200, (await self._post(inline)).status)
         self.assertEqual([frozenset({0})], self.asked)
 
-    async def test_a_handed_over_inline_image_stays_retryable_on_a_vision_host(self):
-        """The peer refused it for lack of capacity, not for what it is: a 400 would tell its caller to give up."""
+    async def test_an_inline_only_host_serves_a_handed_over_inline_image_but_not_a_web_one(self):
         await self._setup(frozenset({0}))
-        inline = body({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}})
-        self.assertEqual(503, (await self._post(inline, **{mm.OVERFLOW_HEADER: "1"})).status)
+        self.router.model_configs[MODEL] = mm.replace(self.router.model_configs[MODEL], inline_images_only=True)
+        header = {mm.OVERFLOW_HEADER: "1"}
+        self.assertEqual(503, (await self._post(body(IMAGE), **header)).status)
         self.assertEqual([], self.forwarded)
+        inline = body({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}})
+        self.assertEqual(200, (await self._post(inline, **header)).status)
 
     async def test_a_part_without_a_type_may_not_name_a_server_path(self):
         await self._setup(None)

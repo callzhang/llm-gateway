@@ -3923,11 +3923,11 @@ class DynamicRouter:
                 for m in msgs if isinstance(m, dict)
             )
 
-        # Images: only the instances on vision_gpu_ids can take them, and they
-        # never cross regions.  A host without such a GPU answers 400, or 503 to
-        # work its peer handed over, so the peer's caller can retry there.  A host
-        # with one answers a handed-over inline image 503 too (the peer lacked
-        # capacity) and any other handed-over image 400 (the peer refused its URL).
+        # Images: only the instances on vision_gpu_ids can take them.  They never
+        # queue-overflow, but one this host cannot serve (no vision GPU, the GPU
+        # held by another model, a URL it may not fetch) fails here and LiteLLM
+        # tries the peer, which serves it if it can.  Handed-over work it cannot
+        # serve gets 503: the sender could not either.
         # Whatever the vision setting: an image may only be inline or on the web.
         if config.request_kind == "chat" and isinstance(parsed_body, dict) and unsafe_image_url(parsed_body):
             return self._invalid_request("image URLs must be data: or http(s):")
@@ -3945,10 +3945,10 @@ class DynamicRouter:
         ):
             crossed = _already_crossed(request)
             if crossed and (not config.vision_gpu_ids
-                            or not unsafe_image_url(parsed_body, inline_only=True)):
+                            or (config.inline_images_only and unsafe_image_url(parsed_body, inline_only=True))):
                 return self._error_response(
-                    503, f"'{model_name}' takes no images handed over to this region; retry later.", "gpu_busy")
-            if not config.vision_gpu_ids or crossed:
+                    503, f"'{model_name}' cannot take this image in this region either; retry later.", "gpu_busy")
+            if not config.vision_gpu_ids:
                 return self._invalid_request(
                     f"'{model_name}' does not accept images on this endpoint.")
             vision_gpus = config.vision_gpu_ids

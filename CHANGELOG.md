@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+- An image request the receiving region cannot serve (a web URL on the inline-only A100, or its vision GPU taken)
+  is now served by the other region instead of failing. Images still do not queue-overflow.
+
 ### Fixed
 - `run_litellm.sh` and the `llm-litellm` unit now default to the LiteLLM 1.108.19 venv. Only the untracked
   `gateway.env` selected it before; without those lines gpu4 would have started 1.99.0, which with these

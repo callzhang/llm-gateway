@@ -17,14 +17,17 @@
 
 | Request | Answer |
 |---|---|
-| image, direct, host takes images | served by a vision GPU, never overflowed to the peer |
-| image, direct, host takes none | 400 |
-| image handed over by the peer, host takes none | 503 `gpu_busy` |
-| inline image handed over by the peer, host takes images | 503 `gpu_busy`: the peer lacked capacity |
-| other image handed over by the peer, host takes images | 400: the peer refused its URL |
-| image, vision GPU held by another model | 503 `gpu_busy` |
+| image, direct, host takes images | served by a vision GPU, never queue-overflowed to the peer |
+| image, direct, host takes none | 400, and LiteLLM tries the peer |
+| image, direct, vision GPU held by another model | 503 `gpu_busy`, and LiteLLM tries the peer |
+| web URL, direct, inline-only host | 400, and LiteLLM tries the peer |
+| image handed over by the peer, host can take it | served by a vision GPU |
+| image handed over by the peer, host takes none, or a web URL on an inline-only host | 503 `gpu_busy` |
 
-LiteLLM 1.99 moves on to the `order: 2` deployment after a 400 as well as after a 503 (measured 2026-11-26), which is why a handed-over image is never served: otherwise one region's image would run in the other. The client sees the second region's answer.
+An image goes to the other region only when the sending region cannot serve it (2026-11-28, Derek: image
+requests should reach a multimodal instance, not fail). So a CN request with a web-URL image, which the A100
+may not fetch, is processed on GPU4. LiteLLM moves on to the `order: 2` deployment after a 400 as well as
+after a 503, and a handed-over request is never handed on again.
 
 The A100 runs SGLang, whose `--language-only` loaded the same weights and KV as with vision (2026-11-26), so every A100 engine can take images and model_manager alone decides which instance gets them. Only card 1's does: SGLang has run out of GPU memory processing large images, and this keeps that to one instance.
 
@@ -40,4 +43,4 @@ context_fit adds each image's tokens to the prompt count (`image_fit.image_token
 
 1. On the A100 the settings are in `/etc/llm-model-manager-cn-27b-scaleout.env`; restart `llm-model-manager` (system unit) after a change.
 2. On gpu4, restarting model_manager stops a running GPU 1 instance (it was started with vision) and the next request starts it text-only.
-3. Changing which regions take images changes what a handed-over image gets (table above); tell the callers.
+3. Changing which regions take images changes which region serves one (table above); tell the callers.
