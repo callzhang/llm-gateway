@@ -150,9 +150,9 @@ Limits come from `config.yaml` (`model_info.max_input_tokens`, `max_output_token
 declares a window without a tokenizer fails at startup (model_manager loads the tokenizers once,
 ~5 s). Known gaps: image tokens expand inside vLLM and only their placeholder is counted (the 512
 margin absorbs small images). Reasoning models spend the output cap on thinking first, so a tight
-cap can end the answer before any visible text. LiteLLM 1.99 reports a capped Responses answer as
-`status: "incomplete"` with `incomplete_details: null` (newer LiteLLM fills `reason`); clients
-should key on `status`.
+cap can end the answer before any visible text. LiteLLM 1.99 reported a capped Responses answer as
+`status: "incomplete"` with `incomplete_details: null` (1.104 and later fill `reason`, not checked
+here); clients should key on `status`.
 
 **Cost** (qwen3.8-27b tokenizer + chat template, 32-core host, 2026-10-22): one count is about
 1.5-2 µs/token, so 29k tokens ≈ 50 ms, 113k ≈ 220 ms, 169k ≈ 300 ms. A request that fits costs
@@ -241,7 +241,7 @@ with `stream: true`. Keepalives from model_manager would not help: LiteLLM's Ope
 comments, and LiteLLM still buffers its first real chunk before writing headers.
 
 The bytes therefore come from LiteLLM itself. `litellm_settings.sse_keepalive_ping_interval_seconds:
-15` turns on LiteLLM 1.99's TTFT keepalive (`open_sse_before_first_byte`). A streaming chat or
+15` turns on LiteLLM's TTFT keepalive (`open_sse_before_first_byte`). A streaming chat or
 Responses request still silent after 15 s gets 200 `text/event-stream` headers and a `: ping\n\n`
 comment every 15 s until the real stream starts. Gaps mid-stream get the same comment. Requests
 that answer within 15 s are byte-identical to before, and non-streaming requests are unaffected.
@@ -251,7 +251,7 @@ SSE comments are ignored by spec; openai-python 1.109.1 and 2.30.0 were checked 
 The trade-off: once a ping is sent, the status line is committed. A failure found later (an
 upstream 4xx/5xx after the gate, or the peer region also failing) reaches the client as
 `data: {"error": {..., "code": "<status>"}}` and `data: [DONE]` under the 200. The OpenAI SDK
-raises `APIError` for it, not the status-specific subclass, and LiteLLM 1.99 replaces the message
+raises `APIError` for it, not the status-specific subclass, and LiteLLM 1.99 replaced the message
 with "Error processing stream start". A 503 `queue_overflow` from the gate still moves the request
 to the peer region inside LiteLLM, behind the pings. `tests/test_litellm_proxy_stream.py` runs the
 real proxy with this repo's `litellm_settings` against a slow fake upstream to pin this behaviour.
@@ -265,14 +265,10 @@ deployments), and waits at most 12 s for its own ids. Spend-log rows are written
 `general_settings.proxy_batch_write_at` (2) + 0-5 s, so a row lands inside that wait.
 `tests/test_previous_response_hook.py` checks both numbers against `config.yaml`.
 
-**Streamed responses cannot be continued with `previous_response_id`** (LiteLLM 1.99,
-`custom_openai` Responses bridge, measured 2026-11-22). The final id of a streamed response points
-at the stream's placeholder (`resp_<uuid>`), but its spend-log row is keyed by the upstream
-`chatcmpl-…` id, and the uuid is stored nowhere, so the lookup finds nothing and the answer is 410.
-A non-streamed response continues normally. `response.created` / `response.in_progress` carry a
-different placeholder id that is never continuable either; only `response.completed` (or
-`stream.get_final_response()`) carries the final id. A client that streams must resend the
-conversation in `input` instead of using `previous_response_id`.
+**Streamed responses can be continued with `previous_response_id`** since LiteLLM 1.108.19
+(2026-11-27, checked in both regions). Use the id from `response.completed`. On 1.99 a streamed
+answer answered 410, and a list-shaped `input` silently lost the user messages on replay
+(`docs/litellm-upgrade-1.108.md`).
 
 ## Public-facing stack (Open WebUI + systemd target + tunnel)
 
@@ -468,7 +464,7 @@ same directory.
 #### LiteLLM memory cap and watcher
 
 On 2026-11-01 LiteLLM 1.99.0 grew to 45.8 GB and triggered a global OOM; its normal footprint is about
-1.3 GB. The drop-in `llm-litellm.service.d/memory-cap.conf` sets `MemoryHigh=3G` (throttle) and
+1.3 GB (1.108.19 in its own venv: 0.8 GB idle, 0.9 GB under a synthetic load). The drop-in `llm-litellm.service.d/memory-cap.conf` sets `MemoryHigh=3G` (throttle) and
 `MemoryMax=4G` (kill and restart only LiteLLM).
 
 `scripts/litellm_mem_watch.sh` runs every minute from the root timer `llm-litellm-mem-watch.timer`

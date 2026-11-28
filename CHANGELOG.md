@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-### LiteLLM 1.108.19 (not deployed; ship these together with the new venv, `docs/litellm-upgrade-1.108.md`)
+### LiteLLM 1.108.19 (deployed to both regions 2026-11-27; record and rollback in `docs/litellm-upgrade-1.108.md`)
+- Fixes `previous_response_id`: streamed answers can be continued (they answered 410), and a list-shaped `input`
+  keeps its user messages on replay.
 - LiteLLM 1.99.0 → 1.108.19, pinned in `docs/litellm-1.108.19-requirements.txt`.
 - `retry_breadcrumb_hook.py` is removed: upstream's `log_retry` no longer copies request content, and the
   callback would replace it. These configs on 1.99.0 would store other callers' requests again.

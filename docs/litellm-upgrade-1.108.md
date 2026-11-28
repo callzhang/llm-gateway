@@ -2,14 +2,59 @@
 
 ## 结论
 
-**建议升级，目标 `1.108.19`（1.108 LTS 线），先 GPU4、后 CN。** 但不能只换包：下面的「随升级上线的改动」要和换版本
-同时上线。改动已写好，在分支 `feat/litellm-1.108`（已合入部署分支到 `ad29914`；部署分支再前进要重新合并并重测）。
-**这个分支不能在 1.99.0 上部署**（它去掉了重试记录修复）。
-没有部署、没有重启服务、没有改线上环境和线上数据库。
+**两区已在 2026-11-27 升级到 `1.108.19`。** 下面「部署记录」是实际做法和回滚命令；其后各节是升级前的评估原文。
 
-`ca223b2`（重试记录修复）已随两区后来的重启生效（US 11-27 16:46 PST，CN 11-27 11:17 UTC；没有查新日志行确认效果）。
+## 部署记录（2026-11-27，时间为 US PST）
 
-升级还会修好一个现网问题：1.99.0 续接 `previous_response_id` 时丢历史（见下一节）。
+| | US（gpu4） | CN（A100） |
+|---|---|---|
+| 新环境 | `/home/derek/venvs/litellm-1.108.19` | `/data/derek/venv-litellm-1.108.19` |
+| 数据库备份（不含请求日志数据） | `/home/derek/litellm-backups/gpu4-pre-1.108.dump` | `/data/derek/llm-gateway-backups/cn-pre-1.108.dump` |
+| 迁移 | 中途失败一次后成功（见下） | 63 个，59 秒 |
+| 切换 | 21:52 与 21:53 两次重启，恢复用时 47 秒、25 秒 | 22:02 重启，32 秒恢复 |
+| 验证 | 端到端全过 | 端到端全过；key 同步成功 |
+| 旧环境（回滚用，确认稳定前不删） | `llm-gateway-vllm` conda 环境 | `/data/derek/venv-litellm` |
+
+端到端检查：chat（含流式）、列表 `input` 的 `previous_response_id` 续接（流式和非流式）、伪造 id 410、
+Codex 形状带工具调用的请求、两种 `priority` 写法、TTS、ASR；切换前在旁路端口 8911 用新版连真实库和引擎试跑过，
+含与旧版双向续接。TTS 两版都返回 MP3。
+
+### 出过的问题
+
+1. **US 迁移堵住线上请求日志约 10 分钟（21:35–21:45）。** 两个 11-08 起「事务中空闲」的连接（CN 还连 US 库时
+   遗留，角色 `litellm_cn`）各持有 `LiteLLM_SpendLogs` 的锁；`ALTER TABLE` 等锁时，后面的日志插入全部排队。
+   处理：取消 `ALTER`、终止这两个连接和线上进程里一个因堵塞卡住的事务、把失败的迁移标为已回滚后重跑。
+   影响：日志里没见请求失败；几批日志写入重试耗尽，可能丢了少量请求日志行（数量没法确定），
+   对应的响应无法续接。
+   **以后迁移前**：查有没有超过 60 秒的事务；迁移时开看门狗，别人被迁移语句挡住超过 5 秒就取消它。
+2. **US 第一次切换时合并没做成。** `git merge -F -` 不支持从标准输入读说明，后续步骤照常执行，
+   1.108.19 带着旧配置跑了约 1 分钟（21:52–21:53）。旧回调仍在，不会串日志。补合并（`6e1cc7f`）后重启。
+3. CN 连不上 pypi.org：用 pypi.org 生成带哈希的依赖清单，从清华源安装并逐包校验；Prisma 工具链从旧环境复制。
+4. CN 的 `model_manager.py` 与部署分支不一致，所以 CN 只换了 `config.cn.yaml` 和根目录的
+   `sync_cn_litellm_keys.sh`，没有传整个仓库。
+
+### 回滚
+
+两区都**保留 `DISABLE_SCHEMA_UPDATE=true`**，数据库不回退。
+
+US：删掉 `gateway.env` 里的 `GATEWAY_PY_BIN`、`PRISMA_BINARY_CACHE_DIR` 两行，把重试记录回调带回来（否则 1.99 会
+串日志；其余改动在 1.99 上无害。如果之后有人改过 `config.yaml`，改为手工把回调那一行加回 `callbacks`），再重启：
+
+```bash
+git -C /home/derek/Projects/llm-gateway checkout ad29914 -- config.yaml retry_breadcrumb_hook.py
+```
+
+```bash
+sudo systemctl restart llm-litellm
+```
+
+CN：
+
+```bash
+ssh a100-1 'cd /data/derek/llm-gateway && B=/data/derek/llm-gateway-backups && cat $B/config.cn.yaml.pre-1.108 > config.cn.yaml && cat $B/sync_cn_litellm_keys.sh.pre-1.108 > sync_cn_litellm_keys.sh && sed -i "s#^GATEWAY_PY_BIN=.*#GATEWAY_PY_BIN=/data/derek/venv-litellm/bin#; s#^PRISMA_BINARY_CACHE_DIR=.*#PRISMA_BINARY_CACHE_DIR=/data/derek/venv-litellm/share/prisma-python#" gateway.env && sudo systemctl restart llm-litellm'
+```
+
+US 先回滚、CN 不回滚没有问题；key 同步在两种组合下都能跑。
 
 ## `previous_response_id` 续接（1.99.0 的现有缺陷）
 
@@ -137,7 +182,7 @@ TTS 的 `voice` / `instructions` / `response_format` 和 ASR 表单字段的转�
   「config 文件优先」和 1.108 的 fallback 权限默认开启不影响现状；主密钥长度够（1.104 起拒绝弱密钥）。
 - **环境**：用独立 venv，不在 `llm-gateway-vllm` 里原地升级（它和 vLLM 共用）。回滚只需改回 `GATEWAY_PY_BIN`。
 
-## 实施步骤
+## 实施步骤（升级前的计划，实际偏差见「部署记录」）
 
 命令不会打印连接串。两区的 `gateway.env` 里 `DATABASE_URL` 都没有引号。
 
