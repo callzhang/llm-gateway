@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### gpu4 runs master (2026-11-27)
+- gpu4 stops holding back the per-instance `OVERFLOW_QUEUE_DEPTH` (below): both regions now run the same code.
+  With one running instance the threshold is unchanged; with two it is twice the configured depth.
+
+### LiteLLM 1.108.19 (deployed to both regions 2026-11-27; record and rollback in `docs/litellm-upgrade-1.108.md`)
+- Fixes `previous_response_id`: streamed answers can be continued (they answered 410), and a list-shaped `input`
+  keeps its user messages on replay.
+- LiteLLM 1.99.0 → 1.108.19, pinned in `docs/litellm-1.108.19-requirements.txt`.
+- `retry_breadcrumb_hook.py` is removed: upstream's `log_retry` no longer copies request content, and the
+  callback would replace it. These configs on 1.99.0 would store other callers' requests again.
+- `request_priority_hook` checks a client's priority on every route and moves a top-level `priority` into
+  `extra_body`. Before, `/v1/messages` and `/v1/completions` let any key run at 0; 1.108 would also have
+  forwarded a top-level 0 and kept other top-level values for its own scheduler.
+- `budget_exceeded_status_code: 429` in both configs (upstream's new default is 422).
+- CN key sync leaves `total_spend` alone, a column 1.108 adds.
+
+### Changed
+- gpu4: model_manager, LiteLLM, Open WebUI and the JIT warm-up are system units running as `derek` (were user units),
+  so systemd-oomd's swap kills pass them over. Manage them with `sudo systemctl`.
+- gpu4: the TTS access gateway is retired (no requests; `ai-services` calls LiteLLM for speech). Code kept.
+
+### Fixed
+- Chat text and refusal parts are forwarded as plain text parts: an empty
+  media key beside the text could turn it into a media placeholder, and a replayed refusal was a template error.
+- A request the chat template cannot render (an audio or video part, say) answered 500; it is now a 400, and no
+  engine gets it.
+- The inline-only host refused a message that merely carried `"audio": null` or an audio reference.
+
 ### Fixed
 - Codex requests to a chat model answered 500: LiteLLM passed `client_metadata` on to the OpenAI client.
   Every chat deployment now drops it.

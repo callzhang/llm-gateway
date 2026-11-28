@@ -1,0 +1,301 @@
+# LiteLLM 1.99.0 → 1.108.19 升级评估（2026-11-26，11-27 合并部署分支后复测）
+
+## 结论
+
+**两区已在 2026-11-27 升级到 `1.108.19`。** 下面「部署记录」是实际做法和回滚命令；其后各节是升级前的评估原文。
+
+## 部署记录（2026-11-27，时间为 US PST）
+
+| | US（gpu4） | CN（A100） |
+|---|---|---|
+| 新环境 | `/home/derek/venvs/litellm-1.108.19` | `/data/derek/venv-litellm-1.108.19` |
+| 数据库备份（不含请求日志数据） | `/home/derek/litellm-backups/gpu4-pre-1.108.dump` | `/data/derek/llm-gateway-backups/cn-pre-1.108.dump` |
+| 迁移 | 中途失败一次后成功（见下） | 63 个，59 秒 |
+| 切换 | 21:52 与 21:53 两次重启，恢复用时 47 秒、25 秒 | 22:02 重启，32 秒恢复 |
+| 验证 | 端到端全过 | 端到端全过；key 同步成功 |
+| 旧环境（回滚用，确认稳定前不删） | `llm-gateway-vllm` conda 环境 | `/data/derek/venv-litellm` |
+
+端到端检查：chat（含流式）、列表 `input` 的 `previous_response_id` 续接（流式和非流式）、伪造 id 410、
+Codex 形状带工具调用的请求、两种 `priority` 写法、TTS、ASR；切换前在旁路端口 8911 用新版连真实库和引擎试跑过，
+含与旧版双向续接。TTS 两版都返回 MP3。
+
+### 出过的问题
+
+1. **US 迁移堵住线上请求日志约 10 分钟（21:35–21:45）。** 两个 11-08 起「事务中空闲」的连接（CN 还连 US 库时
+   遗留，角色 `litellm_cn`）各持有 `LiteLLM_SpendLogs` 的锁；`ALTER TABLE` 等锁时，后面的日志插入全部排队。
+   处理：取消 `ALTER`、终止这两个连接和线上进程里一个因堵塞卡住的事务、把失败的迁移标为已回滚后重跑。
+   影响：日志里没见请求失败；几批日志写入重试耗尽，可能丢了少量请求日志行（数量没法确定），
+   对应的响应无法续接。
+   **以后迁移前**：查有没有超过 60 秒的事务；迁移时开看门狗，别人被迁移语句挡住超过 5 秒就取消它。
+2. **US 第一次切换时合并没做成。** `git merge -F -` 不支持从标准输入读说明，后续步骤照常执行，
+   1.108.19 带着旧配置跑了约 1 分钟（21:52–21:53）。旧回调仍在，不会串日志。补合并（`6e1cc7f`）后重启。
+3. CN 连不上 pypi.org：用 pypi.org 生成带哈希的依赖清单，从清华源安装并逐包校验；Prisma 工具链从旧环境复制。
+4. CN 的 `model_manager.py` 与部署分支不一致，所以 CN 只换了 `config.cn.yaml` 和根目录的
+   `sync_cn_litellm_keys.sh`，没有传整个仓库。
+
+### 回滚
+
+两区都**保留 `DISABLE_SCHEMA_UPDATE=true`**，数据库不回退。
+
+US：删掉 `gateway.env` 里的 `GATEWAY_PY_BIN`、`PRISMA_BINARY_CACHE_DIR` 两行，把重试记录回调带回来（否则 1.99 会
+串日志；其余改动在 1.99 上无害。如果之后有人改过 `config.yaml`，改为手工把回调那一行加回 `callbacks`），再重启：
+
+```bash
+git -C /home/derek/Projects/llm-gateway checkout ad29914 -- config.yaml retry_breadcrumb_hook.py
+```
+
+```bash
+sudo systemctl restart llm-litellm
+```
+
+CN：
+
+```bash
+ssh a100-1 'cd /data/derek/llm-gateway && B=/data/derek/llm-gateway-backups && cat $B/config.cn.yaml.pre-1.108 > config.cn.yaml && cat $B/sync_cn_litellm_keys.sh.pre-1.108 > sync_cn_litellm_keys.sh && sed -i "s#^GATEWAY_PY_BIN=.*#GATEWAY_PY_BIN=/data/derek/venv-litellm/bin#; s#^PRISMA_BINARY_CACHE_DIR=.*#PRISMA_BINARY_CACHE_DIR=/data/derek/venv-litellm/share/prisma-python#" gateway.env && sudo systemctl restart llm-litellm'
+```
+
+US 先回滚、CN 不回滚没有问题；key 同步在两种组合下都能跑。
+
+## `previous_response_id` 续接（1.99.0 的现有缺陷）
+
+上游 [PR 37956](https://github.com/BerriAI/litellm/pull/37956)（2026-08-22 合并）不在 1.99.0 里，在 1.108.19 里
+（合并提交是 `v1.108.19` 的祖先）。2026-11-26 实测：真实 proxy + 仓库 `config.yaml` 和回调 + 临时 Postgres +
+假上游，每条链 3 轮，检查第 2、3 轮发给上游的内容里有没有之前各轮的用户输入；续接前等 8 秒和不等各一次。
+
+| 请求形式 | 1.99.0 | 1.108.19 |
+|---|---|---|
+| 非流式，字符串 `input` | 历史完整 | 历史完整 |
+| 非流式，列表 `input`（两种写法） | **只剩上一轮回答，用户输入全丢，仍返回 200** | 历史完整 |
+| 流式，用 `response.completed` 的 id | **410 `has no stored history`** | 历史完整 |
+| 流式，用 `response.created` 的 id | **410 `was not issued by this gateway`** | 历史完整 |
+
+流式两行的 410 是本仓库 `previous_response_hook` 在 LiteLLM 查不到历史时的回答。1.99.0 上的结果与
+`retry_breadcrumb_hook` 无关（列表丢失由另一会话在完整代理里单独复现过）。回滚到 1.99.0 会带回这些问题。
+
+## 版本选择
+
+| 版本 | 取舍 |
+|---|---|
+| **1.108.19** | 选它。LTS 线最新补丁（11-26 发布）；含 PR 39491 修复；下列公告除最后一行外都已修 |
+| 1.100.1+ / 1.101.x | 只解决日志问题；GHSA-m8fp 到 1.103.0 才修；LTS 试行期间这两条线不再维护 |
+| 1.100.0 | 不能用（重试记录无限增长） |
+| 1.109–1.111 | 变更更多；1.111.0 评估时刚发布一天 |
+
+LiteLLM 的 LTS 是 2026-11-02 起为期一个月的试行（[说明](https://docs.litellm.ai/docs/enterprise/lts_pilot)），
+实施前确认 1.108 是否仍在维护。
+
+影响 1.99.0、与本网关有关的安全公告：
+
+| 公告 | 内容 | 修复版本 |
+|---|---|---|
+| GHSA-m8fp-3f3g-j5p7（高） | 请求体自带 `api_key` / `api_base` 会污染其他用户的部署。公告称默认配置受影响；我们的配置下用 `api_key` 没有复现 | 1.103.0 |
+| GHSA-7hp6-4w63-5g45（严重） | `internal_user` 提权为管理员并执行命令 | 1.100.4 |
+| GHSA-4xm2-x5g5-wc8q（中） | 没有绑定用户的虚拟 key 能读到同类 key 的元数据 | 1.108.13 |
+| GHSA-2364 / fjxr / wpm4（中） | 缓存与花费接口越权读取；团队 fallback 越权 | 1.108.0 |
+| GHSA-w5h5-479w-p5hx（高） | JWT / SSO 邮箱匹配串号；本网关没配 JWT / SSO | 仅 1.111.0 |
+
+## 随升级上线的改动
+
+| # | 问题（均在临时环境实测） | 改动 |
+|---|---|---|
+| 1 | 顶层 `priority`：1.99 返回 500；1.108 把 0 原样转给 model_manager，把其他值当成自己的调度参数吃掉 | `request_priority_hook.py` 把它挪进 `extra_body` 再检查 |
+| 2 | `/v1/messages`、`/v1/completions` 现在就能让没授权的 key 拿到优先级 0（1.99 已如此） | 同一个 hook：客户端自带的值在所有路由上检查 |
+| 3 | 超预算的状态码从 429 变 422（两区各有 3 个 key 设了预算） | 两个 config 加 `budget_exceeded_status_code: 429` |
+| 4 | `retry_breadcrumb_hook.py` 会盖掉上游修好的 `log_retry` | 删文件和回调；测试改为 `tests/test_retry_breadcrumbs.py` |
+| 5 | 新列 `total_spend` 会被 CN 的 key 同步每天用 GPU4 的值覆盖 | 同步脚本排除列表加 `total_spend` |
+| 6 | `test_model_manager_cancellation` 的假日志对象缺字段 | 加 `call_type="aresponses"` |
+
+CN 的 LiteLLM 不加载 `request_priority_hook`（现状如此，本次没改），CN 入口对优先级没有限制。
+
+## `Router.log_retry` 与回调的去留
+
+1.108.19 每次失败记：`model_group`、`deployment_id`、`model`、`base_model`、`exception_type`、`exception_string`、
+`attempted_retries`，另在 metadata 记 `request_retry_count`；最多 4 条，只放在本请求的 metadata 里。
+**不再复制 `input` / `messages` / 图片**：实测一条经过 order 1 → order 2 的请求，内容在日志里只出现一次。
+唯一残留：`exception_string` 是完整的 `str(e)`、不截断，引擎报错若引用请求原文会进日志（只涉及本请求）。
+
+**删除 `retry_breadcrumb_hook.py`。** 保留会替换上游实现，丢掉 `request_retry_count`（请求级重试上限用它）和按次计费用的字段。
+
+## 测试结果
+
+整个 `tests/` 目录，2026-11-27，合并部署分支（`ad29914`）之后。
+
+| 环境 | 结果 |
+|---|---|
+| 1.108.19，分支 `feat/litellm-1.108` | 441 通过，0 失败 |
+| 1.99.0，同一分支 | 440 通过，3 失败 |
+| 1.99.0，部署分支原样（基线） | 436 通过，0 失败 |
+
+3 个失败：重试记录回归测试 2 个子测试（1.99 去掉回调后会串内容，预期）；伪造 id 返回 410 的计时断言超限 1 毫秒
+（1.0010 s 对上限 1.0 s），单独重跑该文件 3 次都通过。
+
+11-26 用仓库原样测 1.108.19 时失败的是：上游已修导致的预期失败、断言了已删除的 `Router.previous_models`、
+取消测试的假日志对象缺 `call_type`。新环境另装了 pytest、Pillow、transformers、jinja2（线上 model_manager 不用这个环境）。
+
+key 同步脚本的改动没有自动化测试（依赖两个 Postgres 和 docker），用临时库手工验证：新→新时 CN 的
+`total_spend`、`spend` 保持原值、别的字段照常更新；新→旧同步成功。
+
+Codex 形状的请求（`client_metadata`、`reasoning.summary`、工具等，流式和非流式）在两版上都返回 200 并完成，
+发给上游的内容里没有 `client_metadata`。用的是假上游，没有用真的 Codex。
+
+### 内存和开销
+
+合成负载：真实 proxy + 临时 Postgres + 假上游，测试机本身负载很高（32 核，load 10–50），只看量级。
+
+| | 1.99.0 | 1.108.19 |
+|---|---|---|
+| 空闲内存（含 Prisma 引擎） | 1258 MB | 793 MB |
+| 2400 个请求后的峰值 | 1450 MB | 927 MB |
+| 小请求，每个的 CPU 时间 | 7–14 ms | 14–16 ms |
+| 108 KB 请求（流式），每个的 CPU 时间 | 32–49 ms | 32–34 ms |
+| 小请求串行时的中位耗时 | 6–11 ms | 10–15 ms |
+
+内存低于 GPU4 单元的上限（`MemoryHigh=3G`、`MemoryMax=4G`）。小请求开销变大，但相对模型推理耗时很小。
+长时间运行的内存增长没测。
+
+另做了新旧版本对比（真实 proxy + 临时 Postgres + 假上游，用仓库当时的 `config.yaml`）。
+
+两版一致：SSE keepalive；伪造 `previous_response_id` 返回 410；`previous_response_id` 跨版本续接（旧发新续、新发旧续，只测了非流式、字符串 `input`）；
+order 1 → order 2（503、断连、TTS 503，含流式）；限定模型的 key 走 order 2；客户端断开后取消上游（chat / responses，流式与否）；
+TTS 的 `voice` / `instructions` / `response_format` 和 ASR 表单字段的转发（TTS 参数此前只在 1.86.2 验证过）。
+
+有变化、不需改网关，但调用方可能感知：
+- Responses 流式事件：message 项现在有 `output_item.added` / `content_part.added`，事件带 `sequence_number`；
+  纯工具调用的回答不再多出一个空 message 项。
+- 错误体的 `error.type` 有值了，部分 `error.message` 不再带 `Received Model Group=...`。
+- 流中途断开时不再向 order 2 重发一次（客户端两版收到的都是错误）。
+- chat 流式块带 `finish_reason: null`；`provider_specific_fields.refusal` 没有了。
+- 顶层的非标准参数（如 `chat_template_kwargs`）从 500 变为转给上游。
+
+## 1.99 之后的变更中与我们有关的
+
+- **数据库**：新增 63 个迁移（180 → 243 条记录）。用两区线上库的**结构和迁移记录副本（不含数据）**演练，
+  均成功、迁移后与 1.108 的 schema 无差异。对现有表以加列为主；`LiteLLM_SpendLogs` 加两列和两个并发建的索引
+  （表本体 GPU4 122 MB、CN 254 MB；真实数据上的耗时没测）。
+- **没迁移就启动**：1.108 能启动、`/health/liveliness` 正常，但 key 校验全部 500（缺列）。必须先迁移再换版本。
+- **Prisma**：新环境要 `prisma generate`；1.104 起默认 v2 迁移器，迁移失败时代理拒绝启动。
+- **回滚**：1.99 在迁移后的库上能正常读写。实测 1.99 开着 schema 更新启动没有删任何列（没有待应用迁移），
+  但[上游警告](https://docs.litellm.ai/docs/proxy/database_migrations)旧版在迁移恢复路径上会删掉新表新列，
+  所以回滚必须保持 `DISABLE_SCHEMA_UPDATE=true`。
+- **回调接口**：仓库的回调在两个 config 下都能按路径加载；1.108 起加载不了的日志回调会让代理拒绝启动。
+- **不涉及**：库里没有覆盖 config 的设置、没有库内模型、没有 key 级 `router_settings`，所以 1.103 的
+  「config 文件优先」和 1.108 的 fallback 权限默认开启不影响现状；主密钥长度够（1.104 起拒绝弱密钥）。
+- **环境**：用独立 venv，不在 `llm-gateway-vllm` 里原地升级（它和 vLLM 共用）。回滚只需改回 `GATEWAY_PY_BIN`。
+
+## 实施步骤（升级前的计划，实际偏差见「部署记录」）
+
+命令不会打印连接串。两区的 `gateway.env` 里 `DATABASE_URL` 都没有引号。
+
+### GPU4
+
+在 `/home/derek/Projects/llm-gateway`。LiteLLM 是系统级单元（`sudo systemctl`）。这是线上目录：到第 5 步才合并分支，合并后马上做第 6 步，别让旧版本带着
+去掉回调的 config 重启。
+
+1. 建环境（不影响线上）：
+
+```bash
+V=/home/derek/venvs/litellm-1.108.19; /home/derek/miniforge3/envs/llm-gateway-vllm/bin/python -m venv $V && PYTHONNOUSERSITE=1 $V/bin/pip install -r .worktrees/litellm-1.108/docs/litellm-1.108.19-requirements.txt && PYTHONNOUSERSITE=1 PRISMA_BINARY_CACHE_DIR=$V/share/prisma-python PATH=$V/bin:$PATH $V/bin/prisma generate --schema $V/lib/python3.12/site-packages/litellm/proxy/schema.prisma
+```
+
+2. 备份库（不含 spend log 数据，避免再复制一份含他人内容的日志）：
+
+```bash
+mkdir -p -m 700 ~/litellm-backups; url=$(grep '^DATABASE_URL=' gateway.env | cut -d= -f2-); PGURL=${url%%\?*} docker run --rm --memory=1g --network host -e PGURL postgres:16 sh -c 'pg_dump "$PGURL" -Fc --exclude-table-data="\"LiteLLM_SpendLogs\""' > ~/litellm-backups/gpu4-pre-1.108.dump
+```
+
+3. `gateway.env` 加一行 `DISABLE_SCHEMA_UPDATE=true`（此后任何版本重启都不自动改库）。
+4. 迁移（1.99 可继续服务）。要求退出码 0：
+
+```bash
+(export DATABASE_URL="$(grep '^DATABASE_URL=' gateway.env | cut -d= -f2-)" LITELLM_MASTER_KEY="$(grep '^LITELLM_MASTER_KEY=' gateway.env | cut -d= -f2-)"; V=/home/derek/venvs/litellm-1.108.19; PYTHONNOUSERSITE=1 PRISMA_BINARY_CACHE_DIR=$V/share/prisma-python PATH=$V/bin:$PATH DISABLE_SCHEMA_UPDATE=false $V/bin/litellm --skip_server_startup)
+```
+
+5. 把 `feat/litellm-1.108` 合并进当前部署分支（`git merge --no-ff feat/litellm-1.108`），在新 venv 里跑一遍上面的测试。
+6. `gateway.env` 加两行，然后重启。第二行必须有：单元文件里的 `PRISMA_BINARY_CACHE_DIR` 指向旧环境，
+   `gateway.env` 的值会盖过它。
+
+   ```
+   GATEWAY_PY_BIN=/home/derek/venvs/litellm-1.108.19/bin
+   PRISMA_BINARY_CACHE_DIR=/home/derek/venvs/litellm-1.108.19/share/prisma-python
+   ```
+
+```bash
+sudo systemctl restart llm-litellm
+```
+7. 验证：版本号是 1.108.19；chat、流式 responses、TTS、ASR 各一次；`previous_response_id` 续接按下面两条查：
+   第 1 轮用列表 `input` 给一个暗号，第 2 轮让模型复述（非流式、流式各一次，流式用 `response.completed` 的 id），
+   都要返回 200 且答出暗号；
+   日志里没有 `does not exist in the current database`；spend log 有新行；用 Codex 打一次；看单元的 `MemoryPeak`；
+   `sudo systemctl start llm-litellm-key-sync.service`（在 A100 上）仍显示 `synced keys=...`。
+
+回滚：删掉第 6 步加的两行，**保留 `DISABLE_SCHEMA_UPDATE=true`**，`git revert -m 1` 那个合并提交（把重试记录回调带回来，
+否则 1.99 会再次串日志），重启。数据库不回退。
+
+### CN（A100）
+
+GPU4 稳定后再做。**顺序不能反**：CN 先升级会让 key 同步失败（`total_spend` 非空约束，实测）；GPU4 先升级则同步正常。
+这一步的建环境命令没有在 A100 上演练过。
+
+1. 传代码前先建环境（依赖清单单独传）：
+
+```bash
+scp /home/derek/Projects/llm-gateway/docs/litellm-1.108.19-requirements.txt a100-1:/data/derek/litellm-1.108.19-requirements.txt
+```
+
+```bash
+ssh a100-1 'V=/data/derek/venv-litellm-1.108.19; /data/derek/bin/uv venv --python /data/derek/uv-python/cpython-3.12.16-linux-x86_64-gnu/bin/python3.12 $V && /data/derek/bin/uv pip install --python $V/bin/python -r /data/derek/litellm-1.108.19-requirements.txt && PYTHONNOUSERSITE=1 PRISMA_BINARY_CACHE_DIR=$V/share/prisma-python PATH=$V/bin:$PATH $V/bin/prisma generate --schema $V/lib/python3.12/site-packages/litellm/proxy/schema.prisma'
+```
+
+2. 备份：
+
+```bash
+ssh a100-1 'cd /data/derek/llm-gateway && umask 077 && sudo -n docker exec -e PGPASSWORD="$(cut -d= -f2- pg-local.env)" llm-litellm-pg pg_dump -h 127.0.0.1 -p 15433 -U litellm -d litellm -Fc --exclude-table-data="\"LiteLLM_SpendLogs\"" > /data/derek/llm-gateway-backups/cn-pre-1.108.dump'
+```
+
+3. 手动迁移（`disable_prisma_schema_update` 和 `DISABLE_SCHEMA_UPDATE=true` 保持不动）：
+
+```bash
+ssh a100-1 'cd /data/derek/llm-gateway && V=/data/derek/venv-litellm-1.108.19 && export DATABASE_URL="$(grep "^DATABASE_URL=" gateway.env | cut -d= -f2-)" LITELLM_MASTER_KEY="$(grep "^LITELLM_MASTER_KEY=" gateway.env | cut -d= -f2-)" && PYTHONNOUSERSITE=1 PRISMA_BINARY_CACHE_DIR=$V/share/prisma-python PATH=$V/bin:$PATH DISABLE_SCHEMA_UPDATE=false $V/bin/litellm --skip_server_startup'
+```
+
+4. A100 的 `gateway.env`：先抄下原来的 `GATEWAY_PY_BIN`、`PRISMA_BINARY_CACHE_DIR`，改为
+   `/data/derek/venv-litellm-1.108.19/bin`、`/data/derek/venv-litellm-1.108.19/share/prisma-python`。
+5. 传代码、更新 key 同步脚本并重启（约 70 秒 502）。11-27 时 CN 的 `model_manager.py` 和部署分支不一致，传整个 HEAD
+   之前先看清差异。key 同步单元跑的是 checkout **根目录**的 `sync_cn_litellm_keys.sh`，不是 `scripts/` 里那份：
+
+```bash
+git -C /home/derek/Projects/llm-gateway archive HEAD | ssh a100-1 'tar -x -C /data/derek/llm-gateway'
+```
+
+```bash
+ssh a100-1 'cd /data/derek/llm-gateway && cp sync_cn_litellm_keys.sh sync_cn_litellm_keys.sh.pre-1.108 && cp scripts/sync_cn_litellm_keys.sh sync_cn_litellm_keys.sh'
+```
+
+```bash
+ssh a100-1 'sudo systemctl restart llm-litellm'
+```
+
+6. 验证同 GPU4 第 7 步，再跑 `sudo systemctl start llm-litellm-key-sync.service`。
+
+回滚：`gateway.env` 两个变量改回原值，同步脚本换回 `sync_cn_litellm_keys.sh.pre-1.108`，把 revert 后的代码传过去，`sudo systemctl restart llm-litellm`。
+数据库不回退；旧版 `/data/derek/venv-litellm` 在确认稳定前不删。
+
+## 没有验证的
+
+- 真实流量下长时间运行的内存和 CPU（这条线上有过 LiteLLM 内存问题，升级后看 `llm-litellm-mem-watch`）。
+- 真实数据量下的迁移和建索引耗时。
+- 真实调用方（编码 agent、memory 服务）对新的 Responses 流式事件的兼容性。
+- 真实引擎：对比用的是假上游。
+- 1.99.0 写下的列表 `input` 历史，升级后续接能否带回。
+- CN 上建环境和下载 Prisma 工具链。
+
+## 名词表
+
+| 名词 | 含义 |
+|---|---|
+| order 1 / order 2 | 同一模型的本区部署 / 对区部署；order 1 失败才用 order 2 |
+| spend log | LiteLLM 的请求日志表 `LiteLLM_SpendLogs`，`previous_response_id` 历史也从这里重建 |
+| 重试记录 | `metadata.previous_models`，失败尝试的记录 |
+| 回调 / hook | config 的 `callbacks` 里按路径加载的 Python 文件 |
+| 迁移 | 升级版本时对数据库结构做的变更 |
+| key 同步 | CN 每天从 GPU4 库复制虚拟 key 的定时任务 |
