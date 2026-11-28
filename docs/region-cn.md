@@ -152,7 +152,7 @@ CN service ─► https://llm-cn.preseen.ai:18900 ─► site NAT 27.221.10.54:1
   the kernels ahead of Marlin so it falls through to Marlin W8A16.
 * qwen3.8-27b runs on SGLang 0.5.17 on the A100 (`QWEN27B_ENGINE=sglang` in `gateway.env`, script
   `run_qwen38_27b_sglang.sh`, venv `/data/derek/venv-sglang0517`, runtime files in
-  `/data/derek/sglang-runtime`); switched 2026-11-14 08:08Z for finer prefix reuse on the hybrid model:
+  `/data/derek/sglang-runtime`, weights in `/data/derek/models`, a checksum-verified copy so no other account can change them); switched 2026-11-14 08:08Z for finer prefix reuse on the hybrid model:
   SGLang keeps attention KV per token (`page_size=1`) and a Mamba state every 256 tokens
   (`mamba_track_interval`), where vLLM aligns hits to 1,584-token blocks. model_manager accepts an
   SGLang process for a slot only with `--context-length 131072` and no `--speculative-algorithm`.

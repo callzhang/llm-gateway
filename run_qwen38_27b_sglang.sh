@@ -32,7 +32,7 @@ key_tmp=$(mktemp "$key_config.XXXXXX")   # mode 600
 printf "api-key: '%s'\n" "$ENGINE_API_KEY" > "$key_tmp"
 mv -f "$key_tmp" "$key_config"
 exec /data/derek/venv-sglang0517/bin/python -m sglang.launch_server \
- --model-path /data/zhoujunjie/models/Qwen3.8-27B-NVFP4 \
+ --model-path /data/derek/models/Qwen3.8-27B-NVFP4 \
  --served-model-name qwen3.8-27b --host 127.0.0.1 --port "${VLLM_PORT:?manager port required}" \
  --tp-size 1 --quantization modelopt_fp4 --fp4-gemm-backend marlin --dtype bfloat16 \
  --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer \
