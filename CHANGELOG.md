@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### LiteLLM 1.108.19 (not deployed; ship these together with the new venv, `docs/litellm-upgrade-1.108.md`)
+- LiteLLM 1.99.0 → 1.108.19, pinned in `docs/litellm-1.108.19-requirements.txt`.
+- `retry_breadcrumb_hook.py` is removed: upstream's `log_retry` no longer copies request content, and the
+  callback would replace it. These configs on 1.99.0 would store other callers' requests again.
+- `request_priority_hook` checks a client's priority on every route and moves a top-level `priority` into
+  `extra_body`. Before, `/v1/messages` and `/v1/completions` let any key run at 0; 1.108 would also have
+  forwarded a top-level 0 and kept other top-level values for its own scheduler.
+- `budget_exceeded_status_code: 429` in both configs (upstream's new default is 422).
+- CN key sync leaves `total_spend` alone, a column 1.108 adds.
+
 ### Changed
 - gpu4: model_manager, LiteLLM, Open WebUI and the JIT warm-up are system units running as `derek` (were user units),
   so systemd-oomd's swap kills pass them over. Manage them with `sudo systemctl`.

@@ -74,6 +74,43 @@ class UngrantedKeyTests(unittest.TestCase):
                 self.assertEqual(bad, data["extra_body"]["priority"])
 
 
+class TopLevelPriorityTests(unittest.TestCase):
+    """LiteLLM 1.108 takes a top-level `priority` where 1.99 answered 500: 0 goes upstream as is,
+    and any other value is taken by LiteLLM's own scheduler.  Both are wrong here, so it moves to
+    extra_body, which reaches model_manager."""
+
+    def moved(self, data: dict) -> int:
+        self.assertNotIn("priority", data)
+        return sent(data)
+
+    def test_an_ungranted_top_level_zero_is_raised_to_one(self):
+        for call_type in ("aresponses", "acompletion"):
+            with self.subTest(call_type=call_type):
+                data = {"model": "qwen3.8-27b", "priority": 0}
+                self.assertIs(run(data, None, call_type), data)
+                self.assertEqual(1, self.moved(data))
+
+    def test_a_granted_key_cannot_ask_above_its_grant_at_the_top_level(self):
+        data = {"model": "qwen3.8-27b", "priority": 0}
+        run(data, {"gateway_priority": 10})
+        self.assertEqual(10, self.moved(data))
+
+    def test_a_granted_keys_own_lower_priority_is_not_overridden_by_its_grant(self):
+        data = {"model": "qwen3.8-27b", "priority": 200}
+        self.assertIs(run(data, {"gateway_priority": 0}), data)
+        self.assertEqual(200, self.moved(data))
+
+    def test_extra_body_wins_over_the_top_level_as_it_does_upstream(self):
+        data = {"model": "qwen3.8-27b", "priority": 9, "extra_body": {"priority": 0}}
+        run(data)
+        self.assertEqual(1, self.moved(data))
+
+    def test_a_malformed_top_level_priority_still_reaches_model_manager_to_be_rejected(self):
+        data = {"model": "qwen3.8-27b", "priority": "high"}
+        self.assertIs(run(data), data)
+        self.assertEqual("high", self.moved(data))
+
+
 class GrantValidationTests(unittest.TestCase):
     def test_an_invalid_grant_grants_nothing(self):
         for grant in ("0", -1, 256, 0.0, True, None):
@@ -90,6 +127,15 @@ class CallTypeTests(unittest.TestCase):
                 data = {"model": "qwen3-asr"}
                 self.assertIsNone(run(data, {"gateway_priority": 0}, call_type))
                 self.assertNotIn("extra_body", data)
+
+    def test_a_priority_sent_on_any_route_is_checked(self):
+        """/v1/messages and /v1/completions reach model_manager's chat gate too."""
+        for call_type in ("anthropic_messages", "atext_completion", "acreate_interaction"):
+            for data in ({"priority": 0}, {"extra_body": {"priority": 0}}):
+                with self.subTest(call_type=call_type, data=data):
+                    self.assertIs(run(data, None, call_type), data)
+                    self.assertEqual(1, sent(data))
+                    self.assertNotIn("priority", data)
 
 
 if __name__ == "__main__":

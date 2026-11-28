@@ -374,7 +374,7 @@ class HttpCancellationTests(unittest.IsolatedAsyncioTestCase):
             processor = processing.ProxyBaseLLMRequestProcessing({
                 "model": "synthetic-cancellation", "stream": False,
                 "litellm_logging_obj": SimpleNamespace(
-                    litellm_call_id="synthetic-call", litellm_params={},
+                    litellm_call_id="synthetic-call", litellm_params={}, call_type="aresponses",
                     model_call_details={"response_cost": 0},
                 ),
             })

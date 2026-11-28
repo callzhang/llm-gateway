@@ -216,6 +216,25 @@ class LiteLLMProxyStreamTests(unittest.TestCase):
         self.assertNotIn(b": ping", body)
         self.assertIn(b"previous_response_id", body)
 
+    def test_model_manager_gets_the_checked_priority_from_every_route_and_placement(self) -> None:
+        messages = [{"role": "user", "content": "hi"}]
+        routes = {
+            "/v1/chat/completions": {"messages": messages},
+            "/v1/messages": {"messages": messages, "max_tokens": 5},
+            "/v1/completions": {"prompt": "hi"},
+        }
+        for path, body in routes.items():
+            for asked, expected in ((0, 1), (200, 200)):
+                for placement in ({"priority": asked}, {"extra_body": {"priority": asked}}):
+                    # LiteLLM drops a top-level priority on /v1/completions before the hook's
+                    # result is sent; model_manager then applies its default (100).
+                    if path == "/v1/completions" and "priority" in placement:
+                        continue
+                    with self.subTest(path=path, placement=placement):
+                        open(self.bodies, "w").close()
+                        post(self.proxy_port, path, {"model": "qwen3.8-27b", **body, **placement})
+                        self.assertEqual(expected, self.last_body().get("priority"))
+
     def test_non_streaming_requests_wait_for_the_whole_answer_as_before(self) -> None:
         events = post(self.proxy_port, "/v1/chat/completions", {
             "model": "qwen3.8-27b", "messages": [{"role": "user", "content": "hi"}]})

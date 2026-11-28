@@ -199,15 +199,16 @@ window. A firing backed only by this busy signal takes a free slot and never evi
 model_manager's per-backend priority gate admits queued chat requests by the body field
 `priority` (0-255, smaller first, missing = 100; design in `docs/request-priority-gate.md`).
 Clients send it as a nested `extra_body: {extra_body: {priority: N}}` in the OpenAI SDK, which
-LiteLLM forwards as a top-level field (a top-level `priority` is dropped by LiteLLM on chat and
-answered 500 on Responses).
+LiteLLM forwards as a top-level field. A top-level `priority` is moved there by
+`request_priority_hook.py`, so both forms work.
 
 Priority 0 is a grant held by a LiteLLM virtual key, not something a client can claim:
 
 - `request_priority_hook.py` (a LiteLLM callback) reads the key's metadata. A key with
   `gateway_priority: P` runs at P when the request sends no priority, and may only send a larger
   number. Any other key may send 1-255 as before; a 0 it sends becomes 1. Malformed values are left
-  for model_manager to reject with 400.
+  for model_manager to reject with 400. What a client sends is checked on every route
+  (`/v1/messages` and `/v1/completions` too); the grant is only filled in on chat and Responses.
 - The peer region's requests reach model_manager from another host without passing that hook, so
   model_manager raises their priority to `PEER_PRIORITY_FLOOR` (1). Only this host's LiteLLM
   (a loopback caller) can deliver a 0.
