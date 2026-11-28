@@ -509,23 +509,11 @@ python3.12 -m venv .venv-tts
   'import importlib.metadata as m; print("vllm-omni", m.version("vllm-omni")); print("vllm", m.version("vllm"))'
 ```
 
-### Employees: the `stardust-tts` skill
+### Employees
 
-Employees do not get a LiteLLM key. They install the `stardust-tts` skill from
-<https://github.com/stardustai/stardust-skills> and sign in once per day in a
-browser with their `@stardust.ai` address:
-
-```bash
-python3 ~/.agents/skills/stardust-tts/scripts/synthesize.py \
-  "你好" --voice Vivian --output hello.mp3
-```
-
-That path is `tts-api.preseen.ai` → Cloudflare Access (`email_domain:
-stardust.ai`) → the `tts-auth-gateway` on `127.0.0.1:8910` → LiteLLM's internal
-TTS-only virtual key. The Skill performs Managed OAuth with PKCE and stores the
-refresh token in the operating system's secure credential store; nothing on the
-employee's machine holds a gateway credential. Design and deployment runbook:
-`docs/superpowers/specs/2026-08-19-employee-tts-skill-access.md`.
+The employee path through `tts-api.preseen.ai` was retired on 2026-11-28: its tunnel rule, DNS record, Access
+application and `llm-tts-access-gateway` are gone, so the `stardust-tts` skill's old endpoint no longer
+resolves. Speech for products is served by `ai-services`.
 
 ### Server-to-server: LiteLLM virtual key
 

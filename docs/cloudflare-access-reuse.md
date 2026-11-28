@@ -83,7 +83,7 @@ employee-facing GPU APIs now have separate applications and separate AUDs.
 
 | Hostname | Origin | Today | Natural pattern |
 |---|---|---|---|
-| `tts-api.preseen.ai` | :8910 | **Access** | A (done) |
+| `tts-api.preseen.ai` | — | retired 2026-11-28 (tunnel rule, DNS, Access app removed) | — |
 | `llm.preseen.ai` | :8080 Open WebUI | password + domain allowlist | B |
 | `llm-api.preseen.ai` | :8900 LiteLLM | static virtual key | A, or leave for machines |
 | `embed.preseen.ai` | :7997 | key | A |
