@@ -147,7 +147,10 @@ SCALE_OUT_BUSY_SUSTAIN = float(os.environ.get("SCALE_OUT_BUSY_SUSTAIN", "120"))
 # LiteLLM lists the other region's gateway as an order-2 deployment of the same
 # model; a 503 here is what moves a request across the border.  New chat work
 # is turned away once the model's summed vLLM queue (the saturation sampler's
-# last reading) reaches this depth.  Sticky hits stay to keep their prefix
+# last reading) reaches this depth times its running instances: the depth is per
+# instance, so scaling out does not make overflow easier (2026-11-22: on four A100
+# replicas a flat 4 sent ~40 requests a minute across while each replica queued
+# about one and had room to spare).  Sticky hits stay to keep their prefix
 # cache, and a request that already crossed once (OVERFLOW_HEADER, or from
 # another host — see _already_crossed) is always served.  0 disables it.
 OVERFLOW_QUEUE_DEPTH = int(os.environ.get("OVERFLOW_QUEUE_DEPTH", "0"))
@@ -4019,29 +4022,31 @@ class DynamicRouter:
             # is never sent across for a queue it would jump.  `waiting` is the
             # sampler's last reading; the live count of waiters behind it comes off it.
             waiting = self._queue_waiting.get(model_name, 0)
+            instances = max(len(backends), 1)
+            overflow_at = OVERFLOW_QUEUE_DEPTH * instances
             if (
                 OVERFLOW_QUEUE_DEPTH
                 and config.request_kind == "chat"
                 and _may_overflow(request)
-                and waiting >= OVERFLOW_QUEUE_DEPTH
+                and waiting >= overflow_at
             ):
                 ahead = waiting - sum(b.waiting_behind(priority) for b in backends)
                 sticky_ahead = (
                     sticky_backend.local_waiting - sticky_backend.waiting_behind(priority)
                     if sticky_backend is not None else None
                 )
-                if ahead >= OVERFLOW_QUEUE_DEPTH and (sticky_ahead is None or sticky_ahead > 0):
+                if ahead >= overflow_at and (sticky_ahead is None or sticky_ahead > 0):
                     self.log.info(
                         f"Overflow: {model_name} priority={priority} waiting={waiting} "
-                        f"ahead={ahead} ≥ {OVERFLOW_QUEUE_DEPTH}"
+                        f"ahead={ahead} ≥ {OVERFLOW_QUEUE_DEPTH}x{instances}"
                         + (f", sticky slot {sticky_backend.slot.slot_id} queueing "
                            f"{sticky_ahead} ahead" if sticky_backend is not None else "")
                         + " — 503 so LiteLLM tries the peer region"
                     )
                     return self._error_response(
                         503,
-                        f"'{model_name}' has {ahead} requests queued here ahead of this one; "
-                        "send it to the other region.",
+                        f"'{model_name}' has {ahead} requests queued on {instances} "
+                        "instances here ahead of this one; send it to the other region.",
                         "queue_overflow",
                     )
             if sticky_backend is not None:

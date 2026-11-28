@@ -12,6 +12,10 @@ model_manager is what moves a request across the border.  The rule here:
   * a request that already crossed (x-gateway-overflow header, set by the
     peer's LiteLLM deployment, or simply coming from another host) is never
     turned away again, so the two regions cannot bounce a request between them;
+  * OVERFLOW_QUEUE_DEPTH is per running instance: the model's queue, summed over
+    its instances, is compared with depth x instances, so scaling out does not
+    make overflow easier (2026-11-22: four A100 replicas each queueing one
+    request already sent ~40 requests a minute across with depth 4);
   * OVERFLOW_QUEUE_DEPTH=0 (the default) disables the rule entirely.
 """
 
@@ -92,7 +96,7 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("queue_overflow", (await response.json())["error"]["type"])
 
     async def test_long_queue_turns_new_work_away_with_a_503(self):
-        self.router._queue_waiting[self.MODEL] = 4
+        self.router._queue_waiting[self.MODEL] = 8  # depth 4 x 2 instances
         with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4):
             response = await self._post()
         self.assertEqual(503, response.status)
@@ -100,7 +104,7 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], self.proxied)
 
     async def test_queue_below_the_depth_is_served_locally(self):
-        self.router._queue_waiting[self.MODEL] = 3
+        self.router._queue_waiting[self.MODEL] = 7  # under depth 4 x 2 instances
         with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4):
             response = await self._post()
         self.assertEqual(200, response.status)
@@ -109,12 +113,12 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_only_requests_queued_ahead_count_toward_overflow(self):
         """A request is not sent across for a queue it would jump: the gate admits it
         before every waiter with a larger priority number."""
-        self.router._queue_waiting[self.MODEL] = 8  # depth 4 (flat on this deploy branch)
-        self.backends[0].queued = {100: 2, 200: 2}
-        self.backends[1].queued = {100: 1, 200: 3}
+        self.router._queue_waiting[self.MODEL] = 8  # depth 4 x 2 instances
+        self.backends[0].queued = {100: 3, 200: 2}
+        self.backends[1].queued = {100: 1, 200: 2}
         cases = (
             (0, 200, [0]),      # granted: all 8 queued are behind it
-            (100, 200, [0]),    # normal: 5 at 200 behind it, 3 at 100 ahead (< 4) -> local
+            (100, 200, [0]),    # normal: 4 at 200 behind it, 4 at 100 ahead (< 8) -> local
             (200, 503, []),     # eval: all 8 are ahead of it (equal priority is FIFO)
         )
         with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4):
@@ -131,6 +135,43 @@ class OverflowTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4):
             response = await self._post()
         self.assertEqual(200, response.status)
+
+    def _run_on(self, instances):
+        slots = [mm.GpuSlot(i, i, 9000 + 10 * i) for i in range(instances)]
+        backends = [
+            FakeBackend(s, self.backends[0].proxy)
+            for s in slots
+        ]
+
+        async def get_or_start(_model):
+            return backends
+
+        self.router._get_or_start = get_or_start
+
+    async def test_four_instances_each_queueing_one_request_are_served_locally(self):
+        self._run_on(4)
+        self.router._queue_waiting[self.MODEL] = 4
+        with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4):
+            response = await self._post()
+        self.assertEqual(200, response.status)
+        self.assertEqual([0], self.proxied)
+
+    async def test_four_instances_overflow_at_depth_times_four(self):
+        self._run_on(4)
+        self.router._queue_waiting[self.MODEL] = 16
+        with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4):
+            response = await self._post()
+        self.assertEqual(503, response.status)
+        self.assertIn("16 requests queued on 4 instances", (await response.json())["error"]["message"])
+        self.assertEqual([], self.proxied)
+
+    async def test_one_instance_overflows_at_the_depth(self):
+        self._run_on(1)
+        self.router._queue_waiting[self.MODEL] = 4
+        with patch.object(mm, "OVERFLOW_QUEUE_DEPTH", 4):
+            response = await self._post()
+        self.assertEqual(503, response.status)
+        self.assertEqual([], self.proxied)
 
     async def test_disabled_by_default(self):
         self.router._queue_waiting[self.MODEL] = 1000

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### gpu4 runs master (2026-11-27)
+- gpu4 stops holding back the per-instance `OVERFLOW_QUEUE_DEPTH` (below): both regions now run the same code.
+  With one running instance the threshold is unchanged; with two it is twice the configured depth.
+
 ### LiteLLM 1.108.19 (deployed to both regions 2026-11-27; record and rollback in `docs/litellm-upgrade-1.108.md`)
 - Fixes `previous_response_id`: streamed answers can be continued (they answered 410), and a list-shaped `input`
   keeps its user messages on replay.
