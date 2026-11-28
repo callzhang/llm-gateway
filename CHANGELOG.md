@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Fixed
+- Codex requests to a chat model answered 500: LiteLLM passed `client_metadata` on to the OpenAI client.
+  Every chat deployment now drops it.
+- A Responses request with `reasoning.summary` (Codex sends it) answered 400 on qwen3.8-27b; the
+  summary request is removed, the effort kept.
 - Chat text and refusal parts are forwarded as plain text parts: an empty
   media key beside the text could turn it into a media placeholder, and a replayed refusal was a template error.
 - A request the chat template cannot render (an audio or video part, say) answered 500; it is now a 400, and no
