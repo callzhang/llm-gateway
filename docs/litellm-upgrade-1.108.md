@@ -1,13 +1,13 @@
-# LiteLLM 1.99.0 → 1.108.19 升级评估（2026-11-26）
+# LiteLLM 1.99.0 → 1.108.19 升级评估（2026-11-26，11-27 合并部署分支后复测）
 
 ## 结论
 
 **建议升级，目标 `1.108.19`（1.108 LTS 线），先 GPU4、后 CN。** 但不能只换包：下面的「随升级上线的改动」要和换版本
-同时上线。改动已写好，在分支 `feat/litellm-1.108`。**这个分支不能在 1.99.0 上部署**（它去掉了重试记录修复）。
+同时上线。改动已写好，在分支 `feat/litellm-1.108`（已合入部署分支到 `ad29914`；部署分支再前进要重新合并并重测）。
+**这个分支不能在 1.99.0 上部署**（它去掉了重试记录修复）。
 没有部署、没有重启服务、没有改线上环境和线上数据库。
 
-与升级无关、现在就该做的一件事：`ca223b2`（重试记录修复）还没生效。2026-11-26 查到两区 LiteLLM 都没重启过
-（GPU4 自 11-23，CN 自 11-17），CN 的目录里还没有这个回调文件。见步骤 0。
+`ca223b2`（重试记录修复）已随两区后来的重启生效（US 11-27 16:46 PST，CN 11-27 11:17 UTC；没有查新日志行确认效果）。
 
 升级还会修好一个现网问题：1.99.0 续接 `previous_response_id` 时丢历史（见下一节）。
 
@@ -73,24 +73,40 @@ CN 的 LiteLLM 不加载 `request_priority_hook`（现状如此，本次没改�
 
 ## 测试结果
 
-`tests/` 里与 LiteLLM 相关的文件（回调加载、proxy stream、各 hook、context fit、取消、TTS 配置与接入网关）。
+整个 `tests/` 目录，2026-11-27，合并部署分支（`ad29914`）之后。
 
 | 环境 | 结果 |
 |---|---|
-| 现网 1.99.0 环境 | 120 通过 |
-| 1.108.19，仓库原样 | 118 通过，6 失败 |
-| 1.108.19，分支 `feat/litellm-1.108` | 125 通过，0 失败 |
-| 1.99.0 环境跑同一分支 | 125 通过，2 失败（重试记录回归测试：1.99 去掉回调后会串内容，符合预期） |
+| 1.108.19，分支 `feat/litellm-1.108` | 441 通过，0 失败 |
+| 1.99.0，同一分支 | 440 通过，3 失败 |
+| 1.99.0，部署分支原样（基线） | 436 通过，0 失败 |
 
-「仓库原样」的 6 个失败：
-- `test_upstream_log_retry_...` 2 个子测试：预期失败，上游已修。
-- `test_with_the_hook_...` 2 个子测试：断言用的 `Router.previous_models` 属性上游已删除。
-- `test_configured_responses_proxy_normal_request_completes`、`..._disconnect_does_not_cancel_peer`：测试替身缺 `call_type`。
+3 个失败：重试记录回归测试 2 个子测试（1.99 去掉回调后会串内容，预期）；伪造 id 返回 410 的计时断言超限 1 毫秒
+（1.0010 s 对上限 1.0 s），单独重跑该文件 3 次都通过。
 
-新环境另装了 Pillow、transformers、jinja2 才能跑 model_manager 的测试（线上 model_manager 不用这个环境）。
+11-26 用仓库原样测 1.108.19 时失败的是：上游已修导致的预期失败、断言了已删除的 `Router.previous_models`、
+取消测试的假日志对象缺 `call_type`。新环境另装了 pytest、Pillow、transformers、jinja2（线上 model_manager 不用这个环境）。
 
 key 同步脚本的改动没有自动化测试（依赖两个 Postgres 和 docker），用临时库手工验证：新→新时 CN 的
 `total_spend`、`spend` 保持原值、别的字段照常更新；新→旧同步成功。
+
+Codex 形状的请求（`client_metadata`、`reasoning.summary`、工具等，流式和非流式）在两版上都返回 200 并完成，
+发给上游的内容里没有 `client_metadata`。用的是假上游，没有用真的 Codex。
+
+### 内存和开销
+
+合成负载：真实 proxy + 临时 Postgres + 假上游，测试机本身负载很高（32 核，load 10–50），只看量级。
+
+| | 1.99.0 | 1.108.19 |
+|---|---|---|
+| 空闲内存（含 Prisma 引擎） | 1258 MB | 793 MB |
+| 2400 个请求后的峰值 | 1450 MB | 927 MB |
+| 小请求，每个的 CPU 时间 | 7–14 ms | 14–16 ms |
+| 108 KB 请求（流式），每个的 CPU 时间 | 32–49 ms | 32–34 ms |
+| 小请求串行时的中位耗时 | 6–11 ms | 10–15 ms |
+
+内存低于 GPU4 单元的上限（`MemoryHigh=3G`、`MemoryMax=4G`）。小请求开销变大，但相对模型推理耗时很小。
+长时间运行的内存增长没测。
 
 另做了新旧版本对比（真实 proxy + 临时 Postgres + 假上游，用仓库当时的 `config.yaml`）。
 
@@ -125,36 +141,15 @@ TTS 的 `voice` / `instructions` / `response_format` 和 ASR 表单字段的转�
 
 命令不会打印连接串。两区的 `gateway.env` 里 `DATABASE_URL` 都没有引号。
 
-### 步骤 0：让现版本的修复先生效（独立于升级）
-
-GPU4：
-
-```bash
-systemctl --user restart llm-litellm
-```
-
-CN 的目录落后于 HEAD（`previous_response_hook.py`、key 同步脚本也不同），所以这一步只传两个文件
-（`config.cn.yaml` 与现网只差回调那两行）：
-
-```bash
-git -C /home/derek/Projects/llm-gateway archive ca223b2 retry_breadcrumb_hook.py config.cn.yaml | ssh a100-1 'tar -x -C /data/derek/llm-gateway'
-```
-
-```bash
-ssh a100-1 'sudo systemctl restart llm-litellm'
-```
-
-重启各有几十秒 502。之后的清理见 [spend-log-retry-leak.md](spend-log-retry-leak.md)。
-
 ### GPU4
 
-在 `/home/derek/Projects/llm-gateway`。这是线上目录：到第 5 步才合并分支，合并后马上做第 6 步，别让旧版本带着
+在 `/home/derek/Projects/llm-gateway`。LiteLLM 是系统级单元（`sudo systemctl`）。这是线上目录：到第 5 步才合并分支，合并后马上做第 6 步，别让旧版本带着
 去掉回调的 config 重启。
 
 1. 建环境（不影响线上）：
 
 ```bash
-V=/home/derek/venvs/litellm-1.108.19; /home/derek/miniforge3/envs/llm-gateway-vllm/bin/python -m venv $V && PYTHONNOUSERSITE=1 $V/bin/pip install -r .worktrees/litellm-1.108/docs/litellm-1.108.19-requirements.txt && PYTHONNOUSERSITE=1 PATH=$V/bin:$PATH $V/bin/prisma generate --schema $V/lib/python3.12/site-packages/litellm/proxy/schema.prisma
+V=/home/derek/venvs/litellm-1.108.19; /home/derek/miniforge3/envs/llm-gateway-vllm/bin/python -m venv $V && PYTHONNOUSERSITE=1 $V/bin/pip install -r .worktrees/litellm-1.108/docs/litellm-1.108.19-requirements.txt && PYTHONNOUSERSITE=1 PRISMA_BINARY_CACHE_DIR=$V/share/prisma-python PATH=$V/bin:$PATH $V/bin/prisma generate --schema $V/lib/python3.12/site-packages/litellm/proxy/schema.prisma
 ```
 
 2. 备份库（不含 spend log 数据，避免再复制一份含他人内容的日志）：
@@ -167,18 +162,28 @@ mkdir -p -m 700 ~/litellm-backups; url=$(grep '^DATABASE_URL=' gateway.env | cut
 4. 迁移（1.99 可继续服务）。要求退出码 0：
 
 ```bash
-(export DATABASE_URL="$(grep '^DATABASE_URL=' gateway.env | cut -d= -f2-)" LITELLM_MASTER_KEY="$(grep '^LITELLM_MASTER_KEY=' gateway.env | cut -d= -f2-)"; V=/home/derek/venvs/litellm-1.108.19; PYTHONNOUSERSITE=1 PATH=$V/bin:$PATH DISABLE_SCHEMA_UPDATE=false $V/bin/litellm --skip_server_startup)
+(export DATABASE_URL="$(grep '^DATABASE_URL=' gateway.env | cut -d= -f2-)" LITELLM_MASTER_KEY="$(grep '^LITELLM_MASTER_KEY=' gateway.env | cut -d= -f2-)"; V=/home/derek/venvs/litellm-1.108.19; PYTHONNOUSERSITE=1 PRISMA_BINARY_CACHE_DIR=$V/share/prisma-python PATH=$V/bin:$PATH DISABLE_SCHEMA_UPDATE=false $V/bin/litellm --skip_server_startup)
 ```
 
 5. 把 `feat/litellm-1.108` 合并进当前部署分支（`git merge --no-ff feat/litellm-1.108`），在新 venv 里跑一遍上面的测试。
-6. `gateway.env` 加 `GATEWAY_PY_BIN=/home/derek/venvs/litellm-1.108.19/bin`，`systemctl --user restart llm-litellm`。
+6. `gateway.env` 加两行，然后重启。第二行必须有：单元文件里的 `PRISMA_BINARY_CACHE_DIR` 指向旧环境，
+   `gateway.env` 的值会盖过它。
+
+   ```
+   GATEWAY_PY_BIN=/home/derek/venvs/litellm-1.108.19/bin
+   PRISMA_BINARY_CACHE_DIR=/home/derek/venvs/litellm-1.108.19/share/prisma-python
+   ```
+
+```bash
+sudo systemctl restart llm-litellm
+```
 7. 验证：版本号是 1.108.19；chat、流式 responses、TTS、ASR 各一次；`previous_response_id` 续接按下面两条查：
    第 1 轮用列表 `input` 给一个暗号，第 2 轮让模型复述（非流式、流式各一次，流式用 `response.completed` 的 id），
    都要返回 200 且答出暗号；
-   日志里没有 `does not exist in the current database`；spend log 有新行；
+   日志里没有 `does not exist in the current database`；spend log 有新行；用 Codex 打一次；看单元的 `MemoryPeak`；
    `sudo systemctl start llm-litellm-key-sync.service`（在 A100 上）仍显示 `synced keys=...`。
 
-回滚：删掉 `GATEWAY_PY_BIN` 行，**保留 `DISABLE_SCHEMA_UPDATE=true`**，`git revert -m 1` 那个合并提交（把重试记录回调带回来，
+回滚：删掉第 6 步加的两行，**保留 `DISABLE_SCHEMA_UPDATE=true`**，`git revert -m 1` 那个合并提交（把重试记录回调带回来，
 否则 1.99 会再次串日志），重启。数据库不回退。
 
 ### CN（A100）
@@ -210,10 +215,15 @@ ssh a100-1 'cd /data/derek/llm-gateway && V=/data/derek/venv-litellm-1.108.19 &&
 
 4. A100 的 `gateway.env`：先抄下原来的 `GATEWAY_PY_BIN`、`PRISMA_BINARY_CACHE_DIR`，改为
    `/data/derek/venv-litellm-1.108.19/bin`、`/data/derek/venv-litellm-1.108.19/share/prisma-python`。
-5. 传代码并重启（约 70 秒 502）。整个 HEAD 会一并带去 CN 目录还没有的其他改动，先确认它们可以上线：
+5. 传代码、更新 key 同步脚本并重启（约 70 秒 502）。11-27 时 CN 的 `model_manager.py` 和部署分支不一致，传整个 HEAD
+   之前先看清差异。key 同步单元跑的是 checkout **根目录**的 `sync_cn_litellm_keys.sh`，不是 `scripts/` 里那份：
 
 ```bash
 git -C /home/derek/Projects/llm-gateway archive HEAD | ssh a100-1 'tar -x -C /data/derek/llm-gateway'
+```
+
+```bash
+ssh a100-1 'cd /data/derek/llm-gateway && cp sync_cn_litellm_keys.sh sync_cn_litellm_keys.sh.pre-1.108 && cp scripts/sync_cn_litellm_keys.sh sync_cn_litellm_keys.sh'
 ```
 
 ```bash
@@ -222,12 +232,12 @@ ssh a100-1 'sudo systemctl restart llm-litellm'
 
 6. 验证同 GPU4 第 7 步，再跑 `sudo systemctl start llm-litellm-key-sync.service`。
 
-回滚：`gateway.env` 两个变量改回原值，把 revert 后的代码传过去，`sudo systemctl restart llm-litellm`。
+回滚：`gateway.env` 两个变量改回原值，同步脚本换回 `sync_cn_litellm_keys.sh.pre-1.108`，把 revert 后的代码传过去，`sudo systemctl restart llm-litellm`。
 数据库不回退；旧版 `/data/derek/venv-litellm` 在确认稳定前不删。
 
 ## 没有验证的
 
-- 真实负载下的内存和 CPU（这条线上有过 LiteLLM 内存问题，升级后看 `llm-litellm-mem-watch`）。
+- 真实流量下长时间运行的内存和 CPU（这条线上有过 LiteLLM 内存问题，升级后看 `llm-litellm-mem-watch`）。
 - 真实数据量下的迁移和建索引耗时。
 - 真实调用方（编码 agent、memory 服务）对新的 Responses 流式事件的兼容性。
 - 真实引擎：对比用的是假上游。

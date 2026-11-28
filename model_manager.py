@@ -32,6 +32,7 @@ import heapq
 import itertools
 import fcntl
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -46,13 +47,14 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 import aiohttp
+import jinja2
 from aiohttp import web
 
 from asr_adapter import service as asr_service
 from asr_adapter.cpu_pool import CpuAsrWorker, CpuWorkerError
 from asr_adapter.engine import EngineError, pcm16_wav
-from context_fit import ContextFitter
-from image_fit import ImageTooLarge, fit_images, has_images
+from context_fit import ContextFitter, normalize_text_parts
+from image_fit import ImageTooLarge, fit_images, has_images, has_video_or_audio, unsafe_image_url
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 # 300→1200 (2026-09-04): real traffic for both chat models arrives in bursts
@@ -450,13 +452,16 @@ def _guaranteed_uuid(gpu_id: int) -> "str | None":
     return uuid if uuid in GUARANTEED_GPU_UUIDS else None
 
 
+def _clear_cooling(uuid: str) -> bool:
+    """True while a card that recently resisted clearing is left aside."""
+    failed_at = _gpu_clear_failed_at.get(uuid)
+    return failed_at is not None and time.monotonic() - failed_at < GPU_CLEAR_RETRY_SECONDS
+
+
 def _gpu_guaranteed(gpu_id: int) -> bool:
     """True for a guaranteed card that has not recently resisted clearing."""
     uuid = _guaranteed_uuid(gpu_id)
-    if uuid is None:
-        return False
-    failed_at = _gpu_clear_failed_at.get(uuid)
-    return failed_at is None or time.monotonic() - failed_at >= GPU_CLEAR_RETRY_SECONDS
+    return uuid is not None and not _clear_cooling(uuid)
 
 
 def _gpu_compute_pids(gpu: str) -> list[int]:
@@ -469,25 +474,42 @@ def _gpu_compute_pids(gpu: str) -> list[int]:
 
 
 def _describe_pid(pid: int) -> str:
-    """"<user>: <command>" for the log; arguments are cut off, they can hold secrets."""
+    """"<user>: <program>" for the log; no argument of another user's process is
+    recorded, any of them can be a secret."""
     try:
         user = pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_name
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            argv = f.read().decode("utf-8", errors="ignore").split("\0")
-        return f"{user}: {' '.join(argv[:3])[:160]}"
+        with open(f"/proc/{pid}/comm", "r", errors="ignore") as f:
+            return f"{user}: {f.read().strip()}"
     except (OSError, KeyError):
         return "unknown process"
 
 
-def _signal_pid(pid: int, sig: int) -> None:
-    """Signal one process, through passwordless sudo if another user owns it."""
+def _pid_started(pid: int) -> str | None:
+    """Start time of the process (field 22 of /proc/pid/stat), which tells it
+    apart from a later one with the same number.  None if it is gone."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+        return data[data.rindex(b")") + 2:].split()[19].decode()
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _signal_pid(pid: int, sig: int, started: str | None) -> None:
+    """Signal the process that was seen on the card (`started`), not whatever has
+    its number now; through passwordless sudo if another user owns it.  The start
+    time is read right before each signal (the gateway's Python has no
+    os.pidfd_open, and sudo takes only a number)."""
+    if started is None or _pid_started(pid) != started:
+        return
     try:
         os.kill(pid, sig)
     except ProcessLookupError:
         pass
     except PermissionError:
-        subprocess.run(["sudo", "-n", "kill", f"-{int(sig)}", str(pid)],
-                       capture_output=True, timeout=10)
+        if _pid_started(pid) == started:
+            subprocess.run(["sudo", "-n", "kill", f"-{int(sig)}", str(pid)],
+                           capture_output=True, timeout=10)
 
 
 def _gpu_vllm_pids(gpu_id: int) -> "list[tuple[int, str]]":
@@ -579,6 +601,85 @@ def _read_vllm_cmdline(pid: int) -> list[str] | None:
             return [arg.decode("utf-8", errors="ignore") for arg in f.read().split(b"\x00") if arg]
     except (FileNotFoundError, PermissionError):
         return None
+
+
+def _read_process_env(pid: int, name: str) -> str | None:
+    """One variable from a running process's initial environment."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            entries = f.read().split(b"\x00")
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+    prefix = name.encode() + b"="
+    return next(
+        (e[len(prefix):].decode("utf-8", errors="ignore") for e in entries if e.startswith(prefix)),
+        None,
+    )
+
+
+# Local addresses, as /proc/net/tcp{,6} writes them, at which a request to
+# 127.0.0.1 arrives: loopback and the wildcards.
+_LOOPBACK_LISTEN = frozenset({
+    "0100007F", "00000000", "0" * 32, "0000000000000000FFFF00000100007F",
+})
+
+
+class ForeignListener(RuntimeError):
+    """A slot port is answered by something other than the engine just started."""
+
+
+def _listening_inodes(port: int) -> set[str]:
+    inodes = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as f:
+                rows = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        for fields in map(str.split, rows):
+            address, _, hex_port = fields[1].partition(":")
+            if fields[3] == "0A" and int(hex_port, 16) == port and address in _LOOPBACK_LISTEN:
+                inodes.add(fields[9])
+    return inodes
+
+
+def _listener_is_ours(port: int, pgid: int | None) -> bool:
+    """True when every socket listening for the port belongs to process group
+    `pgid`.  A /health answer alone does not say who gave it, and every forwarded
+    request carries the engine key."""
+    wanted = _listening_inodes(port)
+    if not wanted or pgid is None:
+        return False
+    held = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or GpuBackend._pgid_of(int(entry)) != pgid:
+            continue
+        try:
+            for fd in os.listdir(f"/proc/{entry}/fd"):
+                try:
+                    target = os.readlink(f"/proc/{entry}/fd/{fd}")
+                except OSError:
+                    continue
+                if target.startswith("socket:["):
+                    held.add(target[len("socket:["):-1])
+        except OSError:
+            continue
+    return wanted <= held
+
+
+def _adopted_engine_has_gateway_key(pid: int) -> bool:
+    """Whether a running engine accepts the current ENGINE_API_KEY and only that.
+
+    The environment alone does not say how the engine was launched, so the command
+    line must also show the launch scripts' way of taking the key.
+    """
+    args = _read_vllm_cmdline(pid)
+    if not args or any(a == "--api-key" or a.startswith("--api-key=") for a in args):
+        return False
+    key_option = (
+        "--config" if "sglang.launch_server" in args else "require_api_key.RequireApiKey"
+    )
+    return key_option in args and _read_process_env(pid, "ENGINE_API_KEY") == ENGINE_API_KEY
 
 
 def _cmdline_option(args: list[str], option: str) -> str | None:
@@ -725,6 +826,13 @@ def _parse_vision_gpus(spec: str) -> "frozenset[int] | None":
     return frozenset(int(x) for x in spec.split(",") if x.strip())
 
 
+def _parse_flag(name: str, spec: str) -> bool:
+    """An on/off setting: unset or "0" is off, "1" is on, anything else an error."""
+    if spec.strip() not in ("", "0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, not {spec!r}")
+    return spec.strip() == "1"
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     """Runtime and request contract for one dynamically scheduled model."""
@@ -744,6 +852,9 @@ class ModelConfig:
     # None: no restriction (every instance as its run script has it).  Empty:
     # this host takes no images for the model.  From VISION_GPU_IDS.
     vision_gpu_ids: frozenset[int] | None = None
+    # Images must be base64 data: URLs: the engine then fetches nothing, and every
+    # image passes the shrink above.  From IMAGE_URLS_INLINE_ONLY.
+    inline_images_only: bool = False
     # Scheduled by VRAM budget instead of taking a GPU slot: a small model that
     # shares a GPU with whichever primary model owns the slot.  It is admitted
     # only where the GPU's current free VRAM covers its min-viable footprint,
@@ -817,6 +928,8 @@ MODEL_CONFIGS: dict[str, ModelConfig] = {
         # == longest_edge in run_qwen38_27b.sh and SGLANG_IMAGE_MAX_PIXELS.
         max_image_pixels=4_194_304,
         vision_gpu_ids=_parse_vision_gpus(os.environ.get("VISION_GPU_IDS", "")),
+        inline_images_only=_parse_flag(
+            "IMAGE_URLS_INLINE_ONLY", os.environ.get("IMAGE_URLS_INLINE_ONLY", "")),
     ),
     "qwen3-tts-1.7b-customvoice": ModelConfig(
         "run_qwen3_tts_1_7b_customvoice.sh",
@@ -1024,7 +1137,6 @@ CORESIDENT_PORT_BASE = int(os.environ.get("GPU_CORESIDENT_PORT_BASE", "9100"))
 # POST /v1/audio/transcriptions is chunked here (<=30 s, silence trimmed, loops
 # dropped) and each chunk goes to the co-resident GPU lane, or — when no GPU has
 # room — to a CPU worker process (same model, transformers bf16, ~6x realtime).
-ASR_GPU_API_KEY = os.environ.get("ASR_GPU_API_KEY", "local-qwen36")   # run_qwen3_asr_0_6b.sh --api-key
 ASR_GPU_CHUNK_TIMEOUT = float(os.environ.get("ASR_GPU_CHUNK_TIMEOUT", "120"))
 ASR_CPU_PYTHON = os.environ.get("ASR_CPU_PYTHON", "/home/derek/miniforge3/bin/python")
 ASR_CPU_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asr_adapter", "cpu_worker.py")
@@ -1101,6 +1213,26 @@ MIN_USEFUL_MODEL_LEN = int(os.environ.get("MIN_USEFUL_MODEL_LEN", "16384"))
 # Safety haircut applied to vLLM's estimated-max-len before retrying, so we sit
 # comfortably under the limit (KV must hold ≥1 full sequence plus a little slack).
 MODEL_LEN_RETRY_FRACTION = float(os.environ.get("MODEL_LEN_RETRY_FRACTION", "0.92"))
+
+# What the engines accept from this process, and nothing else: generated at deployment, set in
+# gateway.env, handed to the engines through their environment (never their command line).
+ENGINE_API_KEY = os.environ.get("ENGINE_API_KEY", "")
+# What the gateway's LiteLLMs (this host's and the peer region's) send to this
+# process.  Without it anyone who can connect to the port uses the models past
+# the virtual keys, their limits and the usage records.  main() requires it.
+GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY", "")
+
+
+def _has_gateway_key(request: web.Request) -> bool:
+    if not GATEWAY_API_KEY:
+        return True
+    return hmac.compare_digest(
+        request.headers.get("Authorization", "").encode(), f"Bearer {GATEWAY_API_KEY}".encode())
+
+
+def _engine_auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {ENGINE_API_KEY}"}
+
 
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -1182,8 +1314,13 @@ ADMIN_HTML = """<!doctype html>
 <div id="meta" class="meta"></div>
 <script>
 async function post(path, payload) {
-  await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
-                     body: JSON.stringify(payload)});
+  const key = sessionStorage.getItem('gatewayKey') || prompt('GATEWAY_API_KEY');
+  if (!key) return;
+  const r = await fetch(path, {method:'POST',
+                               headers:{'Content-Type':'application/json', 'Authorization':'Bearer ' + key},
+                               body: JSON.stringify(payload)});
+  if (r.status === 401) { sessionStorage.removeItem('gatewayKey'); alert('wrong key'); }
+  else sessionStorage.setItem('gatewayKey', key);
   setTimeout(refresh, 300);
 }
 function opts(models, current) {
@@ -1359,6 +1496,23 @@ def translate_thinking_budget_for_sglang(parsed_body: dict) -> bool:
     parsed_body["custom_params"] = {**custom_params, "thinking_budget": budget}
     parsed_body["custom_logit_processor"] = SGLANG_QWEN38_THINKING_BUDGET_PROCESSOR
     return True
+
+
+# The engine routes a chat model serves; the engines have many more (native, admin, weight loading).
+CHAT_ENGINE_PATHS = frozenset({"/v1/chat/completions", "/v1/completions", "/v1/responses"})
+# Request fields an engine turns into code or loader arguments.  Only the gateway may set them.
+GATEWAY_ONLY_FIELDS = ("custom_logit_processor", "mm_processor_kwargs", "chat_template")
+
+
+def gateway_only_field(parsed_body: dict) -> str | None:
+    """The first field of a client body that only the gateway may set, or None."""
+    for field in GATEWAY_ONLY_FIELDS:
+        if parsed_body.get(field) is not None:
+            return field
+    template_kwargs = parsed_body.get("chat_template_kwargs")
+    if isinstance(template_kwargs, dict) and template_kwargs.get("chat_template") is not None:
+        return "chat_template_kwargs.chat_template"
+    return None
 
 
 def request_priority(parsed_body: dict | None) -> int:
@@ -1793,47 +1947,59 @@ class GpuBackend:
         self.log.error(msg)
         raise RuntimeError(msg)
 
-    def _foreign_gpu_pids(self, uuid: str) -> list[int]:
-        """Processes on this card that belong to no running backend of ours."""
-        ours = self.router.live_pgids()
-        found = []
-        for pid in _gpu_compute_pids(uuid):
+    def _foreign_of(self, pids: list[int], ours: set) -> dict[int, str | None]:
+        """{pid: start time} of those processes that are outside our process groups."""
+        found = {}
+        for pid in pids:
+            started = _pid_started(pid)
             pgid = self._pgid_of(pid)
             if pid > 1 and pid != os.getpid() and pgid is not None and pgid not in ours:
-                found.append(pid)
+                found[pid] = started
         return found
 
     async def _clear_guaranteed_gpu(self) -> None:
         """Stop everything that is not ours on a guaranteed card before a primary
-        spawn.  Raises if something is still there afterwards.  Without a router
-        there is no way to tell our processes apart, so nothing is touched."""
-        if self.coresident or self.router is None:
+        spawn.  Raises if something is still there afterwards, or if that cannot
+        be checked.  Without a router there is no way to tell our processes apart,
+        so nothing is touched.  nvidia-smi and sudo run off the event loop: other
+        cards keep streaming meanwhile."""
+        if self.coresident or self.router is None or not GUARANTEED_GPU_UUIDS:
             return
-        uuid = _guaranteed_uuid(self.gpu_id)
+        uuid = await asyncio.to_thread(_gpu_uuid, self.gpu_id)
         if uuid is None:
+            raise RuntimeError(
+                f"GPU {self.gpu_id}: cannot tell which card this is, so not whether to clear it")
+        if uuid not in GUARANTEED_GPU_UUIDS:
             return
+
+        async def foreign() -> dict:
+            pids = await asyncio.to_thread(_gpu_compute_pids, uuid)
+            # Read after the query: an engine of ours that came up during it is ours.
+            return self._foreign_of(pids, self.router.live_pgids())
+
         try:
-            pids = self._foreign_gpu_pids(uuid)
+            pids = await foreign()
             for sig, grace in ((signal.SIGTERM, GPU_CLEAR_TERM_SECONDS),
                                (signal.SIGKILL, GPU_CLEAR_KILL_SECONDS)):
                 if not pids:
                     break
-                for pid in pids:
+                for pid, started in pids.items():
                     self.log.warning(
                         f"Guaranteed GPU {self.gpu_id}: {signal.Signals(sig).name} "
                         f"PID {pid} ({_describe_pid(pid)})"
                     )
-                    _signal_pid(pid, sig)
+                    await asyncio.to_thread(_signal_pid, pid, sig, started)
                 deadline = time.monotonic() + grace
                 while True:
-                    pids = self._foreign_gpu_pids(uuid)
+                    pids = await foreign()
                     if not pids or time.monotonic() >= deadline:
                         break
                     await asyncio.sleep(1)
         except (OSError, subprocess.SubprocessError) as exc:
             _gpu_clear_failed_at[uuid] = time.monotonic()
-            self.log.warning(f"Guaranteed GPU {self.gpu_id}: could not clear it: {exc}")
-            return
+            msg = f"Guaranteed GPU {self.gpu_id}: could not check that it is clear: {exc}"
+            self.log.warning(msg)
+            raise RuntimeError(msg) from exc
         if pids:
             _gpu_clear_failed_at[uuid] = time.monotonic()
             msg = (
@@ -2150,6 +2316,11 @@ class GpuBackend:
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as r:
                     if r.status == 200:
+                        if not _listener_is_ours(self.vllm_port, spawn_pid):
+                            await self._kill_process_locked()
+                            raise ForeignListener(
+                                f"port {self.vllm_port} is answered by a process that is not the "
+                                f"engine just started on slot {self.slot.slot_id}")
                         elapsed = int(time.monotonic() - started)
                         self.log.info(
                             f"vLLM ready in {elapsed}s "
@@ -2166,6 +2337,8 @@ class GpuBackend:
                             f"health poll: HTTP {r.status} after "
                             f"{int(time.monotonic()-started)}s"
                         )
+            except ForeignListener:
+                raise
             except Exception as exc:
                 self.log.warning(
                     f"health poll: {type(exc).__name__}: {exc} after "
@@ -2337,7 +2510,7 @@ class GpuBackend:
             form.add_field("file", wav, filename="chunk.wav", content_type="audio/wav")
             async with self._session.post(
                 f"{self.vllm_base}/v1/audio/transcriptions", data=form,
-                headers={"Authorization": f"Bearer {ASR_GPU_API_KEY}"},
+                headers=_engine_auth_headers(),
                 timeout=aiohttp.ClientTimeout(total=ASR_GPU_CHUNK_TIMEOUT),
             ) as resp:
                 if resp.status != 200:
@@ -2446,8 +2619,9 @@ class GpuBackend:
         target_url  = f"{self.vllm_base}{request.path_qs}"
         fwd_headers = {
             k: v for k, v in request.headers.items()
-            if k.lower() not in _HOP_BY_HOP | {"host", "content-length"}
+            if k.lower() not in _HOP_BY_HOP | {"host", "content-length", "authorization"}
         }
+        fwd_headers.update(_engine_auth_headers())
         # Normalise the body before it reaches vLLM.  Parsed once, re-serialised
         # only if something actually changed.
         if body:
@@ -2956,11 +3130,16 @@ class DynamicRouter:
         )
 
     @staticmethod
-    def _slot_rank(slot: GpuSlot) -> "tuple[bool, float]":
+    def _slot_rank(slot: GpuSlot) -> "tuple[int, float]":
+        """Higher first: healthy guaranteed cards, then other cards, then a card
+        that is cooling down after resisting clearing, then an unreadable one."""
         free = _gpu_free_mib(slot.gpu_id)
         if free is None:
-            return (False, -1.0)   # unreadable, guaranteed or not
-        return (_gpu_guaranteed(slot.gpu_id), free)
+            return (-1, -1.0)
+        uuid = _guaranteed_uuid(slot.gpu_id)
+        if uuid is None:
+            return (1, free)
+        return (0 if _clear_cooling(uuid) else 2, free)
 
     def _allowed_gpus(self, model_name: str) -> "set[int] | None":
         """GPU IDs this model may occupy, or None if unconstrained.
@@ -3579,6 +3758,10 @@ class DynamicRouter:
             if request.remote not in ("127.0.0.1", "::1"):
                 return web.json_response(
                     {"error": "admin actions are loopback-only"}, status=403)
+            # Other accounts on this host reach loopback too, and starting a model
+            # can stop their processes on a guaranteed card.
+            if not _has_gateway_key(request):
+                return self._error_response(401, "missing or wrong gateway API key", "authentication_error")
             try:
                 data = await request.json()
                 slot_id = int(data["slot_id"])
@@ -3596,6 +3779,11 @@ class DynamicRouter:
                 fn = self.admin_start if action == "start" else self.admin_switch
                 self._track_admin(fn(slot_id, model))
             return web.json_response({"ok": True, "action": action, "slot_id": slot_id})
+
+        # Everything above is health, status and loopback-only admin; the rest uses the models.
+        if not _has_gateway_key(request):
+            self.log.warning(f"Unauthorized {request.method} {request.path!r} from {request.remote}")
+            return self._error_response(401, "missing or wrong gateway API key", "authentication_error")
 
         body = await request.read()
         model_name = self._extract_model(body, request.headers.get("Content-Type", ""))
@@ -3625,9 +3813,17 @@ class DynamicRouter:
         config = self.model_configs[model_name]
         invalid = self._validate_model_request(request, parsed_body, config)
         if invalid is not None:
+            self.log.warning(
+                f"Refused {request.method} {request.path!r} for {model_name} from {request.remote}: "
+                f"{invalid.text}"
+            )
             return invalid
         if config.request_kind == "transcription":
             return await self._handle_transcription(request, body, model_name)
+        # The engine gets what was checked, not the client's bytes (repeated keys),
+        # with text-like parts in the one form the count and every engine read.
+        normalize_text_parts(parsed_body)
+        body = json.dumps(parsed_body).encode()
         if config.request_kind == "speech":
             # The public speech contract is deliberately MP3-only.  vLLM-Omni
             # can encode it natively, and LiteLLM 1.86.2 labels every speech
@@ -3718,17 +3914,25 @@ class DynamicRouter:
             approx_chars = sum(
                 len(m.get("content", "")) if isinstance(m.get("content"), str)
                 else sum(
-                    len(p.get("text", "") or "")
-                    for p in (m.get("content") or []) if isinstance(p, dict)
+                    len(p["text"])
+                    for p in (m.get("content") or []) if isinstance(p, dict) and isinstance(p.get("text"), str)
                 )
                 for m in msgs if isinstance(m, dict)
             )
 
         # Images: only the instances on vision_gpu_ids can take them, and they
         # never cross regions.  A host without such a GPU answers 400, or 503 to
-        # work its peer handed over, so the peer's caller can retry there.  A
-        # handed-over image is refused even with vision here: the peer's region
-        # does not take images.
+        # work its peer handed over, so the peer's caller can retry there.  A host
+        # with one answers a handed-over inline image 503 too (the peer lacked
+        # capacity) and any other handed-over image 400 (the peer refused its URL).
+        # Whatever the vision setting: an image may only be inline or on the web.
+        if config.request_kind == "chat" and isinstance(parsed_body, dict) and unsafe_image_url(parsed_body):
+            return self._invalid_request("image URLs must be data: or http(s):")
+
+        # A region that takes images inline only takes no other media at all.
+        if config.inline_images_only and isinstance(parsed_body, dict) and has_video_or_audio(parsed_body):
+            return self._invalid_request("video and audio are not accepted on this endpoint")
+
         vision_gpus: "frozenset[int] | None" = None
         if (
             config.vision_gpu_ids is not None
@@ -3737,14 +3941,19 @@ class DynamicRouter:
             and has_images(parsed_body)
         ):
             crossed = _already_crossed(request)
-            if not config.vision_gpu_ids and crossed:
+            if crossed and (not config.vision_gpu_ids
+                            or not unsafe_image_url(parsed_body, inline_only=True)):
                 return self._error_response(
-                    503, f"'{model_name}' takes no images in this region; retry later.", "gpu_busy")
+                    503, f"'{model_name}' takes no images handed over to this region; retry later.", "gpu_busy")
             if not config.vision_gpu_ids or crossed:
                 return self._invalid_request(
                     f"'{model_name}' does not accept images on this endpoint.")
             vision_gpus = config.vision_gpu_ids
             request[KEEP_LOCAL] = True
+
+        if (config.inline_images_only and isinstance(parsed_body, dict)
+                and unsafe_image_url(parsed_body, inline_only=True)):
+            return self._invalid_request("images must be base64 data: URLs on this endpoint")
 
         # Shrink oversized images before the engine sees them.  Off the event
         # loop, a few at a time: a 128-megapixel source takes ~400 MB decoded.
@@ -3763,7 +3972,13 @@ class DynamicRouter:
         # oldest turns changes the first user message, which would re-pin the
         # conversation to another slot and lose its prefix cache.
         if config.request_kind == "chat" and isinstance(parsed_body, dict):
-            if await self.context_fitter.fit(parsed_body, model_name):
+            try:
+                fitted = await self.context_fitter.fit(parsed_body, model_name, config.max_image_pixels)
+            except jinja2.exceptions.TemplateError as exc:
+                # The model's template cannot render it (an audio or video part,
+                # say).  No engine gets it, and none is started for it.
+                return self._invalid_request(f"{model_name} cannot take this request: {exc}")
+            if fitted:
                 body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
 
         # A backend can vanish BEFORE it streams a single byte — a crash-recycle
@@ -4031,14 +4246,23 @@ class DynamicRouter:
                     "POST /v1/audio/transcriptions"
                 )
             return None
-        if config.request_kind != "speech":
-            return None
-        if request.method != "POST" or request.path != "/v1/audio/speech":
+        if config.request_kind == "speech":
+            if request.method != "POST" or request.path != "/v1/audio/speech":
+                return self._invalid_request(
+                    "Speech models are only available through POST /v1/audio/speech"
+                )
+        elif request.method != "POST" or request.path not in CHAT_ENGINE_PATHS:
             return self._invalid_request(
-                "Speech models are only available through POST /v1/audio/speech"
+                "Chat models are only available through POST "
+                + ", ".join(sorted(CHAT_ENGINE_PATHS))
             )
         if not isinstance(parsed_body, dict):
             return self._invalid_request("Request body must be a JSON object")
+        field = gateway_only_field(parsed_body)
+        if field is not None:
+            return self._invalid_request(f"'{field}' is not accepted", param=field)
+        if config.request_kind != "speech":
+            return None
         input_text = parsed_body.get("input")
         if not isinstance(input_text, str) or not input_text.strip():
             return self._invalid_request(
@@ -4115,7 +4339,8 @@ class DynamicRouter:
             )
             return
         model_name, config = match
-        if not _adopted_vllm_matches_config(pid, model_name, config, slot.gpu_id):
+        if not (_adopted_engine_has_gateway_key(pid)
+                and _adopted_vllm_matches_config(pid, model_name, config, slot.gpu_id)):
             self.log.warning(
                 f"Slot {slot.slot_id}: refusing to adopt stale vLLM pid={pid} "
                 f"for {model_name}; stopping it so current runtime config applies"
@@ -4153,6 +4378,13 @@ class DynamicRouter:
                 f"within {self.ADOPT_BOOT_WAIT}s — skipping"
             )
             return
+        if not _listener_is_ours(slot.port, GpuBackend._pgid_of(pid)):
+            self.log.warning(
+                f"Slot {slot.slot_id}: port {slot.port} is not served by vLLM pid={pid} alone; "
+                "stopping that engine instead of adopting it"
+            )
+            await _terminate_adopted_vllm(pid)
+            return
         b = self._make_backend(model_name, slot, served_name=served_name)
         await b.start()                # init session + idle watchdog
         b._adopted_pid = pid
@@ -4168,6 +4400,10 @@ class DynamicRouter:
 
 async def main() -> None:
     log = logging.getLogger("model_manager")
+    if not ENGINE_API_KEY:
+        raise SystemExit("ENGINE_API_KEY is not set (gateway.env); refusing to start.")
+    if not GATEWAY_API_KEY:
+        raise SystemExit("GATEWAY_API_KEY is not set (gateway.env); refusing to start.")
 
     slots  = [GpuSlot(sid, gid, port) for sid, gid, port in GPU_SLOTS]
     router = DynamicRouter(slots, MODEL_CONFIGS, ContextFitter.from_config())

@@ -12,6 +12,7 @@ import json
 import unittest
 from unittest import mock
 
+import jinja2
 import yaml
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -124,6 +125,71 @@ class ContextFitInRouterTests(RouterHarness):
         raw = json.dumps({"model": MODEL, "prompt": "x" * 50_000, "max_tokens": 3000}).encode()
         await self.client.post("/v1/completions", data=raw, headers={"Content-Type": "application/json"})
         self.assertEqual([raw], self.forwarded)
+
+
+class ImagesCountTowardTheWindow(RouterHarness):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.router.model_configs[MODEL] = mm.replace(self.router.model_configs[MODEL], max_image_pixels=4_194_304)
+
+    async def test_the_output_cap_leaves_room_for_the_image(self):
+        image = {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}   # size unknown: 4096 tokens
+        payload = {"model": MODEL, "messages": [{"role": "user", "content": [image]}], "max_tokens": 8000}
+        await self.client.post("/v1/chat/completions", json=payload)
+        sent = json.loads(self.forwarded[0])
+        self.assertEqual(CTX - (1 + 4) - 4096 - 512, sent["max_tokens"])
+
+    async def test_a_dropped_turn_gives_back_its_image(self):
+        image = {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+        history = [{"role": "user", "content": [image]}, {"role": "assistant", "content": "a" * 3000}]
+        payload = {"model": MODEL, "messages": history + [{"role": "user", "content": "x" * 100}], "max_tokens": 3000}
+        await self.client.post("/v1/chat/completions", json=payload)
+        sent = json.loads(self.forwarded[0])
+        self.assertEqual([{"role": "user", "content": "x" * 100}], sent["messages"])
+        self.assertEqual(3000, sent["max_tokens"])
+
+
+class TextPartsReachTheEngineAsText(RouterHarness):
+    async def test_text_like_parts_are_rewritten_and_nothing_else_is(self):
+        """So the engine renders, and the count reads, the same thing whichever engine it is."""
+        kept = [{"type": "text", "uuid": "u", "text": "cached", "image_url": None}, {"type": "text", "text": 5},
+                {"type": "image_url", "image_url": {"url": "data:,"}},
+                # SGLang leaves a thinking part out of the prompt; rewriting it would put it in.
+                {"type": "thinking", "thinking": "t", "text": None}]
+        parts = [{"type": "text", "text": "a", "video": None, "image_url": "file:///x"},
+                 {"type": "refusal", "refusal": "no"}]
+        payload = {"model": MODEL, "messages": [{"role": "user", "content": parts + kept, "audio": None}]}
+        await self.client.post("/v1/chat/completions", json=payload)
+        sent = json.loads(self.forwarded[0])["messages"][0]
+        self.assertEqual([{"type": "text", "text": "a"}, {"type": "text", "text": "no"}] + kept,
+                         sent["content"])
+        self.assertIsNone(sent["audio"])
+
+    async def test_a_responses_input_keeps_its_part_types(self):
+        payload = {"model": MODEL, "input": [{"role": "user", "content": [{"type": "input_text", "text": "a"}]}]}
+        await self.client.post("/v1/responses", json=payload)
+        self.assertEqual(payload["input"], json.loads(self.forwarded[0])["input"])
+
+
+class UnrenderableRequests(RouterHarness):
+    def make_fitter(self) -> ContextFitter:
+        fitter = super().make_fitter()
+
+        def refuse(*_args, **_kwargs):
+            raise jinja2.exceptions.TemplateError("Unsupported multimodal content item.")
+
+        fitter._limits[MODEL].tokenizer._tokenizer.apply_chat_template = refuse
+        return fitter
+
+    async def test_a_request_the_template_refuses_is_a_400_before_any_engine(self):
+        """It answered 500 (an audio or video part).  It goes to no engine: one that loads media would
+        fetch the URL, and a cold model would be started for a request that cannot succeed."""
+        self.router._get_or_start = mock.AsyncMock()
+        response = await self.client.post("/v1/chat/completions", json={"model": MODEL, "messages": [
+            {"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": "data:,"}}]}]})
+        self.assertEqual(400, response.status)
+        self.assertIn("Unsupported multimodal content item", (await response.json())["error"]["message"])
+        self.router._get_or_start.assert_not_awaited()
 
 
 class ContextFitWithRealTokenizerTests(unittest.IsolatedAsyncioTestCase):

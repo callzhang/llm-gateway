@@ -297,17 +297,22 @@ The stack is grouped under `systemd/llm-gateway.target`. Each service declares
 all members, while each keeps its own `Restart=` supervision and log file.
 
 ```bash
-systemctl --user start    llm-gateway.target   # bring up the whole stack
-systemctl --user stop     llm-gateway.target   # tear it all down
-systemctl --user restart  llm-gateway.target
-systemctl --user status   llm-gateway.target
+sudo systemctl start    llm-gateway.target   # bring up the whole stack
+sudo systemctl stop     llm-gateway.target   # tear it all down
+sudo systemctl restart  llm-gateway.target
+systemctl status        llm-gateway.target
 # components remain independently controllable, e.g.:
-systemctl --user restart  llm-litellm
+sudo systemctl restart  llm-litellm
 ```
 
+These are system units running as `derek`: systemd-oomd spares only root-owned cgroups from swap
+kills, and it repeatedly killed model_manager when it was a user unit (2026-11). While
+`llm-jit-warmup` is failed, `sudo systemctl restart --job-mode=ignore-dependencies llm-model-manager`
+skips the warm-up.
+
 Members: `llm-model-manager` · `llm-litellm` · `llm-open-webui`. Install/enable
-everything with `systemd/install.sh` (linger is enabled so the stack survives
-logout and starts at boot).
+everything with `systemd/install.sh`. The TTS access gateway was retired on 2026-11-27
+(`ai-services` calls LiteLLM for speech); its code is kept.
 
 ### Loopback-only binding
 
@@ -484,10 +489,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now llm-litellm-mem-watc
 # model_manager alone (listens on :8002)
 python3 model_manager.py
 
-# with systemd (user service)
-cp systemd/llm-model-manager.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now llm-model-manager
+# with systemd (system services running as derek)
+systemd/install.sh && sudo systemctl start llm-gateway.target
 
 # LiteLLM proxy (reads config.yaml, listens on :8900)
 litellm --config config.yaml --port 8900
@@ -578,8 +581,7 @@ Operational checks:
 ```bash
 curl -sS http://127.0.0.1:8002/admin/status
 nvidia-smi
-journalctl --user -u llm-model-manager -u llm-litellm -u llm-open-webui -n 100
-systemctl --user status llm-tts-access-gateway
+journalctl -u llm-model-manager -u llm-litellm -u llm-open-webui -n 100
 ```
 
 The status payload includes each chat model's configured vLLM sequence ceiling at
@@ -594,7 +596,7 @@ commit:
 
 ```bash
 git switch --detach e922645
-systemctl --user restart llm-model-manager llm-litellm llm-open-webui
+sudo systemctl restart llm-model-manager llm-litellm llm-open-webui
 ```
 
 Return to the deployed branch with `git switch master` and restart the same
@@ -603,6 +605,25 @@ without the model registration and launcher they are inert and consume no GPU
 memory.
 
 ## Environment variables
+
+### Engine key (required)
+
+`ENGINE_API_KEY` in `gateway.env`, generated per host (`openssl rand -hex 32`). The engines take it from their
+environment and accept nothing else outside `/health` and `/metrics`: vLLM through
+`engine_plugins/require_api_key.py`, SGLang through `engine-api-key.yaml`, which its launch script writes (mode 600).
+Only model_manager holds it; callers' `Authorization` headers never reach an engine. After changing it, restart
+model_manager, which stops the running engines.
+
+### Gateway key (required)
+
+`GATEWAY_API_KEY` in `gateway.env`, the **same value in both regions** (`openssl rand -hex 32`). The LiteLLM
+deployments send it (`config.yaml`, `config.cn.yaml`), including to the peer region, and model_manager answers 401
+to any request that uses a model without it, and to the `/admin` slot actions (loopback only; the dashboard asks for
+the key). Health, status and model-list GETs stay open. Callers use LiteLLM with
+a virtual key; they do not connect to `:8002`. To change it: set it in both files, restart both LiteLLMs and both
+model_managers.
+
+The SGLang engine prints its start arguments; `sglang_plugins/friday_redact_keys.py` masks the keys there.
 
 ### GPU slot configuration
 

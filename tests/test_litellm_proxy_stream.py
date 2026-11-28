@@ -96,6 +96,17 @@ def post(port: int, path: str, payload: dict) -> list[tuple[float, bytes]]:
     return events
 
 
+class ChatDeploymentConfigTests(unittest.TestCase):
+    def test_every_chat_deployment_drops_client_metadata(self) -> None:
+        for name in ("config.yaml", "config.cn.yaml"):
+            with open(os.path.join(REPO, name)) as f:
+                models = yaml.safe_load(f)["model_list"]
+            chat = [m["litellm_params"] for m in models if m["litellm_params"]["model"].startswith("custom_openai/")]
+            self.assertTrue(chat, name)
+            for params in chat:
+                self.assertIn("client_metadata", params.get("additional_drop_params", []), f"{name}: {params['model']}")
+
+
 @unittest.skipUnless(os.path.exists(LITELLM), "needs the gateway env's litellm")
 class LiteLLMProxyStreamTests(unittest.TestCase):
     @classmethod
@@ -107,12 +118,16 @@ class LiteLLMProxyStreamTests(unittest.TestCase):
         for name in repo_cfg["litellm_settings"]["callbacks"]:
             shutil.copy(os.path.join(REPO, name.split(".")[0] + ".py"), cls.tmp)
         upstream_port, cls.proxy_port = free_port(), free_port()
+        entry = next(m for m in repo_cfg["model_list"] if m["model_name"] == "qwen3.8-27b")
+        deployment = entry["litellm_params"]
         cls.bodies = os.path.join(cls.tmp, "bodies.jsonl")
         settings = {**repo_cfg["litellm_settings"], "sse_keepalive_ping_interval_seconds": INTERVAL}
         config = {
             "model_list": [{"model_name": "qwen3.8-27b", "litellm_params": {
                 "model": "custom_openai/qwen3.8-27b", "api_base": f"http://127.0.0.1:{upstream_port}/v1",
-                "api_key": "x", "allowed_openai_params": ["reasoning_effort"]}}],
+                "api_key": "x", "allowed_openai_params": ["reasoning_effort"],
+                "additional_drop_params": deployment.get("additional_drop_params", [])},
+                "model_info": {"reasoning_effort": entry["model_info"]["reasoning_effort"]}}],
             "router_settings": {"num_retries": 0, "disable_cooldowns": True},
             "litellm_settings": settings,
             "general_settings": {"master_key": MASTER_KEY},
@@ -171,6 +186,17 @@ class LiteLLMProxyStreamTests(unittest.TestCase):
         body = self.last_body()
         self.assertEqual(4096, body["thinking_token_budget"])
         self.assertEqual(1, body["priority"], "the master key holds no grant, so 0 becomes 1")
+
+    def test_a_codex_request_with_client_metadata_is_answered(self) -> None:
+        events = post(self.proxy_port, "/v1/responses", {
+            "model": "qwen3.8-27b", "input": "hi", "stream": True,
+            "client_metadata": {"x-codex-installation-id": "test"},
+            "reasoning": {"effort": "medium", "summary": "auto"}})
+        body = b"".join(chunk for _, chunk in events[1:])
+        self.assertEqual(b"HTTP 200", events[0][1], body)
+        self.assertIn(b'"type":"response.completed"', body)
+        self.assertNotIn("client_metadata", self.last_body())
+        self.assertEqual("medium", self.last_body()["reasoning_effort"])
 
     def test_streaming_chat_gets_headers_and_pings_before_the_first_token(self) -> None:
         events = post(self.proxy_port, "/v1/chat/completions", {

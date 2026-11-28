@@ -1,3 +1,6 @@
+# model_info.id is pinned to what LiteLLM derived on 2026-11-27: previous_response_id names it, and
+# otherwise changing any litellm_params (the api_key included) would end every stored chain.  A new
+# deployment needs an id of its own (openssl rand -hex 32).
 model_list:
 
   # ── Qwen3.6-35B-A3B heretic NVFP4 (uncensored, multimodal) ──────────────
@@ -10,12 +13,16 @@ model_list:
   - model_name: qwen3.6-35b-a3b-heretic
     litellm_params:
       model: custom_openai/qwen3.6-35b-a3b-heretic
+      # Codex sends client_metadata; the Responses->chat bridge passed it to the
+      # OpenAI client, which has no such argument: every Codex request answered 500.
+      additional_drop_params: ["client_metadata"]
       api_base: http://127.0.0.1:8002/v1
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       max_tokens: 32768
       timeout: 600
       stream_timeout: 600
     model_info:
+      id: 6cb32b9f46f4274d37269a7c6e5258aa0f4120d036b89f80344b528d87a07b09
       # Must match --max-model-len in run_qwen36_35b_heretic.sh.  This said
       # 122880 while vLLM was actually loaded with far less, so context_fit let
       # over-length requests through and they failed at the backend.
@@ -40,8 +47,11 @@ model_list:
   - model_name: qwen3.8-27b
     litellm_params:
       model: custom_openai/qwen3.8-27b
+      # Codex sends client_metadata; the Responses->chat bridge passed it to the
+      # OpenAI client, which has no such argument: every Codex request answered 500.
+      additional_drop_params: ["client_metadata"]
       api_base: http://127.0.0.1:8002/v1
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       max_tokens: 32768
       timeout: 600
       stream_timeout: 600
@@ -53,6 +63,7 @@ model_list:
       # does LiteLLM move on to order 2 below — see docs/region-cn.md.
       order: 1
     model_info: &qwen38_27b_info
+      id: dfe5c6d1faff58fc46e3658ed6e35d8183584bac4032552170fa8b9235f1fe52
       # Must match --max-model-len in run_qwen38_27b.sh (raised 65536→131072
       # on 2026-09-02; model native is 262144).
       max_input_tokens: 131072
@@ -76,8 +87,11 @@ model_list:
   - model_name: qwen3.8-27b
     litellm_params:
       model: custom_openai/qwen3.8-27b
+      # Codex sends client_metadata; the Responses->chat bridge passed it to the
+      # OpenAI client, which has no such argument: every Codex request answered 500.
+      additional_drop_params: ["client_metadata"]
       api_base: os.environ/PEER_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       max_tokens: 32768
       timeout: 600
       stream_timeout: 600
@@ -92,20 +106,24 @@ model_list:
   # MP3 so LiteLLM's audio/mpeg header always matches the returned bytes.
   # No LiteLLM upgrade or VoiceDesign/Base route is required for this deployment.
   - model_name: qwen3-tts-1.7b-customvoice
+    model_info:
+      id: 7a9bbafabdaa3c037623dc0584f40555c597fa8c98ca5dfaa240e3dd5b358714
     litellm_params:
       model: hosted_vllm/qwen3-tts-1.7b-customvoice
       api_base: http://127.0.0.1:8002/v1
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 600
       order: 1
 
   # Backup in the CN region.  TTS needs a whole card here (~29.3 GiB), so while
   # both slots are busy model_manager answers 503 gpu_busy and LiteLLM moves on.
   - model_name: qwen3-tts-1.7b-customvoice
+    model_info:
+      id: f6c237a5972eac33a0ddc9c9405afe4554fbeec21ece3114aca94515e119b414
     litellm_params:
       model: hosted_vllm/qwen3-tts-1.7b-customvoice
       api_base: os.environ/PEER_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 600
       extra_headers: {x-gateway-overflow: "1"}
       order: 2
@@ -122,21 +140,23 @@ model_list:
     litellm_params:
       model: openai/qwen3-asr-0.6b
       api_base: http://127.0.0.1:8002/v1
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 1800
       order: 1
     model_info:
+      id: 81e5dc0ccf75ed086b67932b9af930216335c792c79d3409a57f7e6dfe44ef9c
       mode: audio_transcription
 
   - model_name: qwen3-asr
     litellm_params:
       model: openai/qwen3-asr-0.6b
       api_base: os.environ/PEER_GATEWAY_API_BASE
-      api_key: local-qwen36
+      api_key: os.environ/GATEWAY_API_KEY
       timeout: 1800
       extra_headers: {x-gateway-overflow: "1"}
       order: 2
     model_info:
+      id: fa4cb72e800cfe1d0df012c56e2c7e72e5f1032090af4ce9d825060563eb76bd
       mode: audio_transcription
 
   # No external fallback by design — every model is served locally through

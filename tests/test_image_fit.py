@@ -14,6 +14,7 @@ import model_manager as mm
 from tests.test_model_manager_context_fit import MODEL, RouterHarness
 
 MAX = 10_000
+ENGINE_PIXELS = 4_194_304
 
 
 def url(width, height, fmt="PNG", mode="RGB", **save):
@@ -29,6 +30,37 @@ def opened(data_url):
 def chat(image_url):
     return {"model": MODEL, "messages": [{"role": "user", "content": [
         {"type": "text", "text": "what is this"}, {"type": "image_url", "image_url": {"url": image_url}}]}]}
+
+
+class ImageTokenTests(unittest.TestCase):
+    """The expected counts are what the engine reported as prompt_tokens, less the text (A100, 2026-11-27)."""
+
+    def test_inline_images_are_counted_by_their_size(self):
+        for size, tokens in (((640, 240), 160), ((730, 550), 391), ((900, 500), 448), ((2048, 2048), 4096),
+                             ((2364, 1773), 4070), ((10, 10), 64)):
+            self.assertEqual(tokens, image_fit.image_tokens(url(*size), ENGINE_PIXELS), size)
+
+    def test_larger_images_count_at_the_cap(self):
+        self.assertLessEqual(image_fit.image_tokens(url(4000, 3000), ENGINE_PIXELS), ENGINE_PIXELS // 1024)
+        self.assertGreater(image_fit.image_tokens(url(4000, 3000), ENGINE_PIXELS), ENGINE_PIXELS // 1024 - 150)
+
+    def test_an_image_whose_size_is_unknown_counts_as_the_largest(self):
+        for value in ("https://example.com/a.png", "data:image/png;base64,AAAA", "data:image/png,AAAA", None):
+            self.assertEqual(ENGINE_PIXELS // 1024, image_fit.image_tokens(value, ENGINE_PIXELS), value)
+
+
+class ImageDetectionTests(unittest.TestCase):
+    def test_any_part_that_names_an_image_is_one_whatever_its_type(self):
+        """Not left to how an engine reads a part whose declared type does not fit; only an empty field is ignored."""
+        def has(part):
+            return image_fit.has_images({"messages": [{"role": "user", "content": [part]}]})
+
+        for part in ({"image_url": {"url": "data:,"}}, {"type": "text", "text": "x", "image_url": "file:///x"},
+                     {"type": "audio_url", "image_url": {"url": "data:,"}}, {"type": "text", "uuid": "u", "image_url": None}):
+            self.assertTrue(has(part), part)
+        self.assertFalse(has({"type": "text", "text": "x", "image_url": None}))
+        self.assertTrue(image_fit.unsafe_image_url({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "x", "image_url": "file:///x"}]}]}))
 
 
 class FitImagesTests(unittest.TestCase):
@@ -62,6 +94,18 @@ class FitImagesTests(unittest.TestCase):
         body = chat(url(400, 100, "JPEG", exif=exif.tobytes()))
         image_fit.fit_images(body, MAX)
         self.assertEqual(6, opened(body["messages"][0]["content"][1]["image_url"]["url"]).getexif()[0x0112])
+
+    def test_an_oversized_image_in_a_mode_png_cannot_hold_is_still_shrunk(self):
+        data = chat(url(300, 200, "TIFF", "CMYK"))
+        self.assertEqual(1, image_fit.fit_images(data, MAX))
+        small = opened(data["messages"][0]["content"][1]["image_url"]["url"])
+        self.assertLessEqual(small.width * small.height, MAX)
+
+    def test_an_oversized_image_that_cannot_be_re_encoded_is_refused(self):
+        big = url(300, 200)
+        with mock.patch.object(Image.Image, "save", side_effect=OSError("cannot write mode")), \
+                self.assertRaises(image_fit.ImageTooLarge):
+            image_fit._shrunk_data_url(big, MAX)
 
     def test_decompression_bomb_is_refused(self):
         with mock.patch.object(Image, "MAX_IMAGE_PIXELS", 1_000), self.assertRaises(image_fit.ImageTooLarge):

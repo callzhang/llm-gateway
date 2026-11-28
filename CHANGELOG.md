@@ -12,7 +12,49 @@
 - `budget_exceeded_status_code: 429` in both configs (upstream's new default is 422).
 - CN key sync leaves `total_spend` alone, a column 1.108 adds.
 
+### Changed
+- gpu4: model_manager, LiteLLM, Open WebUI and the JIT warm-up are system units running as `derek` (were user units),
+  so systemd-oomd's swap kills pass them over. Manage them with `sudo systemctl`.
+- gpu4: the TTS access gateway is retired (no requests; `ai-services` calls LiteLLM for speech). Code kept.
+
+### Fixed
+- Chat text and refusal parts are forwarded as plain text parts: an empty
+  media key beside the text could turn it into a media placeholder, and a replayed refusal was a template error.
+- A request the chat template cannot render (an audio or video part, say) answered 500; it is now a 400, and no
+  engine gets it.
+- The inline-only host refused a message that merely carried `"audio": null` or an audio reference.
+
+### Fixed
+- Codex requests to a chat model answered 500: LiteLLM passed `client_metadata` on to the OpenAI client.
+  Every chat deployment now drops it.
+- A Responses request with `reasoning.summary` (Codex sends it) answered 400 on qwen3.8-27b; the
+  summary request is removed, the effort kept.
+- Chat text and refusal parts are forwarded as plain text parts: an empty
+  media key beside the text could turn it into a media placeholder, and a replayed refusal was a template error.
+- A request the chat template cannot render (an audio or video part, say) answered 500; it is now a 400, and no
+  engine gets it.
+- The inline-only host refused a message that merely carried `"audio": null` or an audio reference.
+
+### Fixed
+- context_fit counts image tokens (one per 32x32 pixels of the size the engine resizes to; the largest when the size
+  is unknown, as for an http URL). It counted only the placeholder, so a near-full conversation with a large image
+  could exceed the context window.
+
+### Security
+- model_manager requires `GATEWAY_API_KEY` for every request that uses a model (README); it accepted any caller that
+  could connect, and added the engine key itself.
+- The SGLang engine log no longer holds the API keys; the manager forwards to a slot port only when the engine it
+  started is what listens there.
+- Guaranteed-GPU clearing: signals only the process it saw (not a reused PID), logs no process arguments, fails the
+  start when it cannot check the card, and runs off the event loop.
+- An `image_url` part without a `type` (vLLM's shorthand) is treated as an image.
+- An image URL must be `data:` or `http(s):`; a path or `file://` URL is a 400.
+- A100: SGLang's internal sockets bind loopback, the gateway unit takes only host and tailnet connections, and
+  `/data/derek` is no longer world-writable (`docs/region-cn.md`).
+
 ### Added
+- A100: `qwen3.8-27b` takes images again, on card 1's instance, as base64 `data:` URLs only
+  (`IMAGE_URLS_INLINE_ONLY=1`). A handed-over inline image answers 503 on a host that takes images (`docs/vision.md`).
 - `qwen3.8-27b`: model_manager shrinks inline (data: URL) images over 4,194,304 pixels on the CPU before forwarding
   (`image_fit.py`). The engine caps images there anyway but resized them on the GPU, where very large sources (up to
   128 megapixels on the CN key) ran the A100's SGLang out of memory and killed the instance. Images by http URL pass
@@ -25,6 +67,14 @@
 ### Changed
 - Engines start with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so a GPU id means the nvidia-smi index. On the A100 this needs
   the pins renumbered in the same deployment (`docs/gpu-guaranteed.md`).
+
+### Security
+- Chat models accept only `POST /v1/chat/completions`, `/v1/completions` and `/v1/responses`, and a client body may
+  not set `custom_logit_processor`, `mm_processor_kwargs` or `chat_template`.
+- The engines accept only `ENGINE_API_KEY` (new, required in `gateway.env`; model_manager and the launch scripts
+  refuse to start without it), on every route but `/health` and `/metrics`. model_manager replaces the caller's
+  `Authorization` with it. It replaces the fixed key in the launch scripts and `ASR_GPU_API_KEY`. A restart stops
+  engines started with anything else instead of adopting them.
 
 ### Fixed
 - `retry_breadcrumb_hook`: spend logs no longer hold other callers' requests. LiteLLM 1.99 kept retry breadcrumbs,

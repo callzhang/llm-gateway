@@ -603,8 +603,9 @@ class BackendTranscribeChunkTests(unittest.IsolatedAsyncioTestCase):
             return web.json_response({"text": "你好"})
 
         backend = await self._serve(handler)
-        self.assertEqual("你好", await backend.transcribe_chunk(b"RIFFwav", "zh"))
-        self.assertEqual(f"Bearer {model_manager.ASR_GPU_API_KEY}", seen["auth"])
+        with patch.object(model_manager, "ENGINE_API_KEY", "engine-key"):
+            self.assertEqual("你好", await backend.transcribe_chunk(b"RIFFwav", "zh"))
+        self.assertEqual("Bearer engine-key", seen["auth"])
         self.assertEqual((backend.served_name, "zh", b"RIFFwav"), (seen["model"], seen["lang"], seen["file"]))
         self.assertEqual(0, backend._active_requests)
 

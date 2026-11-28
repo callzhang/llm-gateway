@@ -271,7 +271,7 @@ class LiteLlmConfigTests(unittest.TestCase):
         local, peer = sorted((m["litellm_params"] for m in matches), key=lambda p: p["order"])
         for params in (local, peer):
             self.assertEqual(f"hosted_vllm/{MODEL_NAME}", params["model"])
-            self.assertEqual("local-qwen36", params["api_key"])
+            self.assertEqual("os.environ/GATEWAY_API_KEY", params["api_key"])
             self.assertEqual(600, params["timeout"])
         self.assertEqual((1, "http://127.0.0.1:8002/v1"), (local["order"], local["api_base"]))
         self.assertEqual((2, "os.environ/PEER_GATEWAY_API_BASE"), (peer["order"], peer["api_base"]))
@@ -297,14 +297,15 @@ class LiteLlmConfigTests(unittest.TestCase):
 
 
 class AccessServiceContractTests(unittest.TestCase):
-    def test_gateway_target_and_installer_include_access_gateway(self):
+    def test_gateway_target_and_installer_leave_out_the_retired_access_gateway(self):
         target = (REPO_ROOT / "systemd/llm-gateway.target").read_text(
             encoding="utf-8"
         )
         installer = (REPO_ROOT / "systemd/install.sh").read_text(encoding="utf-8")
 
-        self.assertIn("llm-tts-access-gateway.service", target)
-        self.assertIn("llm-tts-access-gateway.service", installer)
+        self.assertNotIn("llm-tts-access-gateway.service", target)
+        self.assertNotIn("SERVICES=(\n  llm-tts", installer)
+        self.assertFalse((REPO_ROOT / "systemd/llm-tts-access-gateway.service").exists())
 
     def test_open_webui_trusts_only_cloudflare_identity_header(self):
         launcher = (REPO_ROOT / "run_open_webui.sh").read_text(encoding="utf-8")

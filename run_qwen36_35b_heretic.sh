@@ -33,6 +33,10 @@ GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:?VLLM_GPU_MEM_UTIL is required}
 MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-81920}   # model_manager lowers this on a tight GPU to fit KV
 MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:?VLLM_MAX_NUM_SEQS is required}
 
+# The engine accepts only model_manager's key, read from the environment (engine_plugins/require_api_key.py).
+: "${ENGINE_API_KEY:?set ENGINE_API_KEY in gateway.env}"
+export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/engine_plugins${PYTHONPATH:+:$PYTHONPATH}"
+
 # served-model-name kept distinct so you can A/B against the stock 35b.
 # To make this a drop-in replacement instead, rename to: qwen3.6-35b-a3b
 # vLLM needs BOTH --tool-call-parser and --enable-auto-tool-choice: with
@@ -52,7 +56,7 @@ MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:?VLLM_MAX_NUM_SEQS is required}
 exec "$VLLM_BIN" serve AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
-  --api-key local-qwen36 \
+  --middleware require_api_key.RequireApiKey \
   --served-model-name qwen3.6-35b-a3b-heretic \
   --quantization compressed-tensors \
   --gpu-memory-utilization ${GPU_MEM_UTIL} \

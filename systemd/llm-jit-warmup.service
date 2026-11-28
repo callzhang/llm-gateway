@@ -11,6 +11,10 @@ Before=llm-model-manager.service
 # silently dropping a job (it bit llm-model-manager.service once already).
 
 [Service]
+User=derek
+Group=derek
+Environment=HOME=/home/derek
+Environment=LANG=en_US.UTF-8
 Type=oneshot
 # Deliberately NOT RemainAfterExit=yes.  With it the unit stays "active" after
 # the first run, so every later `systemctl start llm-gateway.target` skips the

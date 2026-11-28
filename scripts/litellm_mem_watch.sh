@@ -14,10 +14,8 @@ THRESHOLD_BYTES=${THRESHOLD_BYTES:-2147483648}   # 2 GiB of memory.current
 MIN_GAP_SECONDS=${MIN_GAP_SECONDS:-600}          # at most one capture per 10 min
 CAPTURE_ROOT=$GATEWAY_DIR/logs/mem-captures
 
-user_systemctl() { systemctl --user --machine="$OWNER@.host" "$@"; }
-
-cgroup=$(user_systemctl show llm-litellm.service -p ControlGroup --value)
-main_pid=$(user_systemctl show llm-litellm.service -p MainPID --value)
+cgroup=$(systemctl show llm-litellm.service -p ControlGroup --value)
+main_pid=$(systemctl show llm-litellm.service -p MainPID --value)
 [ -n "$cgroup" ] && [ "$main_pid" != 0 ] || exit 0
 cg_dir=/sys/fs/cgroup$cgroup
 current=$(cat "$cg_dir/memory.current")

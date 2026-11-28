@@ -4,6 +4,10 @@ After=llm-litellm.service
 PartOf=llm-gateway.target
 
 [Service]
+User=derek
+Group=derek
+Environment=HOME=/home/derek
+Environment=LANG=en_US.UTF-8
 Type=simple
 WorkingDirectory=/home/derek/Projects/llm-gateway
 EnvironmentFile=-/home/derek/Projects/llm-gateway/gateway.env

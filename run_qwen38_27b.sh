@@ -109,10 +109,14 @@ else
            --mm-processor-kwargs '{"size":{"longest_edge":4194304,"shortest_edge":65536}}')
 fi
 
+# The engine accepts only model_manager's key, read from the environment (engine_plugins/require_api_key.py).
+: "${ENGINE_API_KEY:?set ENGINE_API_KEY in gateway.env}"
+export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/engine_plugins${PYTHONPATH:+:$PYTHONPATH}"
+
 exec "$VLLM_BIN" serve gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090 \
   --host 127.0.0.1 \
   --port ${VLLM_PORT:-9010} \
-  --api-key local-qwen36 \
+  --middleware require_api_key.RequireApiKey \
   --served-model-name qwen3.8-27b \
   --revision 35fd99fb8434ef70ee61372df3face5174bed2c8 \
   --gpu-memory-utilization ${GPU_MEM_UTIL} \

@@ -134,9 +134,9 @@ if ! has_artefact "$CACHE_DIR/flashinfer" -type f -name '*.so' \
   rm -f "$MARKDIR"/*.ok 2>/dev/null
 fi
 
-if systemctl --user is-active --quiet llm-model-manager.service; then
+if systemctl is-active --quiet llm-model-manager.service; then
   echo "ERROR: llm-model-manager is running — it would fight this script for the GPU."
-  echo "       systemctl --user stop llm-model-manager.service, then re-run."
+  echo "       sudo systemctl stop llm-model-manager.service, then re-run."
   exit 1
 fi
 

@@ -20,6 +20,12 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(frozenset(), mm._parse_vision_gpus("none"))
         self.assertEqual(frozenset({0, 2}), mm._parse_vision_gpus("0, 2"))
 
+    def test_inline_only_flag(self):
+        for spec, expected in (("", False), ("0", False), ("1", True)):
+            self.assertIs(expected, mm._parse_flag("X", spec))
+        with self.assertRaises(ValueError):
+            mm._parse_flag("X", "yes")
+
 
 class ImageRoutingTests(RouterHarness):
     async def _setup(self, vision_gpus):
@@ -72,6 +78,76 @@ class ImageRoutingTests(RouterHarness):
         await self._setup(frozenset())
         response = await self.client.post("/v1/responses", json={"model": MODEL, "input": [
             {"role": "user", "content": [{"type": "input_image", "image_url": "https://example.com/a.png"}]}]})
+        self.assertEqual(400, response.status)
+
+    async def test_an_image_may_only_be_inline_or_on_the_web(self):
+        await self._setup(None)
+        for url in ("/etc/passwd", "file:///etc/passwd", "ftp://host/a.png", "a.png", 7):
+            for image in ({"url": url}, url):
+                payload = body({"type": "image_url", "image_url": image})
+                self.assertEqual(400, (await self._post(payload)).status, image)
+        self.assertEqual([], self.forwarded)
+        for url in ("data:image/png;base64,AA==", "HTTPS://example.com/a.png"):
+            self.assertEqual(200, (await self._post(body({"type": "image_url", "image_url": {"url": url}}))).status)
+
+    async def test_an_inline_only_host_takes_nothing_but_base64_data_urls(self):
+        await self._setup(frozenset({0}))
+        self.router.model_configs[MODEL] = mm.replace(self.router.model_configs[MODEL], inline_images_only=True)
+        for url in ("https://example.com/a.png", "http://127.0.0.1:1/a.png", "data:image/png,AA==",
+                    "DATA:image/png;base64,AA=="):
+            for image in ({"url": url}, url):
+                payload = body({"type": "image_url", "image_url": image})
+                self.assertEqual(400, (await self._post(payload)).status, image)
+        self.assertEqual([], self.asked)
+        inline = body({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}})
+        self.assertEqual(200, (await self._post(inline)).status)
+        self.assertEqual([frozenset({0})], self.asked)
+
+    async def test_a_handed_over_inline_image_stays_retryable_on_a_vision_host(self):
+        """The peer refused it for lack of capacity, not for what it is: a 400 would tell its caller to give up."""
+        await self._setup(frozenset({0}))
+        inline = body({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}})
+        self.assertEqual(503, (await self._post(inline, **{mm.OVERFLOW_HEADER: "1"})).status)
+        self.assertEqual([], self.forwarded)
+
+    async def test_a_part_without_a_type_may_not_name_a_server_path(self):
+        await self._setup(None)
+        for part in ({"image_url": {"url": "file:///etc/passwd"}}, {"type": "text", "uuid": "u", "image_url": "file:///x"}):
+            self.assertEqual(400, (await self._post(body(part))).status, part)
+        self.assertEqual([], self.forwarded)
+
+    async def test_a_part_without_a_type_is_still_an_image(self):
+        """vLLM takes an `image_url` key with no type (or with a uuid) as an image."""
+        await self._setup(frozenset({0}))
+        self.assertEqual(200, (await self._post(body({"image_url": {"url": "https://example.com/a.png"}}))).status)
+        self.assertEqual([frozenset({0})], self.asked)
+
+    async def test_an_inline_only_host_takes_no_video_or_audio(self):
+        """Their URLs would be loaded by the engine as image URLs would, and none of its models take them."""
+        await self._setup(frozenset({0}))
+        self.router.model_configs[MODEL] = mm.replace(self.router.model_configs[MODEL], inline_images_only=True)
+        for part in ({"type": "video_url", "video_url": {"url": "file:///x.mp4"}},
+                     {"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}},
+                     {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}},
+                     {"video_url": {"url": "data:video/mp4;base64,AA=="}},
+                     {"type": "text", "audio_url": {"url": "data:audio/wav;base64,AA=="}},
+                     {"type": "bogus", "video": "data:,"}):
+            response = await self._post(body(part))
+            self.assertEqual(400, response.status, part)
+        self.assertEqual([], self.forwarded)
+
+    async def test_only_content_parts_count_as_video_or_audio(self):
+        """An SDK replays an assistant message with `"audio": null`, or with a reference to its audio."""
+        await self._setup(frozenset({0}))
+        self.router.model_configs[MODEL] = mm.replace(self.router.model_configs[MODEL], inline_images_only=True)
+        history = [{"role": "user", "content": "hi", "audio": None},
+                   {"role": "assistant", "content": [{"type": "text", "text": "x", "video": None}], "audio": None},
+                   {"role": "assistant", "content": "y", "audio": {"id": "audio_1"}},
+                   {"role": "user", "content": "again"}]
+        response = await self._post({"model": MODEL, "messages": history})
+        self.assertEqual(200, response.status)
+        response = await self.client.post("/v1/responses", json={"model": MODEL, "input": [
+            {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}]})
         self.assertEqual(400, response.status)
 
     async def test_unrestricted_models_are_unchanged(self):
