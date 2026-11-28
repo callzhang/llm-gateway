@@ -4,6 +4,11 @@
 
 **两区已在 2026-11-27 升级到 `1.108.19`。** 下面「部署记录」是实际做法和回滚命令；其后各节是升级前的评估原文。
 
+**现状（2026-11-27 深夜）**：全部改动已合进 `master`（callzhang/llm-gateway#19、#20）；gpu4 的运行目录检出 `master`，
+CN 的代码文件与 `master` 一致。部署分支 `deploy/gpu4-2026-11-22` 停用。gpu4 同时启用了按实例数的
+`OVERFLOW_QUEUE_DEPTH`。网关测试要在装了 1.108.19 的环境里跑；`llm-gateway-vllm` 里仍是 1.99.0，
+在那里跑 `tests/test_retry_breadcrumbs.py` 会失败 2 个子测试。
+
 ## 部署记录（2026-11-27，时间为 US PST）
 
 | | US（gpu4） | CN（A100） |
