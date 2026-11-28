@@ -6,11 +6,20 @@ set -euo pipefail
 umask 077
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+# The passwords reach the container on stdin only.  On a command line or in the environment, sudo writes them
+# to the journal on every run, and ps shows a command line to every account on this shared host.
 SRC=$(grep -E '^LITELLM_SYNC_SOURCE_URL=' gateway.env | cut -d= -f2-)
 PASS=$(cut -d= -f2- pg-local.env)
 
-sudo -n docker exec -i -e SRC="$SRC" -e PGPASSWORD="$PASS" -e PGCONNECT_TIMEOUT=30 llm-litellm-pg bash -s <<'INNER'
+{
+  # printf is a shell builtin, so these values appear in no process's arguments.
+  printf 'export SRC=%q PGPASSWORD=%q PGCONNECT_TIMEOUT=30\n' "$SRC" "$PASS"
+  cat <<'INNER'
 set -euo pipefail
+# Split the source URL so that psql's arguments carry no password.
+[[ $SRC =~ ^(postgres(ql)?://[^:/@]+):([^@]*)@(.+)$ ]] || { echo "LITELLM_SYNC_SOURCE_URL needs user:password@host" >&2; exit 1; }
+SRC_URL="${BASH_REMATCH[1]}@${BASH_REMATCH[4]}"
+printf -v SRC_PASS '%b' "${BASH_REMATCH[3]//%/\\x}"   # percent-decode
 OPTS="with (format csv, quote e'\\x01', delimiter e'\\x02')"
 LOCAL=(-h 127.0.0.1 -p 15433 -U litellm -d litellm -X -q -v ON_ERROR_STOP=1)
 # Only keys: no key uses LiteLLM's budget, organization or project tables. A key that starts to will fail the
@@ -25,7 +34,7 @@ trap 'rm -rf "$T"' EXIT
 for entry in "${TABLES[@]}"; do
   table=${entry%%:*}
   echo "\\copy (select to_jsonb(x)::text from \"$table\" x) to '$T/$table' $OPTS"
-done | psql "$SRC" -X -q -v ON_ERROR_STOP=1
+done | PGPASSWORD=$SRC_PASS psql "$SRC_URL" -X -q -v ON_ERROR_STOP=1
 
 {
   echo 'create temp table incoming (tbl text, doc jsonb) on commit drop;'
@@ -69,3 +78,4 @@ end
 SQL
 } | psql "${LOCAL[@]}" --single-transaction
 INNER
+} | sudo -n docker exec -i llm-litellm-pg bash -s
