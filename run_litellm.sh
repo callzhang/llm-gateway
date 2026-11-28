@@ -2,8 +2,10 @@
 # Run LiteLLM proxy — foreground for systemd
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONNOUSERSITE=1
-# GATEWAY_PY_BIN: the env holding litellm + prisma; another region sets its own.
-GATEWAY_PY_BIN=${GATEWAY_PY_BIN:-/home/derek/miniforge3/envs/llm-gateway-vllm/bin}
+# GATEWAY_PY_BIN: the env holding litellm + prisma; another region sets its own.  The default is the
+# venv of the version pinned in docs/litellm-*-requirements.txt, never the env shared with vLLM: that
+# one still has LiteLLM 1.99.0, which with these configs logs other callers' requests.
+GATEWAY_PY_BIN=${GATEWAY_PY_BIN:-/home/derek/venvs/litellm-1.108.19/bin}
 export PATH="$GATEWAY_PY_BIN:$PATH"   # make prisma CLI visible for schema migration
 # No fallback default: the key must come from gateway.env (gitignored).  A
 # hardcoded default here is a tracked file in a PUBLIC repo, so it would be a

@@ -5,7 +5,7 @@ PartOf=llm-gateway.target
 
 [Service]
 # Prisma's engines live in the env, not in a per-user cache.
-Environment=PRISMA_BINARY_CACHE_DIR=/home/derek/miniforge3/envs/llm-gateway-vllm/share/prisma-python
+Environment=PRISMA_BINARY_CACHE_DIR=/home/derek/venvs/litellm-1.108.19/share/prisma-python
 MemoryHigh=3G
 MemoryMax=4G
 MemorySwapMax=1G

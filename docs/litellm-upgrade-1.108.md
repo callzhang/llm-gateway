@@ -42,7 +42,14 @@ Codex 形状带工具调用的请求、两种 `priority` 写法、TTS、ASR；�
 
 US 回滚要**保留 `DISABLE_SCHEMA_UPDATE=true`**，数据库不回退。
 
-US：删掉 `gateway.env` 里的 `GATEWAY_PY_BIN`、`PRISMA_BINARY_CACHE_DIR` 两行，把重试记录回调带回来（否则 1.99 会
+US：仓库默认值指向 1.108.19 的环境（11-28 起），所以删掉 `gateway.env` 里那两行**不会**回到旧版。要把它们改成旧环境：
+
+```
+GATEWAY_PY_BIN=/home/derek/miniforge3/envs/llm-gateway-vllm/bin
+PRISMA_BINARY_CACHE_DIR=/home/derek/miniforge3/envs/llm-gateway-vllm/share/prisma-python
+```
+
+同时把重试记录回调带回来（否则 1.99 会
 串日志；其余改动在 1.99 上无害。如果之后有人改过 `config.yaml`，改为手工把回调那一行加回 `callbacks`），再重启：
 
 ```bash

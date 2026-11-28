@@ -449,22 +449,23 @@ wiped, the path in `client.py` points at a missing file and the proxy exits 3 on
 `Not connected to the query engine`. The `prisma-query-engine-debian-openssl-3.6.x` path in that error
 is only the last lookup fallback; Prisma ships one engine for all of OpenSSL 3.x, named `3.0.x`.
 
-Keep the engine inside the conda env instead, and regenerate after every LiteLLM upgrade:
+Keep the engine inside LiteLLM's own env instead, and regenerate after every LiteLLM upgrade. LiteLLM
+runs from `~/venvs/litellm-<version>` (pinned in `docs/litellm-*-requirements.txt`), the default in
+`run_litellm.sh`; the venv uses the interpreter of the `llm-gateway-vllm` conda env, so removing that env
+breaks it. On the A100 `gateway.env` points at `/data/derek/venv-litellm-<version>`.
 
 ```bash
-ENV=~/miniforge3/envs/llm-gateway-vllm
-PRISMA_BINARY_CACHE_DIR=$ENV/share/prisma-python \
-  $ENV/bin/prisma generate --schema $ENV/lib/python3.12/site-packages/litellm_proxy_extras/schema.prisma
+ENV=~/venvs/litellm-1.108.19
+PRISMA_BINARY_CACHE_DIR=$ENV/share/prisma-python PATH=$ENV/bin:$PATH \
+  $ENV/bin/prisma generate --schema $ENV/lib/python3.12/site-packages/litellm/proxy/schema.prisma
 ```
 
-The `llm-litellm` unit sets the same `PRISMA_BINARY_CACHE_DIR` in the drop-in
-`~/.config/systemd/user/llm-litellm.service.d/prisma-cache.conf`, so the startup migration step uses the
-same directory.
+The `llm-litellm` unit sets the same `PRISMA_BINARY_CACHE_DIR`.
 
 #### LiteLLM memory cap and watcher
 
 On 2026-11-01 LiteLLM 1.99.0 grew to 45.8 GB and triggered a global OOM; its normal footprint is about
-1.3 GB (1.108.19 in its own venv: 0.8 GB idle, 0.9 GB under a synthetic load). The drop-in `llm-litellm.service.d/memory-cap.conf` sets `MemoryHigh=3G` (throttle) and
+1.3 GB (1.108.19 in its own venv: 0.8 GB idle, 0.9 GB under a synthetic load). The unit sets `MemoryHigh=3G` (throttle) and
 `MemoryMax=4G` (kill and restart only LiteLLM).
 
 `scripts/litellm_mem_watch.sh` runs every minute from the root timer `llm-litellm-mem-watch.timer`

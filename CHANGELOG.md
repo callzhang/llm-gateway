@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Fixed
+- `run_litellm.sh` and the `llm-litellm` unit now default to the LiteLLM 1.108.19 venv. Only the untracked
+  `gateway.env` selected it before; without those lines gpu4 would have started 1.99.0, which with these
+  configs logs other callers' requests.
+
+### Fixed
 - `llm-jit-warmup` no longer warms the SGLang script on a vLLM host, so it stops failing on every gpu4 start.
 - A100: the 27B loads its weights from `/data/derek/models` instead of a colleague's world-writable directory.
 
