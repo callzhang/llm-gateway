@@ -37,3 +37,8 @@ With 8 cards, the cards that were `0,1,2,6` are `1,2,3,7`, and TTS's `5` is `6`.
 1. In `/etc/llm-model-manager-cn-27b-scaleout.env`, set `MODEL_GPU_IDS="qwen3.8-27b=1,2,3,7;qwen3-tts-1.7b-customvoice=6"`, add `GUARANTEED_GPU_UUIDS` and the host's image settings (the table in `vision.md`).
 2. Stop model_manager **and every running engine** before starting it again. An engine adopted under the old numbering would be recorded on the wrong card.
 3. Check each instance with `nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv`.
+
+## Verified on the A100 (2026-11-28)
+
+With a placeholder process on each of cards 1, 2 and 3 and no 27B instance, a request started the 27B on card 1:
+only that card's placeholder got SIGTERM, the other two kept running, and the engine was ready 75 s later.

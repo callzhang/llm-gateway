@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+- `llm-jit-warmup` no longer warms the SGLang script on a vLLM host, so it stops failing on every gpu4 start.
+- A100: the 27B loads its weights from `/data/derek/models` instead of a colleague's world-writable directory.
+
 ### gpu4 runs master (2026-11-27)
 - gpu4 stops holding back the per-instance `OVERFLOW_QUEUE_DEPTH` (below): both regions now run the same code.
   With one running instance the threshold is unchanged; with two it is twice the configured depth.
