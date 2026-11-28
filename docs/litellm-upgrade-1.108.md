@@ -5,7 +5,7 @@
 **两区已在 2026-11-27 升级到 `1.108.19`。** 下面「部署记录」是实际做法和回滚命令；其后各节是升级前的评估原文。
 
 **现状（2026-11-27 深夜）**：全部改动已合进 `master`（callzhang/llm-gateway#19、#20）；gpu4 的运行目录检出 `master`，
-CN 的代码文件与 `master` 一致。部署分支 `deploy/gpu4-2026-11-22` 停用。gpu4 同时启用了按实例数的
+CN 的代码文件与 `master` 一致。部署分支 `deploy/gpu4-2026-11-22` 已删除（本地和远端）。gpu4 同时启用了按实例数的
 `OVERFLOW_QUEUE_DEPTH`。网关测试要在装了 1.108.19 的环境里跑；`llm-gateway-vllm` 里仍是 1.99.0，
 在那里跑 `tests/test_retry_breadcrumbs.py` 会失败 2 个子测试。
 
@@ -18,7 +18,7 @@ CN 的代码文件与 `master` 一致。部署分支 `deploy/gpu4-2026-11-22` �
 | 迁移 | 中途失败一次后成功（见下） | 63 个，59 秒 |
 | 切换 | 21:52 与 21:53 两次重启，恢复用时 47 秒、25 秒 | 22:02 重启，32 秒恢复 |
 | 验证 | 端到端全过 | 端到端全过；key 同步成功 |
-| 旧环境（回滚用，确认稳定前不删） | `llm-gateway-vllm` conda 环境 | `/data/derek/venv-litellm` |
+| 旧环境 | `llm-gateway-vllm` conda 环境（与 vLLM 共用，保留） | `/data/derek/venv-litellm`，11-28 已删除 |
 
 端到端检查：chat（含流式）、列表 `input` 的 `previous_response_id` 续接（流式和非流式）、伪造 id 410、
 Codex 形状带工具调用的请求、两种 `priority` 写法、TTS、ASR；切换前在旁路端口 8911 用新版连真实库和引擎试跑过，
@@ -40,7 +40,7 @@ Codex 形状带工具调用的请求、两种 `priority` 写法、TTS、ASR；�
 
 ### 回滚
 
-两区都**保留 `DISABLE_SCHEMA_UPDATE=true`**，数据库不回退。
+US 回滚要**保留 `DISABLE_SCHEMA_UPDATE=true`**，数据库不回退。
 
 US：删掉 `gateway.env` 里的 `GATEWAY_PY_BIN`、`PRISMA_BINARY_CACHE_DIR` 两行，把重试记录回调带回来（否则 1.99 会
 串日志；其余改动在 1.99 上无害。如果之后有人改过 `config.yaml`，改为手工把回调那一行加回 `callbacks`），再重启：
@@ -53,11 +53,9 @@ git -C /home/derek/Projects/llm-gateway checkout ad29914 -- config.yaml retry_br
 sudo systemctl restart llm-litellm
 ```
 
-CN：
-
-```bash
-ssh a100-1 'cd /data/derek/llm-gateway && B=/data/derek/llm-gateway-backups && cat $B/config.cn.yaml.pre-1.108 > config.cn.yaml && cat $B/sync_cn_litellm_keys.sh.pre-1.108 > sync_cn_litellm_keys.sh && sed -i "s#^GATEWAY_PY_BIN=.*#GATEWAY_PY_BIN=/data/derek/venv-litellm/bin#; s#^PRISMA_BINARY_CACHE_DIR=.*#PRISMA_BINARY_CACHE_DIR=/data/derek/venv-litellm/share/prisma-python#" gateway.env && sudo systemctl restart llm-litellm'
-```
+CN：不能再直接回滚。11-28 按 Derek 的要求删掉了旧环境、旧回调文件和回滚用的配置副本（数据库备份保留）。
+要退回 1.99.0 需要按 `llm-gateway-vllm` 里的版本另建环境，并从 git 的 `ad29914` 取回 `config.cn.yaml`、
+`retry_breadcrumb_hook.py` 和 key 同步脚本。
 
 US 先回滚、CN 不回滚没有问题；key 同步在两种组合下都能跑。
 

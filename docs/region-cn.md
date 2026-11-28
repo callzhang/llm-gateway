@@ -128,10 +128,10 @@ CN service ─► https://llm-cn.preseen.ai:18900 ─► site NAT 27.221.10.54:1
   so the zone-wide Cloudflare token never reaches the shared host.
 * Done: the `llm-cn.preseen.ai` A record (DNS only), the first certificate (valid to
   2027-02-05), and the renewal timer on GPU4 (installed 2026-11-08; a manual run succeeded).
-* Still to do: the NAT port forward `27.221.10.54:18900 -> 172.20.10.41:18900` (site network
-  admin). `27.221.10.54` is the whole site's shared address, not the A100's: from outside,
-  `:18900` answers "connection refused" (2026-11-08, probed from GPU4) while `:443` reaches
-  another team's nginx. Everything behind the NAT is verified from inside the LAN.
+* The NAT port forward `27.221.10.54:18900 -> 172.20.10.41:18900` is in place and in use: CN
+  production `friday-memory-cn` (from `47.94.219.56`) calls this entrance (3702 of the 3703 requests
+  in the proxy's access log, 2026-11-27 21:37 to 11-28 07:24 UTC). A probe from GPU4 on 2026-11-27
+  could not connect, so check it from a CN caller, not from the US.
 
 ## A100 specifics
 
