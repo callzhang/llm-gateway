@@ -34,7 +34,8 @@
 # fingerprint of vllm + flashinfer + driver + GPU so any upgrade invalidates it.
 #
 # Usage:  scripts/warm_jit_cache.sh [--force] [run_script ...]
-#         defaults to every run_qwen3[0-9]*_*.sh
+#         defaults to every run_qwen3[0-9]*_*.sh this host's engine can start
+#         (*_sglang.sh only where gateway.env sets QWEN27B_ENGINE=sglang)
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -55,6 +56,11 @@ for arg in "$@"; do
 done
 if [[ ${#SCRIPTS[@]} -eq 0 ]]; then
   mapfile -t SCRIPTS < <(ls "$ROOT"/run_qwen3[0-9]*_*.sh)
+  # A host on vLLM has no SGLang runtime: warming that script failed the unit on
+  # every start on gpu4.
+  if [[ ${QWEN27B_ENGINE:-vllm} != sglang ]]; then
+    mapfile -t SCRIPTS < <(printf '%s\n' "${SCRIPTS[@]}" | grep -v '_sglang\.sh$')
+  fi
 fi
 
 # The fingerprint must be computed with the interpreter that ACTUALLY compiles

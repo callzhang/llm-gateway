@@ -1,6 +1,8 @@
 """VISION_GPU_IDS: only some instances take images; images never cross regions."""
 from __future__ import annotations
 
+import os
+import subprocess
 import unittest
 from unittest import mock
 
@@ -201,6 +203,24 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue(self._adopts(["--language-model-only"], 1))
         self.assertFalse(self._adopts(["--language-model-only"], 0))
         self.assertTrue(self._adopts([], 1, vision_gpus=None))
+
+
+class WarmupSelectionTests(unittest.TestCase):
+    def _selected(self, engine):
+        with open(f"{mm.SCRIPT_DIR}/scripts/warm_jit_cache.sh") as f:
+            text = f.read()
+        block = text[text.index("if [[ ${#SCRIPTS[@]} -eq 0 ]]; then"):text.index("# The fingerprint must be")]
+        out = subprocess.run(
+            ["bash", "-c", f'SCRIPTS=(); ROOT="$1"; {block} printf "%s\\n" "${{SCRIPTS[@]##*/}}"', "-", mm.SCRIPT_DIR],
+            env={"PATH": os.environ["PATH"], **({"QWEN27B_ENGINE": engine} if engine else {})},
+            capture_output=True, text=True, check=True,
+        )
+        return out.stdout.split()
+
+    def test_sglang_is_warmed_only_where_it_is_the_engine(self):
+        self.assertNotIn("run_qwen38_27b_sglang.sh", self._selected(None))
+        self.assertIn("run_qwen38_27b.sh", self._selected(None))
+        self.assertIn("run_qwen38_27b_sglang.sh", self._selected("sglang"))
 
 
 class ScriptTests(unittest.TestCase):
