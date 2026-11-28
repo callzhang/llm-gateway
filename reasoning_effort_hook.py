@@ -14,7 +14,8 @@ outside `xhigh | medium | low`, so the OpenAI-style `high` that clients send wou
 For each model that declares `model_info.reasoning_effort` in config.yaml this hook:
   - keeps a value the model supports,
   - maps an alias onto a supported level (e.g. `high` -> `xhigh`),
-  - removes anything else, which falls back to the template default exactly as before.
+  - removes anything else, which falls back to the template default exactly as before,
+  - removes the Responses API's `reasoning.summary`, which these backends cannot produce.
 Models without that block are left untouched.
 
     model_info:
@@ -104,6 +105,12 @@ class ReasoningEffortHook(CustomLogger):
                 else:
                     reasoning["effort"] = resolved
                 changed = True
+        # Every backend here is chat completions, which has no reasoning summary. With `summary`
+        # present LiteLLM's bridge sends the whole object as `reasoning_effort`, and the engine
+        # answers 400 — Codex sets it on every request.
+        if isinstance(reasoning, dict) and "summary" in reasoning:
+            del reasoning["summary"]
+            changed = True
         return data if changed else None
 
 

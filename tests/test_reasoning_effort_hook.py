@@ -63,7 +63,7 @@ class ReasoningEffortHookTests(unittest.TestCase):
 
         run(self.hook, data, call_type="aresponses")
 
-        self.assertEqual(data["reasoning"], {"effort": "xhigh", "summary": "auto"})
+        self.assertEqual(data["reasoning"], {"effort": "xhigh"})
 
     def test_unreadable_config_disables_the_hook(self) -> None:
         hook = ReasoningEffortHook(config_path=str(Path(self._tmp.name) / "missing.yaml"))
